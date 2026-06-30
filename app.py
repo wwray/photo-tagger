@@ -1,0 +1,921 @@
+import os
+import re
+import time
+import json
+import hashlib
+import sqlite3
+import threading
+import contextlib
+from pathlib import Path
+from datetime import datetime
+
+import exifread
+import piexif
+import imagehash
+import requests
+from flask import Flask, jsonify, request, send_file, render_template, g
+from PIL import Image
+
+app = Flask(__name__)
+
+# ─── Config ───────────────────────────────────────────────────────────────────
+
+PHOTO_EXTENSIONS   = {".jpg", ".jpeg", ".cr2", ".nef", ".arw", ".orf", ".rw2", ".dng"}
+GEOCODE_DELAY      = 1.1
+DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
+AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
+AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5-20251001")
+DB_PATH            = os.environ.get("DB_PATH", "/app/data/phototagger.db")
+
+_geocode_lock = threading.Lock()
+_last_geocode = 0.0
+_ai_usage     = {"date": None, "count": 0}
+_ai_lock      = threading.Lock()
+
+# PUID/PGID for Unraid
+_puid = int(os.environ.get("PUID", 0))
+_pgid = int(os.environ.get("PGID", 0))
+if _puid and _pgid:
+    try:
+        os.setgid(_pgid); os.setuid(_puid)
+    except (OSError, AttributeError):
+        pass
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+
+def _get_db():
+    if "db" not in g:
+        Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+        g.db = sqlite3.connect(DB_PATH)
+        g.db.row_factory = sqlite3.Row
+        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db.execute("PRAGMA foreign_keys=ON")
+    return g.db
+
+@app.teardown_appcontext
+def _close_db(e=None):
+    db = g.pop("db", None)
+    if db: db.close()
+
+def _db():
+    """Get db connection — works both inside and outside request context."""
+    if app.app_context():
+        try:
+            return _get_db()
+        except RuntimeError:
+            pass
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    return conn
+
+def init_db():
+    Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS photos (
+            id              TEXT PRIMARY KEY,   -- relative path from scan root
+            path            TEXT NOT NULL,
+            filename        TEXT NOT NULL,
+            folder          TEXT NOT NULL,
+            size_kb         INTEGER,
+            file_mtime      REAL,               -- last modified time from filesystem
+            date_taken      TEXT,
+            lat             REAL,
+            lon             REAL,
+            location_name   TEXT,
+            has_gps         INTEGER DEFAULT 0,
+            status          TEXT DEFAULT 'unknown',
+            phash           TEXT,               -- perceptual hash
+            file_hash       TEXT,               -- md5 of first 64KB (fast)
+            inferred_lat    REAL,
+            inferred_lon    REAL,
+            inferred_from   TEXT,
+            inferred_delta_min INTEGER,
+            scan_root       TEXT,
+            last_scanned    TEXT,
+            original_filename TEXT             -- for rename undo
+        );
+
+        CREATE TABLE IF NOT EXISTS pending_changes (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id        TEXT NOT NULL,
+            field           TEXT NOT NULL,      -- 'location_name','lat','lon','date_taken'
+            old_value       TEXT,
+            new_value       TEXT,
+            created_at      TEXT DEFAULT (datetime('now')),
+            committed       INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS sessions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            name        TEXT NOT NULL,
+            scan_root   TEXT NOT NULL,
+            created_at  TEXT DEFAULT (datetime('now')),
+            last_used   TEXT DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS rename_log (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id        TEXT NOT NULL,
+            old_path        TEXT NOT NULL,
+            new_path        TEXT NOT NULL,
+            renamed_at      TEXT DEFAULT (datetime('now')),
+            undone          INTEGER DEFAULT 0
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_photos_folder    ON photos(folder);
+        CREATE INDEX IF NOT EXISTS idx_photos_status    ON photos(status);
+        CREATE INDEX IF NOT EXISTS idx_photos_scan_root ON photos(scan_root);
+        CREATE INDEX IF NOT EXISTS idx_photos_phash     ON photos(phash);
+        CREATE INDEX IF NOT EXISTS idx_pending_photo    ON pending_changes(photo_id);
+    """)
+    conn.commit()
+    conn.close()
+    print(f"[db] Initialised at {DB_PATH}", flush=True)
+
+init_db()
+
+# ─── DB helpers ───────────────────────────────────────────────────────────────
+
+def db_upsert_photo(conn, photo: dict):
+    conn.execute("""
+        INSERT INTO photos (
+            id, path, filename, folder, size_kb, file_mtime,
+            date_taken, lat, lon, location_name, has_gps, status,
+            phash, file_hash, inferred_lat, inferred_lon,
+            inferred_from, inferred_delta_min, scan_root, last_scanned
+        ) VALUES (
+            :id,:path,:filename,:folder,:size_kb,:file_mtime,
+            :date_taken,:lat,:lon,:location_name,:has_gps,:status,
+            :phash,:file_hash,:inferred_lat,:inferred_lon,
+            :inferred_from,:inferred_delta_min,:scan_root,:last_scanned
+        )
+        ON CONFLICT(id) DO UPDATE SET
+            path=excluded.path, filename=excluded.filename,
+            folder=excluded.folder, size_kb=excluded.size_kb,
+            file_mtime=excluded.file_mtime, date_taken=excluded.date_taken,
+            lat=excluded.lat, lon=excluded.lon,
+            location_name=COALESCE(excluded.location_name, photos.location_name),
+            has_gps=excluded.has_gps,
+            status=CASE WHEN photos.status IN ('named','gps') AND excluded.status='unknown'
+                        THEN photos.status ELSE excluded.status END,
+            phash=excluded.phash, file_hash=excluded.file_hash,
+            inferred_lat=excluded.inferred_lat, inferred_lon=excluded.inferred_lon,
+            inferred_from=excluded.inferred_from,
+            inferred_delta_min=excluded.inferred_delta_min,
+            scan_root=excluded.scan_root, last_scanned=excluded.last_scanned
+    """, {**{
+        "id":None,"path":None,"filename":None,"folder":None,"size_kb":None,
+        "file_mtime":None,"date_taken":None,"lat":None,"lon":None,
+        "location_name":None,"has_gps":0,"status":"unknown",
+        "phash":None,"file_hash":None,"inferred_lat":None,"inferred_lon":None,
+        "inferred_from":None,"inferred_delta_min":None,
+        "scan_root":None,"last_scanned":None
+    }, **photo})
+
+def db_save_pending(conn, photo_id, field, old_value, new_value):
+    conn.execute("""
+        INSERT INTO pending_changes (photo_id, field, old_value, new_value)
+        VALUES (?,?,?,?)
+    """, (photo_id, field, str(old_value) if old_value is not None else None,
+          str(new_value) if new_value is not None else None))
+
+def rows_to_dicts(rows):
+    return [dict(r) for r in rows]
+
+# ─── AI helpers ───────────────────────────────────────────────────────────────
+
+def _ai_allowed():
+    with _ai_lock:
+        today = datetime.now().date().isoformat()
+        if _ai_usage["date"] != today:
+            _ai_usage["date"] = today; _ai_usage["count"] = 0
+        if _ai_usage["count"] >= AI_DAILY_LIMIT:
+            return False, f"Daily AI limit of {AI_DAILY_LIMIT} reached."
+        return True, ""
+
+def _ai_increment():
+    with _ai_lock: _ai_usage["count"] += 1
+
+def _ai_usage_info():
+    with _ai_lock:
+        today = datetime.now().date().isoformat()
+        if _ai_usage["date"] != today:
+            return {"used":0,"limit":AI_DAILY_LIMIT,"remaining":AI_DAILY_LIMIT}
+        used = _ai_usage["count"]
+        return {"used":used,"limit":AI_DAILY_LIMIT,"remaining":max(0,AI_DAILY_LIMIT-used)}
+
+# ─── EXIF helpers ─────────────────────────────────────────────────────────────
+
+def _dms_to_decimal(dms, ref):
+    try:
+        d = float(dms[0].num)/float(dms[0].den)
+        m = float(dms[1].num)/float(dms[1].den)
+        s = float(dms[2].num)/float(dms[2].den)
+        dec = d + m/60 + s/3600
+        return -dec if ref in ("S","W") else dec
+    except Exception:
+        return None
+
+def read_exif(filepath):
+    result = {"date_taken":None,"lat":None,"lon":None,
+              "location_name":None,"has_gps":False,"error":None,
+              "date_source":None}
+    try:
+        with open(filepath,"rb") as f:
+            tags = exifread.process_file(f, details=False)
+        for tag in ("EXIF DateTimeOriginal","EXIF DateTimeDigitized","Image DateTime"):
+            if tag in tags:
+                try:
+                    result["date_taken"] = datetime.strptime(
+                        str(tags[tag]),"%Y:%m:%d %H:%M:%S").isoformat()
+                    result["date_source"] = "exif"
+                except ValueError: pass
+                break
+        lat_tag = tags.get("GPS GPSLatitude");  lat_ref = tags.get("GPS GPSLatitudeRef")
+        lon_tag = tags.get("GPS GPSLongitude"); lon_ref = tags.get("GPS GPSLongitudeRef")
+        if lat_tag and lon_tag and lat_ref and lon_ref:
+            lat = _dms_to_decimal(lat_tag.values, str(lat_ref))
+            lon = _dms_to_decimal(lon_tag.values, str(lon_ref))
+            if lat is not None and lon is not None:
+                result["lat"] = lat; result["lon"] = lon; result["has_gps"] = True
+        if "Image ImageDescription" in tags:
+            result["location_name"] = str(tags["Image ImageDescription"])
+    except Exception as e:
+        result["error"] = str(e)
+
+    # Fall back to filesystem dates when EXIF has no date
+    if not result["date_taken"]:
+        try:
+            stat = Path(filepath).stat()
+            # Use the earlier of mtime/ctime as a best guess for creation date
+            ts = min(stat.st_mtime, stat.st_ctime)
+            result["date_taken"] = datetime.fromtimestamp(ts).isoformat()
+            result["date_source"] = "filesystem"
+        except Exception:
+            pass
+
+    return result
+
+def compute_hashes(filepath):
+    """Return (file_hash, phash_str). phash is None for non-image files."""
+    file_hash = None
+    phash_str = None
+    try:
+        with open(filepath,"rb") as f:
+            file_hash = hashlib.md5(f.read(65536)).hexdigest()
+    except Exception: pass
+    try:
+        img = Image.open(filepath)
+        phash_str = str(imagehash.phash(img))
+    except Exception: pass
+    return file_hash, phash_str
+
+def reverse_geocode(lat, lon):
+    global _last_geocode
+    with _geocode_lock:
+        wait = GEOCODE_DELAY - (time.time() - _last_geocode)
+        if wait > 0: time.sleep(wait)
+        _last_geocode = time.time()
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/reverse",
+            params={"lat":lat,"lon":lon,"format":"json","zoom":14},
+            headers={"User-Agent":"PhotoTagger/1.0"}, timeout=10)
+        addr = r.json().get("address",{})
+        parts = []
+        for key in ("city","town","village","municipality","county"):
+            if key in addr: parts.append(addr[key]); break
+        if "country" in addr: parts.append(addr["country"])
+        return ", ".join(parts) if parts else r.json().get("display_name","")
+    except Exception: return None
+
+def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str=None):
+    ext = Path(filepath).suffix.lower()
+    if ext in (".jpg",".jpeg"):
+        _write_jpeg_exif(filepath, location_name, lat, lon, date_str)
+    else:
+        _write_xmp_sidecar(filepath, location_name, lat, lon, date_str)
+
+def _write_jpeg_exif(filepath, location_name, lat=None, lon=None, date_str=None):
+    try:    exif_dict = piexif.load(filepath)
+    except: exif_dict = {"0th":{},"Exif":{},"GPS":{},"1st":{}}
+    if location_name:
+        exif_dict["0th"][piexif.ImageIFD.ImageDescription] = location_name.encode("utf-8")
+    if lat is not None and lon is not None:
+        def to_dms(deg):
+            d=int(abs(deg)); m=int((abs(deg)-d)*60)
+            s=round(((abs(deg)-d)*60-m)*60*100)
+            return ((d,1),(m,1),(s,100))
+        exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef]  = b"N" if lat>=0 else b"S"
+        exif_dict["GPS"][piexif.GPSIFD.GPSLatitude]     = to_dms(lat)
+        exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = b"E" if lon>=0 else b"W"
+        exif_dict["GPS"][piexif.GPSIFD.GPSLongitude]    = to_dms(lon)
+    if date_str:
+        try:
+            dt = datetime.fromisoformat(date_str)
+            exif_date = dt.strftime("%Y:%m:%d %H:%M:%S").encode("utf-8")
+            exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
+            exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_date
+        except ValueError: pass
+    piexif.insert(piexif.dump(exif_dict), filepath)
+
+def _write_xmp_sidecar(filepath, location_name, lat=None, lon=None, date_str=None):
+    sidecar = Path(filepath).with_suffix(".xmp")
+    lat_s = f"{abs(lat):.6f}" if lat is not None else ""
+    lon_s = f"{abs(lon):.6f}" if lon is not None else ""
+    lat_r = ("N" if lat>=0 else "S") if lat is not None else ""
+    lon_r = ("E" if lon>=0 else "W") if lon is not None else ""
+    sidecar.write_text(f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
+<x:xmpmeta xmlns:x='adobe:ns:meta/'>
+  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
+    <rdf:Description rdf:about=''
+      xmlns:dc='http://purl.org/dc/elements/1.1/'
+      xmlns:exif='http://ns.adobe.com/exif/1.0/'
+      xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
+      <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{location_name or ''}</rdf:li></rdf:Alt></dc:description>
+      <exif:GPSLatitude>{lat_s}{lat_r}</exif:GPSLatitude>
+      <exif:GPSLongitude>{lon_s}{lon_r}</exif:GPSLongitude>
+      <xmp:CreateDate>{date_str or ''}</xmp:CreateDate>
+    </rdf:Description>
+  </rdf:RDF>
+</x:xmpmeta>
+<?xpacket end='w'?>""", encoding="utf-8")
+
+# ─── Scan (background thread) ─────────────────────────────────────────────────
+
+_scan_state = {"running":False,"phase":"","current":0,"total":0,
+               "message":"","error":None,"scan_root":None}
+_scan_lock  = threading.Lock()
+
+def _log(msg): print(msg, flush=True)
+
+def _run_scan(folder, rescan=False):
+    base = Path(folder)
+    now_iso = datetime.now().isoformat()
+
+    try:
+        # ── Count ──────────────────────────────────────────────────
+        with _scan_lock:
+            _scan_state.update(phase="counting",message="Counting photo files…",
+                               current=0,total=0,scan_root=folder)
+        all_paths = sorted([p for p in base.rglob("*")
+                            if p.suffix.lower() in PHOTO_EXTENSIONS])
+        total = len(all_paths)
+        _log(f"[scan] Found {total} photos in {folder}")
+
+        # ── Diff against DB (rescan) ───────────────────────────────
+        if rescan:
+            conn = sqlite3.connect(DB_PATH)
+            conn.row_factory = sqlite3.Row
+            existing = {r["id"]: r["file_mtime"]
+                        for r in conn.execute(
+                            "SELECT id,file_mtime FROM photos WHERE scan_root=?",
+                            (folder,))}
+            conn.close()
+            new_or_changed = [p for p in all_paths
+                              if str(p.relative_to(base)) not in existing
+                              or abs((existing.get(str(p.relative_to(base)),0) or 0)
+                                     - p.stat().st_mtime) > 1]
+            skipped = total - len(new_or_changed)
+            _log(f"[scan] Rescan: {len(new_or_changed)} new/changed, {skipped} unchanged")
+            all_paths = new_or_changed
+
+        with _scan_lock:
+            _scan_state.update(total=len(all_paths),
+                               message=f"Found {total} photos — reading EXIF…")
+
+        # ── EXIF + hashes ──────────────────────────────────────────
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        photos_batch = []
+
+        for i, p in enumerate(all_paths):
+            exif = read_exif(str(p))
+            file_hash, phash_str = compute_hashes(str(p))
+            mtime = p.stat().st_mtime
+
+            photo = {
+                "id":           str(p.relative_to(base)),
+                "path":         str(p),
+                "filename":     p.name,
+                "folder":       str(p.parent.relative_to(base)),
+                "size_kb":      round(p.stat().st_size/1024),
+                "file_mtime":   mtime,
+                "date_taken":   exif["date_taken"],
+                "lat":          exif["lat"],
+                "lon":          exif["lon"],
+                "location_name":exif["location_name"],
+                "has_gps":      1 if exif["has_gps"] else 0,
+                "status":       "gps" if exif["has_gps"] else ("named" if exif["location_name"] else "unknown"),
+                "phash":        phash_str,
+                "file_hash":    file_hash,
+                "inferred_lat": None,"inferred_lon":None,
+                "inferred_from":None,"inferred_delta_min":None,
+                "scan_root":    folder,
+                "last_scanned": now_iso,
+                "date_source":  exif.get("date_source"),
+            }
+            photos_batch.append(photo)
+            db_upsert_photo(conn, photo)
+
+            if i % 50 == 0 or i == len(all_paths)-1:
+                conn.commit()
+                _log(f"[scan] EXIF {i+1}/{len(all_paths)}  {p.name}")
+                with _scan_lock:
+                    _scan_state.update(phase="reading", current=i+1,
+                        message=f"Reading EXIF: {i+1} / {len(all_paths)}  ({p.name})")
+
+        # ── Infer locations ────────────────────────────────────────
+        with _scan_lock:
+            _scan_state.update(phase="inferring",
+                               message="Inferring locations from GPS clusters…")
+        _log("[scan] Inferring locations…")
+
+        all_db = rows_to_dicts(conn.execute(
+            "SELECT * FROM photos WHERE scan_root=?", (folder,)).fetchall())
+        gps_photos = [p for p in all_db if p["has_gps"] and p["date_taken"]]
+
+        inferred = 0
+        for photo in all_db:
+            if photo["has_gps"] or photo["status"] in ("named","inferred") or not photo["date_taken"]:
+                continue
+            try: dt = datetime.fromisoformat(photo["date_taken"])
+            except ValueError: continue
+            best, best_delta = None, float("inf")
+            for gp in gps_photos:
+                try:
+                    delta = abs((dt-datetime.fromisoformat(gp["date_taken"])).total_seconds())
+                    if delta < best_delta: best_delta, best = delta, gp
+                except ValueError: continue
+            if best and best_delta <= 4*3600:
+                conn.execute("""UPDATE photos SET inferred_lat=?,inferred_lon=?,
+                    inferred_from=?,inferred_delta_min=?,status='inferred'
+                    WHERE id=?""",
+                    (best["lat"],best["lon"],best["filename"],
+                     round(best_delta/60),photo["id"]))
+                inferred += 1
+        conn.commit()
+        _log(f"[scan] Inferred {inferred} locations")
+
+        # ── Geocode ────────────────────────────────────────────────
+        needs_geo = [p for p in all_db if p["has_gps"] and not p["location_name"]][:200]
+        _log(f"[scan] Geocoding {len(needs_geo)} GPS photos…")
+        for i, photo in enumerate(needs_geo):
+            with _scan_lock:
+                _scan_state.update(phase="geocoding", current=i+1, total=len(needs_geo),
+                    message=f"Geocoding: {i+1}/{len(needs_geo)}  ({photo['filename']})")
+            name = reverse_geocode(photo["lat"], photo["lon"])
+            if name:
+                conn.execute("UPDATE photos SET location_name=?,status='gps' WHERE id=?",
+                             (name, photo["id"]))
+                if (i+1)%20==0: conn.commit()
+            _log(f"[scan] Geocode {i+1}/{len(needs_geo)}: {photo['filename']} → {name}")
+        conn.commit()
+        conn.close()
+
+        counts = {}
+        for p in all_db: counts[p["status"]] = counts.get(p["status"],0)+1
+        _log(f"[scan] Done. {counts}")
+        with _scan_lock:
+            _scan_state.update(running=False, phase="done",
+                message=f"Done! {total} photos in library.",
+                current=total, total=total)
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _log(f"[scan] ERROR: {e}")
+        with _scan_lock:
+            _scan_state.update(running=False, phase="error",
+                               error=str(e), message=f"Error: {e}")
+
+# ─── Routes ───────────────────────────────────────────────────────────────────
+
+@app.route("/")
+def index(): return render_template("index.html")
+
+@app.route("/api/config")
+def api_config():
+    return jsonify({
+        "default_photo_root": DEFAULT_PHOTO_ROOT,
+        "has_ai_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
+        "ai_usage": _ai_usage_info(),
+        "ai_model": AI_MODEL,
+    })
+
+# ── Folder browser ────────────────────────────────────────────────
+@app.route("/api/browse")
+def api_browse():
+    path = request.args.get("path", DEFAULT_PHOTO_ROOT)
+    try:
+        p = Path(path)
+        if not p.exists() or not p.is_dir():
+            return jsonify({"error": f"Not a directory: {path}"}), 400
+        dirs = sorted([str(d.name) for d in p.iterdir()
+                       if d.is_dir() and not d.name.startswith(".")])
+        parent = str(p.parent) if str(p.parent) != str(p) else None
+        return jsonify({"path": str(p), "parent": parent, "dirs": dirs})
+    except PermissionError:
+        return jsonify({"error": "Permission denied"}), 403
+
+# ── Sessions ──────────────────────────────────────────────────────
+@app.route("/api/sessions")
+def api_sessions():
+    db = _get_db()
+    rows = db.execute("SELECT * FROM sessions ORDER BY last_used DESC").fetchall()
+    return jsonify({"sessions": rows_to_dicts(rows)})
+
+@app.route("/api/sessions", methods=["POST"])
+def api_create_session():
+    data = request.json or {}
+    name = data.get("name","").strip()
+    root = data.get("scan_root","").strip()
+    if not name or not root:
+        return jsonify({"error":"name and scan_root required"}), 400
+    db = _get_db()
+    cur = db.execute("INSERT INTO sessions (name,scan_root) VALUES (?,?)", (name,root))
+    db.commit()
+    return jsonify({"id": cur.lastrowid, "name": name, "scan_root": root})
+
+@app.route("/api/sessions/<int:sid>/use", methods=["POST"])
+def api_use_session(sid):
+    db = _get_db()
+    db.execute("UPDATE sessions SET last_used=datetime('now') WHERE id=?", (sid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/sessions/<int:sid>", methods=["DELETE"])
+def api_delete_session(sid):
+    db = _get_db()
+    db.execute("DELETE FROM sessions WHERE id=?", (sid,))
+    db.commit()
+    return jsonify({"ok": True})
+
+# ── Scan ──────────────────────────────────────────────────────────
+@app.route("/api/scan", methods=["POST"])
+def api_scan():
+    data = request.json or {}
+    folder  = data.get("folder","").strip()
+    rescan  = data.get("rescan", False)
+    if not folder or not os.path.isdir(folder):
+        return jsonify({"error": f"Folder not found: {folder}"}), 400
+    with _scan_lock:
+        if _scan_state["running"]:
+            return jsonify({"error":"Scan already in progress"}), 409
+        _scan_state.update(running=True, phase="counting", current=0, total=0,
+                           message="Starting…", error=None, scan_root=folder)
+    threading.Thread(target=_run_scan, args=(folder, rescan), daemon=True).start()
+    return jsonify({"started": True})
+
+@app.route("/api/scan_progress")
+def api_scan_progress():
+    with _scan_lock:
+        s = dict(_scan_state)
+    return jsonify(s)
+
+@app.route("/api/scan_result")
+def api_scan_result():
+    folder = request.args.get("folder","")
+    if not folder:
+        with _scan_lock:
+            folder = _scan_state.get("scan_root","")
+    db = _get_db()
+    rows = db.execute("SELECT * FROM photos WHERE scan_root=? ORDER BY date_taken",
+                      (folder,)).fetchall()
+    return jsonify({"photos": rows_to_dicts(rows), "total": len(rows)})
+
+# ── Pending changes (dry run persistence) ────────────────────────
+@app.route("/api/pending")
+def api_pending():
+    folder = request.args.get("folder","")
+    db = _get_db()
+    rows = db.execute("""
+        SELECT pc.id, pc.photo_id, pc.field, pc.old_value, pc.new_value,
+               pc.created_at, p.filename, p.folder, p.path
+        FROM pending_changes pc
+        JOIN photos p ON p.id = pc.photo_id
+        WHERE pc.committed=0 AND p.scan_root=?
+        ORDER BY p.filename, pc.field
+    """, (folder,)).fetchall()
+
+    # Group by photo for easier display
+    by_photo = {}
+    for r in rows:
+        pid = r["photo_id"]
+        if pid not in by_photo:
+            by_photo[pid] = {
+                "photo_id": pid,
+                "filename": r["filename"],
+                "folder":   r["folder"],
+                "path":     r["path"],
+                "changes":  []
+            }
+        by_photo[pid]["changes"].append({
+            "id":        r["id"],
+            "field":     r["field"],
+            "old_value": r["old_value"],
+            "new_value": r["new_value"],
+        })
+
+    return jsonify({
+        "pending":      list(by_photo.values()),
+        "count":        len(rows),
+        "photo_count":  len(by_photo),
+    })
+
+@app.route("/api/pending/commit", methods=["POST"])
+def api_commit_pending():
+    """Write all pending dry-run changes to actual files."""
+    data = request.json or {}
+    ids  = data.get("ids")   # optional list of specific pending IDs
+    db   = _get_db()
+    q = "SELECT pc.*,p.path FROM pending_changes pc JOIN photos p ON p.id=pc.photo_id WHERE pc.committed=0"
+    rows = db.execute(q + (" AND pc.id IN ({})".format(",".join("?"*len(ids))) if ids else ""),
+                      ids or []).fetchall()
+    results = []
+    by_photo = {}
+    for r in rows:
+        by_photo.setdefault(r["photo_id"], {"path":r["path"],"fields":{}})
+        by_photo[r["photo_id"]]["fields"][r["field"]] = r["new_value"]
+
+    for photo_id, info in by_photo.items():
+        try:
+            fields = info["fields"]
+            write_location_to_exif(
+                info["path"],
+                fields.get("location_name"),
+                float(fields["lat"]) if fields.get("lat") else None,
+                float(fields["lon"]) if fields.get("lon") else None,
+                fields.get("date_taken"),
+            )
+            db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
+                       (photo_id,))
+            results.append({"photo_id":photo_id,"ok":True})
+        except Exception as e:
+            results.append({"photo_id":photo_id,"ok":False,"error":str(e)})
+    db.commit()
+    return jsonify({"results":results,"committed":sum(1 for r in results if r["ok"])})
+
+@app.route("/api/pending/discard", methods=["POST"])
+def api_discard_pending():
+    data = request.json or {}
+    ids  = data.get("ids")
+    db   = _get_db()
+    if ids:
+        db.execute("DELETE FROM pending_changes WHERE id IN ({})".format(",".join("?"*len(ids))), ids)
+    else:
+        db.execute("DELETE FROM pending_changes WHERE committed=0")
+    db.commit()
+    return jsonify({"ok":True})
+
+# ── Geocode ───────────────────────────────────────────────────────
+@app.route("/api/geocode", methods=["POST"])
+def api_geocode():
+    data = request.json or {}
+    lat,lon = data.get("lat"), data.get("lon")
+    if lat is None or lon is None:
+        return jsonify({"error":"lat/lon required"}), 400
+    return jsonify({"location_name": reverse_geocode(lat,lon)})
+
+# ── Save ──────────────────────────────────────────────────────────
+@app.route("/api/save", methods=["POST"])
+def api_save():
+    data          = request.json or {}
+    filepath      = data.get("path")
+    location_name = data.get("location_name")
+    lat           = data.get("lat")
+    lon           = data.get("lon")
+    date_str      = data.get("date_taken")
+    dry_run       = data.get("dry_run", False)
+    photo_id      = data.get("id")
+
+    if not filepath or not os.path.isfile(filepath):
+        return jsonify({"error":"File not found"}), 400
+
+    db = _get_db()
+
+    if dry_run:
+        _log(f"[dry-run] Would write: {filepath}")
+        if photo_id:
+            # Get old values for undo
+            row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+            if row:
+                for field, new_val in [("location_name",location_name),
+                                        ("lat",lat),("lon",lon),("date_taken",date_str)]:
+                    if new_val is not None:
+                        db_save_pending(db, photo_id, field, row[field], new_val)
+            db.commit()
+        return jsonify({"ok":True,"dry_run":True})
+
+    try:
+        write_location_to_exif(filepath, location_name, lat, lon, date_str)
+        # Update DB
+        if photo_id:
+            db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,date_taken=?,
+                          has_gps=?,status=? WHERE id=?""",
+                       (location_name, lat, lon, date_str,
+                        1 if (lat and lon) else 0,
+                        "gps" if (lat and lon) else ("named" if location_name else "unknown"),
+                        photo_id))
+            db.commit()
+        return jsonify({"ok":True})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/save_batch", methods=["POST"])
+def api_save_batch():
+    data    = request.json or {}
+    photos  = data.get("photos",[])
+    dry_run = data.get("dry_run", False)
+    db      = _get_db()
+    results = []
+    for p in photos:
+        if dry_run:
+            _log(f"[dry-run] Would write: {p.get('path')}")
+            if p.get("id"):
+                row = db.execute("SELECT * FROM photos WHERE id=?", (p["id"],)).fetchone()
+                if row:
+                    for field, new_val in [("location_name",p.get("location_name")),
+                                            ("lat",p.get("lat")),("lon",p.get("lon")),
+                                            ("date_taken",p.get("date_taken"))]:
+                        if new_val is not None:
+                            db_save_pending(db, p["id"], field, row[field], new_val)
+            results.append({"id":p.get("id"),"ok":True,"dry_run":True})
+        else:
+            try:
+                write_location_to_exif(p["path"],p.get("location_name"),
+                                        p.get("lat"),p.get("lon"),p.get("date_taken"))
+                if p.get("id"):
+                    db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,
+                                  has_gps=?,status=? WHERE id=?""",
+                               (p.get("location_name"),p.get("lat"),p.get("lon"),
+                                1 if (p.get("lat") and p.get("lon")) else 0,
+                                "gps" if (p.get("lat") and p.get("lon"))
+                                else ("named" if p.get("location_name") else "unknown"),
+                                p["id"]))
+                results.append({"id":p.get("id"),"ok":True})
+            except Exception as e:
+                results.append({"id":p.get("id"),"ok":False,"error":str(e)})
+    db.commit()
+    return jsonify({"results":results,"dry_run":dry_run})
+
+# ── Thumbnail ─────────────────────────────────────────────────────
+@app.route("/api/thumbnail")
+def api_thumbnail():
+    filepath = request.args.get("path","")
+    if not filepath or not os.path.isfile(filepath):
+        return "",404
+    size = int(request.args.get("size",280))
+    try:
+        from io import BytesIO
+        img = Image.open(filepath)
+        img.thumbnail((size,size), Image.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf,"JPEG",quality=75)
+        buf.seek(0)
+        return send_file(buf, mimetype="image/jpeg")
+    except Exception as e:
+        return str(e),500
+
+# ── Duplicates ────────────────────────────────────────────────────
+@app.route("/api/duplicates")
+def api_duplicates():
+    """Find duplicate groups by perceptual hash similarity + filename pattern."""
+    folder   = request.args.get("folder","")
+    db       = _get_db()
+    rows     = rows_to_dicts(db.execute(
+        "SELECT id,path,filename,folder,size_kb,date_taken,phash,file_hash,status,location_name "
+        "FROM photos WHERE scan_root=? AND phash IS NOT NULL", (folder,)).fetchall())
+
+    # Group exact phash matches first
+    from collections import defaultdict
+    exact_groups = defaultdict(list)
+    for r in rows:
+        exact_groups[r["phash"]].append(r)
+
+    # Near-duplicate detection (hamming distance <= 8)
+    groups = []
+    used = set()
+    photo_list = list(rows)
+    for i, a in enumerate(photo_list):
+        if a["id"] in used or not a["phash"]: continue
+        group = [a]
+        used.add(a["id"])
+        ha = imagehash.hex_to_hash(a["phash"])
+        for b in photo_list[i+1:]:
+            if b["id"] in used or not b["phash"]: continue
+            try:
+                dist = ha - imagehash.hex_to_hash(b["phash"])
+                if dist <= 8:
+                    group.append({**b,"similarity":round((1-dist/64)*100)})
+                    used.add(b["id"])
+            except Exception: continue
+        if len(group) > 1:
+            groups.append(group)
+
+    # Also flag filename-pattern duplicates (IMG_4502 and IMG_4502 (1))
+    name_pattern = re.compile(r'^(.+?)(\s*\(\d+\))(\.[^.]+)$')
+    fname_groups = defaultdict(list)
+    for r in rows:
+        m = name_pattern.match(r["filename"])
+        base_name = (m.group(1) + m.group(3)) if m else r["filename"]
+        fname_groups[base_name.lower()].append(r)
+    fname_dups = [list(v) for v in fname_groups.values() if len(v) > 1]
+
+    return jsonify({
+        "phash_groups":  groups,
+        "fname_groups":  fname_dups,
+        "total_groups":  len(groups) + len(fname_dups),
+    })
+
+# ── AI infer ──────────────────────────────────────────────────────
+@app.route("/api/ai_infer", methods=["POST"])
+def api_ai_infer():
+    import anthropic
+    allowed, reason = _ai_allowed()
+    if not allowed:
+        return jsonify({"error":reason,"limit_reached":True}), 429
+    data      = request.json or {}
+    photo     = data.get("photo",{})
+    neighbors = data.get("neighbors",[])
+    lines = []
+    if photo.get("date_taken"): lines.append(f"Photo taken: {photo['date_taken']}")
+    if photo.get("folder"):     lines.append(f"Folder: {photo['folder']}")
+    if photo.get("filename"):   lines.append(f"Filename: {photo['filename']}")
+    if neighbors:
+        lines.append("\nNearby photos with known locations:")
+        for n in neighbors[:6]:
+            lines.append(f"  - {n.get('filename')}: {n.get('location_name')} ({n.get('date_taken')})")
+    prompt = (
+        "You are a metadata assistant. You have NO access to any image files or photos. "
+        "Work only from the text metadata provided below.\n\n"
+        "Based only on the filename, folder name, date, and nearby photos listed, "
+        "suggest the most likely location. Reply with ONLY the location name "
+        "(city, country format), or 'Unknown' if you genuinely cannot guess. "
+        "No explanation, no hedging, no mention of photos or images.\n\n"
+        + "\n".join(lines)
+    )
+    try:
+        msg = anthropic.Anthropic().messages.create(
+            model=AI_MODEL, max_tokens=30,
+            messages=[{"role":"user","content":prompt}])
+        _ai_increment()
+        suggestion = msg.content[0].text.strip()
+        usage = _ai_usage_info()
+        _log(f"[ai] {photo.get('filename')} → {suggestion} ({usage['used']}/{usage['limit']})")
+        return jsonify({"suggestion":suggestion,"ai_usage":usage})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/ai_infer_with_coords", methods=["POST"])
+def api_ai_infer_with_coords():
+    import anthropic
+    allowed, reason = _ai_allowed()
+    if not allowed:
+        return jsonify({"error":reason,"limit_reached":True}), 429
+    data          = request.json or {}
+    photo         = data.get("photo",{})
+    seed_lat      = data.get("seed_lat")
+    seed_lon      = data.get("seed_lon")
+    seed_location = data.get("seed_location","")
+    lines = [
+        f"Seed location (manually pinned by user): {seed_location} (GPS: {seed_lat}, {seed_lon})",
+        f"Photo filename: {photo.get('filename','unknown')}",
+        f"Folder: {photo.get('folder','unknown')}",
+    ]
+    if photo.get("date_taken"):
+        lines.append(f"Date taken: {photo['date_taken']}")
+    prompt = (
+        "You are a metadata assistant. You have NO access to any image files or photos. "
+        "Work only from the text metadata provided below.\n\n"
+        "A user manually pinned a location on a map for one photo in a folder. "
+        "Based only on the seed location and the filename/folder/date metadata below, "
+        "return the most likely location name for this photo. "
+        "If the seed location is reasonable, just return it as-is. "
+        "Reply with ONLY the location name (e.g. 'Paris, France'). "
+        "No explanation, no hedging, no mention of photos or images.\n\n"
+        + "\n".join(lines)
+    )
+    try:
+        msg = anthropic.Anthropic().messages.create(
+            model=AI_MODEL, max_tokens=30,
+            messages=[{"role":"user","content":prompt}])
+        _ai_increment()
+        location_name = msg.content[0].text.strip()
+        # Reject any response that sounds like an apology/explanation
+        if len(location_name) > 60 or any(w in location_name.lower() for w in
+                ("i don't","i cannot","i'm unable","no access","image file","photo file")):
+            location_name = seed_location  # fall back to seed
+        usage = _ai_usage_info()
+        _log(f"[ai-seed] {photo.get('filename')} → {location_name}")
+        return jsonify({"location_name":location_name,"ai_usage":usage})
+    except Exception as e:
+        return jsonify({"error":str(e)}), 500
+
+@app.route("/api/ai_usage")
+def api_ai_usage():
+    return jsonify(_ai_usage_info())
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=5000, debug=False)

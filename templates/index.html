@@ -1,0 +1,1230 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PhotoTagger</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<style>
+:root {
+  --bg:#0f1117; --surface:#181c27; --surface2:#1e2334; --border:#2a3148;
+  --accent:#4f8ef7; --accent-dim:#1e3a6e; --gold:#f0b429; --gold-dim:#4a3500;
+  --green:#3ecf8e; --green-dim:#0d3d28; --red:#f47373; --red-dim:#4a1010;
+  --purple:#a78bfa; --purple-dim:#2e1a5e;
+  --text:#e8eaf0; --text-muted:#7a84a0; --text-dim:#3d4560;
+  --radius:8px; --radius-lg:14px;
+  --mono:"JetBrains Mono","Fira Code",ui-monospace,monospace;
+  --sans:"Inter",system-ui,sans-serif;
+}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
+     min-height:100vh;display:grid;grid-template-rows:auto 1fr}
+
+/* ── Header ── */
+header{background:var(--surface);border-bottom:1px solid var(--border);
+  padding:0 16px;display:flex;align-items:center;gap:12px;height:56px;
+  position:sticky;top:0;z-index:100;overflow-x:auto}
+.logo{font-size:15px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px;white-space:nowrap}
+.logo span{color:var(--accent)}
+.scan-bar{display:flex;gap:6px;flex:1;max-width:560px;min-width:200px}
+.scan-bar input{flex:1;background:var(--surface2);border:1px solid var(--border);
+  border-radius:var(--radius);color:var(--text);padding:7px 10px;
+  font-family:var(--mono);font-size:12px;outline:none;transition:border-color .15s}
+.scan-bar input:focus{border-color:var(--accent)}
+.scan-bar input::placeholder{color:var(--text-dim)}
+.btn{padding:7px 14px;border-radius:var(--radius);border:none;cursor:pointer;
+  font-family:var(--sans);font-size:13px;font-weight:600;transition:opacity .15s;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover:not(:disabled){background:#6ba0ff}
+.btn-ghost{background:transparent;color:var(--text-muted);border:1px solid var(--border)}
+.btn-ghost:hover:not(:disabled){color:var(--text);border-color:var(--text-muted)}
+.btn-gold{background:var(--gold);color:#000}.btn-green{background:var(--green);color:#000}
+.btn-red{background:var(--red);color:#000}
+.btn-sm{padding:4px 10px;font-size:12px}
+.header-actions{display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0}
+.stats-pill{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
+  padding:4px 10px;font-size:12px;color:var(--text-muted);display:flex;gap:12px;white-space:nowrap}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
+.dot-green{background:var(--green)}.dot-gold{background:var(--gold)}.dot-red{background:var(--red)}
+
+/* ── Dry run toggle ── */
+.dry-run-toggle{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
+  padding:5px 10px;border-radius:var(--radius);border:1px solid var(--border);
+  background:var(--surface2);transition:border-color .15s;white-space:nowrap}
+.dry-run-toggle:hover{border-color:var(--gold)}
+.dry-run-toggle.active{border-color:var(--gold);background:var(--gold-dim);color:var(--gold)}
+.dry-run-toggle input{display:none}
+.toggle-track{width:28px;height:16px;background:var(--border);border-radius:8px;
+  position:relative;transition:background .15s;flex-shrink:0}
+.dry-run-toggle.active .toggle-track{background:var(--gold)}
+.toggle-thumb{position:absolute;top:2px;left:2px;width:12px;height:12px;
+  background:#fff;border-radius:50%;transition:transform .15s}
+.dry-run-toggle.active .toggle-thumb{transform:translateX(12px)}
+
+/* ── Main layout ── */
+.main{display:grid;grid-template-columns:240px 1fr;min-height:0}
+.sidebar{background:var(--surface);border-right:1px solid var(--border);
+  overflow-y:auto;padding:12px 0;display:flex;flex-direction:column;gap:0}
+.sidebar-section{padding:0 12px;margin-bottom:20px}
+.sidebar-label{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
+  color:var(--text-dim);margin-bottom:6px}
+.filter-btn{display:flex;align-items:center;gap:7px;width:100%;padding:6px 8px;
+  border-radius:var(--radius);border:none;background:transparent;color:var(--text-muted);
+  cursor:pointer;font-size:13px;text-align:left;transition:background .1s}
+.filter-btn:hover{background:var(--surface2);color:var(--text)}
+.filter-btn.active{background:var(--accent-dim);color:var(--accent);font-weight:600}
+.filter-btn .count{margin-left:auto;background:var(--surface2);border-radius:10px;
+  padding:1px 6px;font-size:11px;font-family:var(--mono)}
+.filter-btn.active .count{background:var(--accent-dim)}
+.folder-list{display:flex;flex-direction:column;gap:2px}
+.folder-item{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:var(--radius);
+  border:none;background:transparent;color:var(--text-muted);cursor:pointer;
+  font-size:11px;font-family:var(--mono);text-align:left;width:100%;overflow:hidden}
+.folder-item:hover{background:var(--surface2);color:var(--text)}
+.folder-item.active{background:var(--accent-dim);color:var(--accent)}
+.folder-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── Session list ── */
+.session-item{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--surface2);margin-bottom:4px;cursor:pointer}
+.session-item:hover{border-color:var(--accent)}
+.session-item.active{border-color:var(--accent);background:var(--accent-dim)}
+.session-name{font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
+.session-root{font-size:10px;color:var(--text-dim);font-family:var(--mono);
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── Content ── */
+.content{overflow-y:auto;padding:16px;position:relative}
+.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;
+  min-height:60vh;gap:14px;color:var(--text-muted)}
+.empty-icon{font-size:48px;opacity:.3}
+.empty-state h2{font-size:17px;color:var(--text)}
+.empty-state p{max-width:340px;text-align:center;line-height:1.6;color:var(--text-muted)}
+.spinner{width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);
+  border-radius:50%;animation:spin .7s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.progress-bar-wrap{background:var(--surface2);border-radius:4px;height:4px;overflow:hidden;margin-top:6px}
+.progress-bar-fill{height:100%;background:var(--accent);transition:width .3s;border-radius:4px}
+
+/* ── Grid toolbar ── */
+.grid-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap}
+.grid-toolbar h3{font-size:13px;color:var(--text-muted);font-weight:500}
+.grid-toolbar h3 strong{color:var(--text);font-weight:700}
+.toolbar-spacer{flex:1}
+.sort-select{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
+  border-radius:var(--radius);padding:5px 8px;font-size:12px;cursor:pointer;outline:none}
+
+/* ── Photo grid ── */
+.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
+.photo-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+  overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s;position:relative}
+.photo-card:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 6px 20px rgba(0,0,0,.4)}
+.photo-card.selected{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.photo-card.duplicate-flag{border-color:var(--purple)}
+.photo-thumb{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface2)}
+.photo-thumb-placeholder{width:100%;aspect-ratio:4/3;background:var(--surface2);
+  display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:24px}
+.photo-info{padding:8px 10px}
+.photo-filename{font-size:10px;font-family:var(--mono);color:var(--text-muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
+.photo-date{font-size:10px;color:var(--text-dim);margin-bottom:5px}
+.photo-location{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status-badge{position:absolute;top:7px;right:7px;border-radius:20px;padding:2px 7px;
+  font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase}
+.badge-gps{background:var(--green-dim);color:var(--green)}
+.badge-inferred{background:var(--gold-dim);color:var(--gold)}
+.badge-named{background:var(--accent-dim);color:var(--accent)}
+.badge-unknown{background:var(--red-dim);color:var(--red)}
+.badge-dup{background:var(--purple-dim);color:var(--purple)}
+.select-checkbox{position:absolute;top:7px;left:7px;width:18px;height:18px;
+  background:rgba(15,17,23,.7);border:2px solid var(--border);border-radius:4px;
+  display:flex;align-items:center;justify-content:center;font-size:11px;transition:.1s}
+.photo-card.selected .select-checkbox{background:var(--accent);border-color:var(--accent)}
+
+/* ── Pending bar ── */
+.pending-bar{background:var(--gold-dim);border-bottom:1px solid var(--gold);padding:8px 16px;
+  display:flex;align-items:center;gap:10px;font-size:13px;color:var(--gold)}
+.pending-bar strong{color:#fff}
+
+/* ── Detail overlay ── */
+.detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
+  display:flex;align-items:center;justify-content:center;padding:16px}
+.detail-panel{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius-lg);width:100%;max-width:860px;max-height:90vh;
+  overflow:hidden;display:grid;grid-template-columns:1fr 310px}
+.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px}
+.detail-img-wrap img{max-width:100%;max-height:68vh;object-fit:contain;display:block}
+.detail-form{padding:20px;overflow-y:auto;border-left:1px solid var(--border);
+  display:flex;flex-direction:column;gap:14px}
+.detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.detail-filename{font-family:var(--mono);font-size:11px;color:var(--text-muted);word-break:break-all}
+.close-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
+  border-radius:var(--radius);width:26px;height:26px;cursor:pointer;display:flex;
+  align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
+.close-btn:hover{color:var(--text)}
+.field-group{display:flex;flex-direction:column;gap:5px}
+.field-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--text-dim)}
+.field-input{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  color:var(--text);padding:7px 10px;font-size:13px;outline:none;transition:border-color .15s;width:100%}
+.field-input:focus{border-color:var(--accent)}
+.gps-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.field-hint{font-size:11px;color:var(--text-dim);margin-top:1px}
+.infer-bar{background:var(--gold-dim);border:1px solid var(--gold);border-radius:var(--radius);
+  padding:8px 10px;font-size:12px;color:var(--gold);display:flex;align-items:center;gap:7px}
+.detail-actions{display:flex;flex-direction:column;gap:6px;margin-top:auto;
+  padding-top:8px;border-top:1px solid var(--border)}
+
+/* ── Batch bar ── */
+.batch-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
+  background:var(--surface);border:1px solid var(--accent);border-radius:var(--radius-lg);
+  padding:10px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 6px 28px rgba(0,0,0,.5);
+  z-index:150;white-space:nowrap}
+.batch-bar span{color:var(--text-muted);font-size:13px}
+.batch-bar strong{color:var(--text)}
+
+/* ── Toast ── */
+.toast{position:fixed;bottom:68px;right:20px;background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:9px 14px;font-size:13px;color:var(--text);z-index:300;
+  opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:280px}
+.toast.show{opacity:1;transform:translateY(0)}
+.toast.success{border-color:var(--green);color:var(--green)}
+.toast.error{border-color:var(--red);color:var(--red)}
+
+/* ── Map modal ── */
+.map-modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:400;
+  display:flex;align-items:center;justify-content:center;padding:16px}
+.map-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+  width:100%;max-width:780px;overflow:hidden;display:flex;flex-direction:column}
+.map-header{display:flex;align-items:center;justify-content:space-between;
+  padding:12px 16px;border-bottom:1px solid var(--border);gap:10px}
+.map-header h3{font-size:14px;font-weight:600}
+.map-hint{font-size:12px;color:var(--text-muted);flex:1}
+#mapContainer{height:400px;width:100%}
+.map-footer{padding:10px 16px;border-top:1px solid var(--border);
+  display:flex;align-items:center;gap:8px}
+.map-coords{font-family:var(--mono);font-size:12px;color:var(--text-muted);flex:1}
+.map-coords strong{color:var(--accent)}
+
+/* ── Folder seed bar ── */
+.folder-seed-bar{background:var(--accent-dim);border:1px solid var(--accent);border-radius:var(--radius);
+  padding:8px 12px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--accent);flex-wrap:wrap}
+.folder-seed-bar button{margin-left:auto;flex-shrink:0}
+
+/* ── Seed checklist ── */
+.seed-item{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--surface2);cursor:pointer;user-select:none;transition:.1s}
+.seed-item:hover{border-color:var(--accent)}
+.seed-item.checked{border-color:var(--accent);background:var(--accent-dim)}
+.seed-item img{width:44px;height:33px;object-fit:cover;border-radius:3px;flex-shrink:0;background:var(--surface)}
+.seed-item-info{flex:1;min-width:0}
+.seed-item-name{font-family:var(--mono);font-size:11px;color:var(--text-muted);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.seed-item-date{font-size:10px;color:var(--text-dim);margin-top:1px}
+.seed-checkbox{width:17px;height:17px;border:2px solid var(--border);border-radius:3px;
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:10px}
+.seed-item.checked .seed-checkbox{background:var(--accent);border-color:var(--accent);color:#fff}
+
+/* ── Duplicates view ── */
+.dup-group{background:var(--surface);border:1px solid var(--purple);border-radius:var(--radius-lg);
+  padding:14px;margin-bottom:14px}
+.dup-group-header{display:flex;align-items:center;gap:10px;margin-bottom:10px;font-size:13px}
+.dup-photos{display:flex;gap:10px;flex-wrap:wrap}
+.dup-card{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  overflow:hidden;width:160px;flex-shrink:0;position:relative;cursor:pointer}
+.dup-card:hover{border-color:var(--accent)}
+.dup-card.keep{border-color:var(--green);box-shadow:0 0 0 2px var(--green)}
+.dup-card.remove{border-color:var(--red);opacity:.5}
+.dup-card img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block}
+.dup-card-info{padding:6px 8px;font-size:10px}
+.dup-card-name{font-family:var(--mono);color:var(--text-muted);white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis}
+.dup-card-meta{color:var(--text-dim);margin-top:2px}
+.sim-badge{position:absolute;top:4px;right:4px;background:var(--purple-dim);color:var(--purple);
+  border-radius:10px;padding:2px 6px;font-size:9px;font-weight:700}
+
+/* ── Pending modal ───────────────────────────────────────────── */
+.pending-item{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
+.pending-item-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.pending-filename{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text);
+  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pending-folder{font-size:10px;color:var(--text-dim);font-family:var(--mono)}
+.pending-change{display:flex;align-items:center;gap:8px;font-size:11px;
+  padding:3px 0;border-top:1px solid var(--border);margin-top:4px}
+.pending-field{color:var(--text-dim);font-weight:700;text-transform:uppercase;
+  font-size:10px;letter-spacing:.4px;width:76px;flex-shrink:0}
+.pending-old{color:var(--red);text-decoration:line-through;flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pending-arrow{color:var(--text-dim);flex-shrink:0}
+.pending-new{color:var(--green);flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ── Folder browser modal ── */
+.browser-list{max-height:360px;overflow-y:auto;padding:8px 4px}
+.browser-item{display:flex;align-items:center;gap:8px;padding:7px 10px;border-radius:var(--radius);
+  cursor:pointer;font-size:13px;font-family:var(--mono);color:var(--text-muted);transition:background .1s}
+.browser-item:hover{background:var(--surface2);color:var(--text)}
+.browser-path{font-size:11px;font-family:var(--mono);color:var(--accent);padding:8px 12px;
+  background:var(--surface2);border-bottom:1px solid var(--border);word-break:break-all}
+</style>
+</head>
+<body>
+
+<header>
+  <div class="logo">📷 <span>Photo</span>Tagger</div>
+  <div class="scan-bar">
+    <input id="folderInput" type="text" placeholder="/photos"/>
+    <button class="btn btn-ghost btn-sm" onclick="openBrowser()" title="Browse folders">📁</button>
+    <button class="btn btn-primary" id="scanBtn" onclick="startScan()">Scan</button>
+    <button class="btn btn-ghost btn-sm" id="rescanBtn" style="display:none" onclick="startRescan()" title="Rescan for new/changed files">↻ Rescan</button>
+  </div>
+  <div class="header-actions">
+    <label class="dry-run-toggle" id="dryRunToggle" title="Preview mode — no files written to disk">
+      <input type="checkbox" id="dryRunCheck" onchange="toggleDryRun(this)"/>
+      <div class="toggle-track"><div class="toggle-thumb"></div></div>
+      <span>Dry run</span>
+    </label>
+    <div class="stats-pill" id="statsPill" style="display:none">
+      <span><span class="dot dot-green"></span><span id="statGps">0</span> GPS</span>
+      <span><span class="dot dot-gold"></span><span id="statInf">0</span> Inf</span>
+      <span><span class="dot dot-red"></span><span id="statUnk">0</span> Unk</span>
+    </div>
+    <button class="btn btn-ghost btn-sm" id="dupBtn" style="display:none" onclick="showDuplicates()">🔍 Duplicates</button>
+    <button class="btn btn-gold btn-sm" id="geoBtn" style="display:none" onclick="batchGeocode()">🌍 Geocode</button>
+    <button class="btn btn-green btn-sm" id="saveAllBtn" style="display:none" onclick="saveAll()">💾 Save All</button>
+  </div>
+</header>
+
+<!-- pending dry-run bar -->
+<div id="pendingBar" class="pending-bar" style="display:none">
+  🧪 <strong id="pendingCount">0</strong> unsaved dry-run changes —
+  <button class="btn btn-gold btn-sm" onclick="openPendingModal()">Review &amp; write to files</button>
+  <button class="btn btn-ghost btn-sm" onclick="discardPending()">Discard all</button>
+</div>
+
+<div class="main">
+<aside class="sidebar">
+  <div class="sidebar-section">
+    <div class="sidebar-label">Filter</div>
+    <button class="filter-btn active" onclick="setFilter('all')" id="filter-all">📁 All <span class="count" id="cnt-all">0</span></button>
+    <button class="filter-btn" onclick="setFilter('gps')" id="filter-gps"><span style="color:var(--green)">●</span> GPS <span class="count" id="cnt-gps">0</span></button>
+    <button class="filter-btn" onclick="setFilter('inferred')" id="filter-inferred"><span style="color:var(--gold)">●</span> Inferred <span class="count" id="cnt-inferred">0</span></button>
+    <button class="filter-btn" onclick="setFilter('named')" id="filter-named"><span style="color:var(--accent)">●</span> Named <span class="count" id="cnt-named">0</span></button>
+    <button class="filter-btn" onclick="setFilter('unknown')" id="filter-unknown"><span style="color:var(--red)">●</span> Untagged <span class="count" id="cnt-unknown">0</span></button>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-label">Folders</div>
+    <div class="folder-list" id="folderList"></div>
+  </div>
+  <div class="sidebar-section">
+    <div class="sidebar-label" style="display:flex;justify-content:space-between;align-items:center">
+      Sessions
+      <button class="btn btn-ghost btn-sm" onclick="newSession()" style="font-size:10px;padding:2px 6px">+ New</button>
+    </div>
+    <div id="sessionList"></div>
+  </div>
+</aside>
+
+<main class="content" id="content">
+  <div class="empty-state" id="emptyState">
+    <div class="empty-icon">🗂️</div>
+    <h2>Point at your photo library</h2>
+    <p>Enter a folder path above, or click 📁 to browse. Hit Scan to start.</p>
+  </div>
+  <div id="gridContainer" style="display:none">
+    <div class="grid-toolbar">
+      <h3 id="gridTitle"><strong>0</strong> photos</h3>
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-ghost btn-sm" onclick="selectAllVisible()">Select all</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearSelection()">Clear</button>
+      <select class="sort-select" onchange="setSort(this.value)">
+        <option value="date">By date</option>
+        <option value="name">By name</option>
+        <option value="status">By status</option>
+        <option value="folder">By folder</option>
+      </select>
+    </div>
+    <div class="photo-grid" id="photoGrid"></div>
+  </div>
+  <div id="dupContainer" style="display:none">
+    <div class="grid-toolbar">
+      <h3>Duplicate groups</h3>
+      <div class="toolbar-spacer"></div>
+      <button class="btn btn-ghost btn-sm" onclick="showGrid()">← Back to grid</button>
+    </div>
+    <div id="dupList"></div>
+  </div>
+</main>
+</div>
+
+<!-- Detail overlay -->
+<div class="detail-overlay" id="detailOverlay" style="display:none" onclick="closeDetail(event)">
+  <div class="detail-panel" onclick="event.stopPropagation()">
+    <div class="detail-img-wrap"><img id="detailImg" src="" alt=""/></div>
+    <div class="detail-form">
+      <div class="detail-header">
+        <div class="detail-filename" id="detailFilename"></div>
+        <button class="close-btn" onclick="closeDetail()">✕</button>
+      </div>
+      <div id="inferBar" class="infer-bar" style="display:none">
+        <span>🤖</span><span id="inferBarText"></span>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Location</div>
+        <input class="field-input" id="detailLocation" type="text" placeholder="e.g. Paris, France"/>
+        <div class="field-hint" id="detailLocationHint"></div>
+        <button class="btn btn-ghost btn-sm" onclick="aiInfer()" id="aiBtn">🤖 AI Suggest</button>
+      </div>
+      <div class="field-group">
+        <div class="field-label">Date Taken</div>
+        <input class="field-input" id="detailDate" type="datetime-local"/>
+        <div class="field-hint" id="detailDateHint"></div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">GPS Coordinates</div>
+        <div class="gps-row">
+          <input class="field-input" id="detailLat" type="number" step="0.000001" placeholder="Latitude" oninput="onCoordsChanged()"/>
+          <input class="field-input" id="detailLon" type="number" step="0.000001" placeholder="Longitude" oninput="onCoordsChanged()"/>
+        </div>
+        <div style="display:flex;gap:5px;flex-wrap:wrap">
+          <button class="btn btn-ghost btn-sm" onclick="reverseGeocode()" id="geocodeBtn">🌍 Geocode</button>
+          <button class="btn btn-ghost btn-sm" onclick="openMapPicker()">🗺️ Map</button>
+        </div>
+      </div>
+      <div class="folder-seed-bar" id="folderSeedBar" style="display:none">
+        <span>📁 Seed to untagged in <strong id="folderSeedName"></strong></span>
+        <button class="btn btn-primary btn-sm" onclick="seedFolder()">Choose photos…</button>
+      </div>
+      <div class="detail-actions">
+        <button class="btn btn-primary" onclick="saveDetail()" id="saveDetailBtn">💾 Save to file</button>
+        <div style="display:flex;gap:6px">
+          <button class="btn btn-ghost btn-sm" onclick="prevPhoto()">← Prev</button>
+          <button class="btn btn-ghost btn-sm" onclick="nextPhoto()">Next →</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Batch bar -->
+<div class="batch-bar" id="batchBar" style="display:none">
+  <span><strong id="batchCount">0</strong> selected</span>
+  <button class="btn btn-primary btn-sm" onclick="batchSetLocation()">📍 Set location…</button>
+  <button class="btn btn-green btn-sm" onclick="batchSave()">💾 Save</button>
+  <button class="btn btn-ghost btn-sm" onclick="clearSelection()">✕</button>
+</div>
+
+<!-- Batch location prompt -->
+<div class="detail-overlay" id="batchPrompt" style="display:none" onclick="closeBatchPrompt(event)">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+              width:100%;max-width:400px;padding:22px" onclick="event.stopPropagation()">
+    <h3 style="margin-bottom:14px">Set location for selected</h3>
+    <div class="field-group" style="margin-bottom:10px">
+      <div class="field-label">Location Name</div>
+      <input class="field-input" id="batchLocation" type="text" placeholder="e.g. Tokyo, Japan"/>
+    </div>
+    <div class="gps-row" style="margin-bottom:14px">
+      <div class="field-group"><div class="field-label">Latitude</div>
+        <input class="field-input" id="batchLat" type="number" step="0.000001" placeholder="Optional"/></div>
+      <div class="field-group"><div class="field-label">Longitude</div>
+        <input class="field-input" id="batchLon" type="number" step="0.000001" placeholder="Optional"/></div>
+    </div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="applyBatchLocation()">Apply to <span id="batchCountPrompt">0</span></button>
+      <button class="btn btn-ghost" onclick="closeBatchPrompt()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Map picker -->
+<div class="map-modal" id="mapModal" style="display:none" onclick="closeMapModal(event)">
+  <div class="map-panel" onclick="event.stopPropagation()">
+    <div class="map-header">
+      <h3>📍 Pick on map</h3>
+      <span class="map-hint">Click to drop pin</span>
+      <div style="display:flex;gap:4px">
+        <button class="btn btn-primary btn-sm" id="layerSatBtn" onclick="setMapLayer('satellite')">🛰 Satellite</button>
+        <button class="btn btn-ghost btn-sm" id="layerStreetBtn" onclick="setMapLayer('street')">🗺 Street</button>
+      </div>
+      <button class="close-btn" onclick="closeMapModal()">✕</button>
+    </div>
+    <div id="mapContainer"></div>
+    <div class="map-footer">
+      <div class="map-coords" id="mapCoords">Click the map to drop a pin</div>
+      <button class="btn btn-ghost btn-sm" onclick="closeMapModal()">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="mapConfirmBtn" disabled onclick="confirmMapPin()">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Seed checklist modal -->
+<div class="map-modal" id="seedModal" style="display:none" onclick="closeSeedModal(event)">
+  <div class="map-panel" style="max-width:600px" onclick="event.stopPropagation()">
+    <div class="map-header">
+      <h3>📁 Propagate to folder</h3>
+      <span class="map-hint" id="seedModalHint"></span>
+      <button class="close-btn" onclick="closeSeedModal()">✕</button>
+    </div>
+    <div id="seedChecklist" style="overflow-y:auto;max-height:400px;padding:10px 14px;display:flex;flex-direction:column;gap:6px"></div>
+    <div class="map-footer" style="gap:8px">
+      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)">All</button>
+      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)">None</button>
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost btn-sm" onclick="closeSeedModal()">Cancel</button>
+      <button class="btn btn-primary btn-sm" id="seedApplyBtn" onclick="applySeedSelection()">Apply</button>
+    </div>
+  </div>
+</div>
+
+<!-- Folder browser -->
+<div class="map-modal" id="browserModal" style="display:none" onclick="closeBrowser(event)">
+  <div class="map-panel" style="max-width:500px" onclick="event.stopPropagation()">
+    <div class="map-header">
+      <h3>📁 Browse folders</h3>
+      <button class="close-btn" onclick="closeBrowser()">✕</button>
+    </div>
+    <div class="browser-path" id="browserPath"></div>
+    <div class="browser-list" id="browserList"></div>
+    <div class="map-footer" style="gap:8px">
+      <button class="btn btn-ghost btn-sm" id="browserUpBtn" onclick="browserUp()">↑ Up</button>
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost btn-sm" onclick="closeBrowser()">Cancel</button>
+      <button class="btn btn-primary btn-sm" onclick="browserSelect()">Select this folder</button>
+    </div>
+  </div>
+</div>
+
+<!-- Pending changes modal -->
+<div class="map-modal" id="pendingModal" style="display:none" onclick="closePendingModal(event)">
+  <div class="map-panel" style="max-width:680px" onclick="event.stopPropagation()">
+    <div class="map-header">
+      <h3>🧪 Review pending changes</h3>
+      <span class="map-hint" id="pendingModalHint"></span>
+      <button class="close-btn" onclick="closePendingModal()">✕</button>
+    </div>
+    <div id="pendingModalList" style="overflow-y:auto;max-height:460px;padding:12px 16px;display:flex;flex-direction:column;gap:8px"></div>
+    <div class="map-footer" style="gap:8px">
+      <span style="font-size:12px;color:var(--text-muted)">These changes will be written to the actual files on disk.</span>
+      <div style="flex:1"></div>
+      <button class="btn btn-ghost btn-sm" onclick="closePendingModal()">Cancel</button>
+      <button class="btn btn-red btn-sm" onclick="discardPending()">Discard all</button>
+      <button class="btn btn-gold btn-sm" onclick="commitPending()">✓ Write to files</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<script>
+// ── State ──────────────────────────────────────────────────────────
+let allPhotos=[], filtered=[], selected=new Set();
+let currentFilter='all', currentSort='date', currentFolder=null, detailIndex=-1;
+let dryRun=false, currentScanRoot='';
+let _pollInterval=null;
+
+// ── Dry run ────────────────────────────────────────────────────────
+function toggleDryRun(cb) {
+  dryRun = cb.checked;
+  document.getElementById('dryRunToggle').classList.toggle('active', dryRun);
+  const ex = document.getElementById('dryRunBanner');
+  if (dryRun && !ex) {
+    const b=document.createElement('div'); b.id='dryRunBanner';
+    b.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:500;background:var(--gold-dim);border-top:2px solid var(--gold);color:var(--gold);text-align:center;padding:7px;font-size:13px;font-weight:600';
+    b.textContent='🧪 Dry run ON — saves preview only, nothing written to disk';
+    document.body.appendChild(b);
+  } else if (!dryRun && ex) ex.remove();
+  toast(dryRun ? 'Dry run ON' : 'Dry run OFF — saves will write to files', dryRun?'':'success');
+  refreshPendingBar();
+}
+
+async function refreshPendingBar() {
+  if (!currentScanRoot) return;
+  const r = await fetch('/api/pending?folder='+encodeURIComponent(currentScanRoot));
+  const d = await r.json();
+  const bar = document.getElementById('pendingBar');
+  if (d.count > 0) {
+    document.getElementById('pendingCount').textContent = d.count;
+    bar.style.display='flex';
+  } else {
+    bar.style.display='none';
+  }
+}
+
+async function openPendingModal() {
+  const r = await fetch('/api/pending?folder='+encodeURIComponent(currentScanRoot));
+  const d = await r.json();
+  document.getElementById('pendingModalHint').textContent =
+    `${d.photo_count} photo${d.photo_count!==1?'s':''}, ${d.count} field change${d.count!==1?'s':''}`;
+  const list = document.getElementById('pendingModalList');
+  list.innerHTML = '';
+  if (!d.pending.length) {
+    list.innerHTML='<div style="color:var(--text-muted);padding:16px">No pending changes.</div>';
+  } else {
+    d.pending.forEach(p => {
+      const item = document.createElement('div');
+      item.className = 'pending-item';
+      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date'};
+      const changes = p.changes.map(c => `
+        <div class="pending-change">
+          <span class="pending-field">${fieldLabels[c.field]||c.field}</span>
+          <span class="pending-old">${c.old_value||'—'}</span>
+          <span class="pending-arrow">→</span>
+          <span class="pending-new">${c.new_value||'—'}</span>
+        </div>`).join('');
+      item.innerHTML = `
+        <div class="pending-item-header">
+          <span class="pending-filename">📷 ${p.filename}</span>
+          <span class="pending-folder">${p.folder||'root'}</span>
+        </div>
+        ${changes}`;
+      list.appendChild(item);
+    });
+  }
+  document.getElementById('pendingModal').style.display='flex';
+}
+
+function closePendingModal(e) {
+  if (e && e.target !== document.getElementById('pendingModal')) return;
+  document.getElementById('pendingModal').style.display='none';
+}
+
+async function commitPending() {
+  document.getElementById('pendingModal').style.display='none';
+  const r = await fetch('/api/pending/commit', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  const d = await r.json();
+  toast(`Written ${d.committed} changes to files`, 'success');
+  refreshPendingBar();
+}
+
+async function discardPending() {
+  if (!confirm('Discard all unsaved dry-run changes?')) return;
+  document.getElementById('pendingModal').style.display='none';
+  await fetch('/api/pending/discard', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
+  toast('Pending changes discarded');
+  refreshPendingBar();
+}
+
+// ── Scan ───────────────────────────────────────────────────────────
+async function startScan(rescan=false) {
+  const folder = document.getElementById('folderInput').value.trim();
+  if (!folder) return;
+  currentScanRoot = folder;
+  const btn = document.getElementById('scanBtn');
+  btn.disabled=true; btn.textContent='Scanning…';
+  showProgress('Starting…', 0, 1);
+  const r = await fetch('/api/scan', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({folder, rescan})});
+  const d = await r.json();
+  if (d.error) { toast(d.error,'error'); btn.disabled=false; btn.textContent='Scan'; return; }
+  clearInterval(_pollInterval);
+  _pollInterval = setInterval(pollProgress, 800);
+}
+
+function startRescan() { startScan(true); }
+
+async function pollProgress() {
+  const r = await fetch('/api/scan_progress');
+  const s = await r.json();
+  const labels={counting:'Counting',reading:'Reading EXIF',inferring:'Inferring',geocoding:'Geocoding',done:'Done',error:'Error'};
+  showProgress(s.message || labels[s.phase] || s.phase, s.current, s.total||1);
+  if (s.phase==='done') { clearInterval(_pollInterval); await loadResult(); }
+  else if (s.phase==='error') {
+    clearInterval(_pollInterval);
+    const btn=document.getElementById('scanBtn'); btn.disabled=false; btn.textContent='Scan';
+    showEmpty(`<div class="empty-icon">⚠️</div><h2>Scan failed</h2><p>${s.error}</p>`);
+    toast('Scan failed: '+s.error,'error');
+  }
+}
+
+async function loadResult() {
+  const r = await fetch('/api/scan_result?folder='+encodeURIComponent(currentScanRoot));
+  const d = await r.json();
+  allPhotos = d.photos;
+  buildFolderList(); applyFilter('all'); updateStats();
+  ['statsPill','geoBtn','saveAllBtn','dupBtn','rescanBtn'].forEach(id=>document.getElementById(id).style.display='');
+  document.getElementById('scanBtn').disabled=false;
+  document.getElementById('scanBtn').textContent='Scan';
+  loadSessions(); refreshPendingBar();
+  toast(`Loaded ${d.total} photos`, 'success');
+}
+
+function showProgress(msg, cur, tot) {
+  const pct = tot>0 ? Math.round(cur/tot*100) : 0;
+  document.getElementById('emptyState').innerHTML=`
+    <div style="display:flex;flex-direction:column;align-items:center;gap:16px;min-height:60vh;justify-content:center;width:100%;max-width:460px;margin:0 auto">
+      <div class="spinner"></div>
+      <div style="width:100%">
+        <div style="display:flex;justify-content:space-between;margin-bottom:6px;font-size:12px;color:var(--text-muted)">
+          <span>${msg}</span><span style="font-family:var(--mono)">${cur>0?cur+(tot>1?' / '+tot:''):''}</span>
+        </div>
+        <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
+      </div>
+      <p style="font-size:11px;color:var(--text-dim)">Check Docker logs for live detail</p>
+    </div>`;
+  document.getElementById('emptyState').style.display='flex';
+  document.getElementById('gridContainer').style.display='none';
+  document.getElementById('dupContainer').style.display='none';
+}
+
+function showEmpty(html) {
+  document.getElementById('emptyState').innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;gap:14px;min-height:60vh;justify-content:center">${html}</div>`;
+  document.getElementById('emptyState').style.display='flex';
+  document.getElementById('gridContainer').style.display='none';
+}
+
+// ── Filter & sort ──────────────────────────────────────────────────
+function setFilter(f) {
+  currentFilter=f; currentFolder=null;
+  document.querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+  document.getElementById('filter-'+f).classList.add('active');
+  document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
+  applyFilter(f);
+}
+function applyFilter(f) {
+  filtered = f==='all' ? [...allPhotos] : allPhotos.filter(p=>p.status===f);
+  if (currentFolder) filtered=filtered.filter(p=>p.folder===currentFolder);
+  showGrid(); renderGrid();
+}
+function setSort(s) { currentSort=s; renderGrid(); }
+function sortedFiltered() {
+  const a=[...filtered];
+  if (currentSort==='date') a.sort((x,y)=>(x.date_taken||'').localeCompare(y.date_taken||''));
+  else if (currentSort==='name') a.sort((x,y)=>x.filename.localeCompare(y.filename));
+  else if (currentSort==='folder') a.sort((x,y)=>x.folder.localeCompare(y.folder));
+  else { const o={gps:0,named:1,inferred:2,unknown:3}; a.sort((x,y)=>(o[x.status]||0)-(o[y.status]||0)); }
+  return a;
+}
+
+// ── Render ─────────────────────────────────────────────────────────
+function showGrid() {
+  document.getElementById('emptyState').style.display='none';
+  document.getElementById('gridContainer').style.display='';
+  document.getElementById('dupContainer').style.display='none';
+}
+
+function renderGrid() {
+  if (!allPhotos.length) return;
+  showGrid();
+  const arr = sortedFiltered();
+  document.getElementById('gridTitle').innerHTML=`<strong>${arr.length}</strong> photos`;
+  const grid = document.getElementById('photoGrid');
+  grid.innerHTML='';
+  arr.forEach((p,i)=>{
+    const card=document.createElement('div');
+    const bc={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',unknown:'badge-unknown'}[p.status]||'badge-unknown';
+    const bl={gps:'GPS',inferred:'Inf',named:'Tagged',unknown:'?'}[p.status];
+    const loc = p.location_name
+      ? `<span style="color:var(--text)">${p.location_name}</span>`
+      : p.status==='inferred'
+        ? `<span style="color:var(--gold)">≈ inferred</span>`
+        : `<span style="color:var(--red)">Untagged</span>`;
+    const dt = p.date_taken
+      ? new Date(p.date_taken).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'})
+      : 'No date';
+    card.className='photo-card'+(selected.has(p.id)?' selected':'');
+    card.dataset.id=p.id;
+    card.innerHTML=`
+      <div class="select-checkbox" onclick="toggleSelect(event,'${p.id.replace(/'/g,"\\'")}')">
+        ${selected.has(p.id)?'✓':''}
+      </div>
+      <img class="photo-thumb" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220"
+           loading="lazy" onerror="this.outerHTML='<div class=\\'photo-thumb-placeholder\\'>📷</div>'"/>
+      <div class="status-badge ${bc}">${bl}</div>
+      <div class="photo-info">
+        <div class="photo-filename">${p.filename}</div>
+        <div class="photo-date">${dt}</div>
+        <div class="photo-location">${loc}</div>
+      </div>`;
+    card.addEventListener('click', e=>{
+      if (e.target.classList.contains('select-checkbox')||e.target.closest('.select-checkbox')) return;
+      openDetail(i);
+    });
+    grid.appendChild(card);
+  });
+}
+
+// ── Stats & sidebar ────────────────────────────────────────────────
+function updateStats() {
+  const c={gps:0,inferred:0,named:0,unknown:0};
+  allPhotos.forEach(p=>c[p.status]=(c[p.status]||0)+1);
+  document.getElementById('statGps').textContent=c.gps||0;
+  document.getElementById('statInf').textContent=c.inferred||0;
+  document.getElementById('statUnk').textContent=c.unknown||0;
+  document.getElementById('cnt-all').textContent=allPhotos.length;
+  document.getElementById('cnt-gps').textContent=c.gps||0;
+  document.getElementById('cnt-inferred').textContent=c.inferred||0;
+  document.getElementById('cnt-named').textContent=c.named||0;
+  document.getElementById('cnt-unknown').textContent=c.unknown||0;
+}
+
+function buildFolderList() {
+  const folders={};
+  allPhotos.forEach(p=>folders[p.folder]=(folders[p.folder]||0)+1);
+  const list=document.getElementById('folderList'); list.innerHTML='';
+  Object.entries(folders).sort().forEach(([f,cnt])=>{
+    const btn=document.createElement('button');
+    btn.className='folder-item'; btn.title=f||'(root)';
+    btn.innerHTML=`<span>📁 ${f||'(root)'}</span><span style="margin-left:auto;color:var(--text-dim);font-size:10px">${cnt}</span>`;
+    btn.onclick=()=>{ currentFolder=f; currentFilter='all';
+      document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      filtered=allPhotos.filter(p=>p.folder===f); renderGrid(); };
+    list.appendChild(btn);
+  });
+}
+
+// ── Sessions ───────────────────────────────────────────────────────
+async function loadSessions() {
+  const r=await fetch('/api/sessions'); const d=await r.json();
+  const list=document.getElementById('sessionList'); list.innerHTML='';
+  d.sessions.forEach(s=>{
+    const el=document.createElement('div'); el.className='session-item';
+    el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${s.name}</div>
+      <div class="session-root">${s.scan_root}</div></div>
+      <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px"
+        onclick="event.stopPropagation();deleteSession(${s.id})">✕</button>`;
+    el.onclick=()=>{ document.getElementById('folderInput').value=s.scan_root;
+      fetch('/api/sessions/'+s.id+'/use',{method:'POST'});
+      startScan(); };
+    list.appendChild(el);
+  });
+}
+
+async function newSession() {
+  const root=document.getElementById('folderInput').value.trim();
+  if (!root) { toast('Scan a folder first','error'); return; }
+  const name=prompt('Session name:', root.split('/').pop()||root);
+  if (!name) return;
+  await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name,scan_root:root})});
+  loadSessions();
+  toast('Session saved','success');
+}
+
+async function deleteSession(id) {
+  await fetch('/api/sessions/'+id,{method:'DELETE'}); loadSessions();
+}
+
+// ── Selection ──────────────────────────────────────────────────────
+function toggleSelect(e,id){
+  e.stopPropagation();
+  selected.has(id)?selected.delete(id):selected.add(id);
+  updateBatchBar(); renderGrid();
+}
+function selectAllVisible(){sortedFiltered().forEach(p=>selected.add(p.id));updateBatchBar();renderGrid();}
+function clearSelection(){selected.clear();updateBatchBar();renderGrid();}
+function updateBatchBar(){
+  const bar=document.getElementById('batchBar');
+  if(selected.size>0){bar.style.display='flex';document.getElementById('batchCount').textContent=selected.size;}
+  else bar.style.display='none';
+}
+
+// ── Detail ─────────────────────────────────────────────────────────
+function openDetail(idx) {
+  const arr=sortedFiltered();
+  if(idx<0||idx>=arr.length) return;
+  detailIndex=idx; const p=arr[idx];
+  document.getElementById('detailFilename').textContent=p.path;
+  document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=600';
+  document.getElementById('detailLocation').value=p.location_name||'';
+  document.getElementById('detailLat').value=p.lat||p.inferred_lat||'';
+  document.getElementById('detailLon').value=p.lon||p.inferred_lon||'';
+  const di=document.getElementById('detailDate');
+  if(p.date_taken){try{di.value=p.date_taken.replace(' ','T').slice(0,16);}catch(e){}}
+  else di.value='';
+  const ib=document.getElementById('inferBar');
+  if(p.status==='inferred'){ib.style.display='flex';
+    document.getElementById('inferBarText').textContent=`Inferred from "${p.inferred_from}" (${p.inferred_delta_min} min apart)`;}
+  else ib.style.display='none';
+  document.getElementById('detailLocationHint').textContent=
+    p.has_gps?`GPS: ${(p.lat||0).toFixed(5)}, ${(p.lon||0).toFixed(5)}`:'No GPS in file';
+  // Date source hint
+  const dh=document.getElementById('detailDateHint');
+  if(dh) {
+    if(p.date_source==='filesystem'){
+      dh.textContent='⚠️ No EXIF date — using file date as estimate';
+      dh.style.color='var(--gold)';
+    } else if(p.date_source==='exif'){
+      dh.textContent='✓ From EXIF';
+      dh.style.color='var(--green)';
+    } else { dh.textContent=''; }
+  }
+  document.getElementById('detailOverlay').style.display='flex';
+  onCoordsChanged();
+}
+function closeDetail(e){
+  if(e&&e.target!==document.getElementById('detailOverlay')) return;
+  document.getElementById('detailOverlay').style.display='none';
+}
+function prevPhoto(){if(detailIndex>0)openDetail(detailIndex-1);}
+function nextPhoto(){const a=sortedFiltered();if(detailIndex<a.length-1)openDetail(detailIndex+1);}
+
+async function reverseGeocode(){
+  const lat=parseFloat(document.getElementById('detailLat').value);
+  const lon=parseFloat(document.getElementById('detailLon').value);
+  if(isNaN(lat)||isNaN(lon)){toast('Enter lat/lon first','error');return;}
+  const btn=document.getElementById('geocodeBtn');
+  btn.disabled=true; btn.textContent='…';
+  const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon})});
+  const d=await r.json();
+  if(d.location_name){document.getElementById('detailLocation').value=d.location_name;toast('📍 '+d.location_name,'success');}
+  else toast('Could not geocode','error');
+  btn.disabled=false; btn.textContent='🌍 Geocode';
+}
+
+async function aiInfer(){
+  const arr=sortedFiltered(); const p=arr[detailIndex];
+  const btn=document.getElementById('aiBtn'); btn.disabled=true; btn.textContent='🤖 Thinking…';
+  const neighbors=allPhotos.filter(n=>n.location_name&&n.id!==p.id&&n.date_taken&&p.date_taken)
+    .filter(n=>Math.abs(new Date(n.date_taken)-new Date(p.date_taken))<7*86400000).slice(0,6);
+  const r=await fetch('/api/ai_infer',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({photo:p,neighbors})});
+  const d=await r.json();
+  if(d.limit_reached){toast('Daily AI limit reached','error');btn.textContent='🤖 Limit reached';return;}
+  if(d.suggestion&&d.suggestion!=='Unknown'){document.getElementById('detailLocation').value=d.suggestion;toast('AI: '+d.suggestion,'success');}
+  else toast('AI could not suggest a location','error');
+  if(d.ai_usage){const el=document.getElementById('aiUsed');if(el)el.textContent=d.ai_usage.used;}
+  btn.disabled=false; btn.textContent='🤖 AI Suggest';
+}
+
+async function saveDetail(){
+  const arr=sortedFiltered(); const p=arr[detailIndex];
+  const btn=document.getElementById('saveDetailBtn'); btn.disabled=true; btn.textContent='Saving…';
+  const dv=document.getElementById('detailDate').value;
+  const payload={
+    id:p.id, path:p.path,
+    location_name:document.getElementById('detailLocation').value,
+    lat:parseFloat(document.getElementById('detailLat').value)||null,
+    lon:parseFloat(document.getElementById('detailLon').value)||null,
+    date_taken:dv?dv+':00':null, dry_run:dryRun
+  };
+  const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+  const d=await r.json();
+  if(d.ok){
+    const orig=allPhotos.find(x=>x.id===p.id);
+    if(orig){Object.assign(orig,{location_name:payload.location_name,lat:payload.lat,lon:payload.lon,
+      date_taken:payload.date_taken,
+      status:payload.lat&&payload.lon?'gps':(payload.location_name?'named':'unknown')});}
+    updateStats(); renderGrid();
+    toast(d.dry_run?'✓ Dry run preview saved':'Saved!',d.dry_run?'':'success');
+    if(dryRun) refreshPendingBar();
+  } else toast('Save failed: '+d.error,'error');
+  btn.disabled=false; btn.textContent='💾 Save to file';
+}
+
+// ── Batch ──────────────────────────────────────────────────────────
+async function batchGeocode(){
+  const need=allPhotos.filter(p=>p.has_gps&&!p.location_name);
+  if(!need.length){toast('All GPS photos geocoded','success');return;}
+  toast(`Geocoding ${need.length} photos…`);
+  let done=0;
+  for(const p of need){
+    const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:p.lat,lon:p.lon})});
+    const d=await r.json();
+    if(d.location_name){p.location_name=d.location_name;p.status='gps';}
+    done++; if(done%10===0){updateStats();renderGrid();toast(`Geocoded ${done}/${need.length}…`);}
+  }
+  updateStats();renderGrid();toast(`Geocoded ${done} photos`,'success');
+}
+
+async function saveAll(){
+  if(!confirm(`Write location data to ${allPhotos.filter(p=>p.location_name||p.lat).length} files?`)) return;
+  const toSave=allPhotos.filter(p=>p.location_name||p.lat);
+  const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({photos:toSave,dry_run:dryRun})});
+  const d=await r.json();
+  const ok=d.results.filter(x=>x.ok).length;
+  toast(d.dry_run?`Dry run: ${ok} previewed`:` Saved ${ok}`,d.dry_run?'':'success');
+  if(dryRun) refreshPendingBar();
+}
+
+function batchSetLocation(){
+  document.getElementById('batchCountPrompt').textContent=selected.size;
+  document.getElementById('batchLocation').value='';
+  document.getElementById('batchLat').value='';
+  document.getElementById('batchLon').value='';
+  document.getElementById('batchPrompt').style.display='flex';
+}
+function closeBatchPrompt(e){
+  if(e&&e.target!==document.getElementById('batchPrompt')) return;
+  document.getElementById('batchPrompt').style.display='none';
+}
+function applyBatchLocation(){
+  const loc=document.getElementById('batchLocation').value;
+  const lat=parseFloat(document.getElementById('batchLat').value)||null;
+  const lon=parseFloat(document.getElementById('batchLon').value)||null;
+  selected.forEach(id=>{const p=allPhotos.find(x=>x.id===id);if(!p)return;
+    if(loc)p.location_name=loc;if(lat)p.lat=lat;if(lon)p.lon=lon;
+    p.status=lat&&lon?'gps':(loc?'named':p.status);});
+  updateStats();renderGrid();document.getElementById('batchPrompt').style.display='none';
+  toast(`Applied to ${selected.size} photos`,'success');
+}
+async function batchSave(){
+  const toSave=allPhotos.filter(p=>selected.has(p.id));
+  const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({photos:toSave,dry_run:dryRun})});
+  const d=await r.json();
+  const ok=d.results.filter(x=>x.ok).length;
+  toast(d.dry_run?`Dry run: ${ok} previewed`:`Saved ${ok}`,'success');
+  if(dryRun) refreshPendingBar();
+}
+
+// ── Duplicates ─────────────────────────────────────────────────────
+async function showDuplicates(){
+  document.getElementById('emptyState').style.display='none';
+  document.getElementById('gridContainer').style.display='none';
+  document.getElementById('dupContainer').style.display='';
+  document.getElementById('dupList').innerHTML='<div style="color:var(--text-muted);padding:20px">Scanning for duplicates…</div>';
+  const r=await fetch('/api/duplicates?folder='+encodeURIComponent(currentScanRoot));
+  const d=await r.json();
+  const list=document.getElementById('dupList');
+  if(!d.total_groups){list.innerHTML='<div style="color:var(--green);padding:20px">✓ No duplicates found!</div>';return;}
+  list.innerHTML='';
+
+  const renderGroup=(photos,label,color)=>{
+    const g=document.createElement('div'); g.className='dup-group';
+    g.innerHTML=`<div class="dup-group-header"><span style="color:${color};font-weight:700">${label}</span>
+      <span style="color:var(--text-muted)">${photos.length} photos</span></div>
+      <div class="dup-photos">${photos.map(p=>`
+        <div class="dup-card" title="${p.filename}">
+          <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
+               onerror="this.style.display='none'"/>
+          ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
+          <div class="dup-card-info">
+            <div class="dup-card-name">${p.filename}</div>
+            <div class="dup-card-meta">${p.size_kb}KB · ${p.folder||'root'}</div>
+          </div>
+        </div>`).join('')}
+      </div>`;
+    list.appendChild(g);
+  };
+
+  d.phash_groups.forEach(g=>renderGroup(g,'🔍 Visual duplicates','var(--purple)'));
+  d.fname_groups.forEach(g=>renderGroup(g,'📄 Filename duplicates','var(--gold)'));
+}
+
+function showGrid(){
+  document.getElementById('emptyState').style.display='none';
+  document.getElementById('gridContainer').style.display='';
+  document.getElementById('dupContainer').style.display='none';
+}
+
+// ── Map picker ─────────────────────────────────────────────────────
+let _map=null,_mapMarker=null,_mapPin=null,_satLayer=null,_streetLayer=null;
+
+function setMapLayer(t){
+  if(!_map) return;
+  if(t==='satellite'){
+    if(_streetLayer) _map.removeLayer(_streetLayer);
+    if(_satLayer) _satLayer.addTo(_map);
+    document.getElementById('layerSatBtn').className='btn btn-primary btn-sm';
+    document.getElementById('layerStreetBtn').className='btn btn-ghost btn-sm';
+  } else {
+    if(_satLayer) _map.removeLayer(_satLayer);
+    if(_streetLayer) _streetLayer.addTo(_map);
+    document.getElementById('layerSatBtn').className='btn btn-ghost btn-sm';
+    document.getElementById('layerStreetBtn').className='btn btn-primary btn-sm';
+  }
+}
+
+function openMapPicker(){
+  document.getElementById('mapModal').style.display='flex';
+  if(!_map){
+    _map=L.map('mapContainer',{zoomControl:true}).setView([20,0],2);
+    _satLayer=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
+      {attribution:'© Esri, Maxar',maxZoom:19});
+    _streetLayer=L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
+      {attribution:'© OpenStreetMap',maxZoom:19});
+    _satLayer.addTo(_map);
+    _map.on('click',e=>{
+      const {lat,lng}=e.latlng;
+      if(_mapMarker) _map.removeLayer(_mapMarker);
+      _mapMarker=L.marker([lat,lng]).addTo(_map);
+      _mapPin={lat:parseFloat(lat.toFixed(6)),lon:parseFloat(lng.toFixed(6))};
+      document.getElementById('mapCoords').innerHTML=`Pin: <strong>${_mapPin.lat}, ${_mapPin.lon}</strong>`;
+      document.getElementById('mapConfirmBtn').disabled=false;
+    });
+  }
+  const lat=parseFloat(document.getElementById('detailLat').value);
+  const lon=parseFloat(document.getElementById('detailLon').value);
+  if(!isNaN(lat)&&!isNaN(lon)){
+    _map.setView([lat,lon],14);
+    if(_mapMarker) _map.removeLayer(_mapMarker);
+    _mapMarker=L.marker([lat,lon]).addTo(_map);
+    _mapPin={lat,lon};
+    document.getElementById('mapCoords').innerHTML=`Pin: <strong>${lat}, ${lon}</strong>`;
+    document.getElementById('mapConfirmBtn').disabled=false;
+  } else {
+    _map.setView([20,0],2);
+    document.getElementById('mapCoords').textContent='Click the map to drop a pin';
+    document.getElementById('mapConfirmBtn').disabled=true;
+  }
+  setTimeout(()=>_map.invalidateSize(),50);
+}
+function closeMapModal(e){if(e&&e.target!==document.getElementById('mapModal'))return;document.getElementById('mapModal').style.display='none';}
+
+async function confirmMapPin(){
+  if(!_mapPin) return;
+  document.getElementById('detailLat').value=_mapPin.lat;
+  document.getElementById('detailLon').value=_mapPin.lon;
+  document.getElementById('mapModal').style.display='none';
+  const btn=document.getElementById('geocodeBtn'); btn.disabled=true; btn.textContent='…';
+  const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:_mapPin.lat,lon:_mapPin.lon})});
+  const d=await r.json();
+  if(d.location_name){document.getElementById('detailLocation').value=d.location_name;toast('📍 '+d.location_name,'success');}
+  btn.disabled=false; btn.textContent='🌍 Geocode';
+  onCoordsChanged();
+}
+
+// ── Folder seed ────────────────────────────────────────────────────
+function onCoordsChanged(){
+  const lat=parseFloat(document.getElementById('detailLat').value);
+  const lon=parseFloat(document.getElementById('detailLon').value);
+  const arr=sortedFiltered(); const p=arr[detailIndex];
+  if(!p) return;
+  const bar=document.getElementById('folderSeedBar');
+  if(!isNaN(lat)&&!isNaN(lon)){
+    const n=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id&&!x.has_gps&&x.status!=='named').length;
+    if(n>0){document.getElementById('folderSeedName').textContent=p.folder||'(root)';bar.style.display='flex';}
+    else bar.style.display='none';
+  } else bar.style.display='none';
+}
+
+let _seedTargets=[],_seedLat=null,_seedLon=null,_seedLocation='';
+
+function seedFolder(){
+  const lat=parseFloat(document.getElementById('detailLat').value);
+  const lon=parseFloat(document.getElementById('detailLon').value);
+  const loc=document.getElementById('detailLocation').value;
+  const arr=sortedFiltered(); const p=arr[detailIndex];
+  if(!p||isNaN(lat)||isNaN(lon)) return;
+  _seedLat=lat; _seedLon=lon; _seedLocation=loc;
+  _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id&&!x.has_gps&&x.status!=='named')
+    .sort((a,b)=>(a.date_taken||'').localeCompare(b.date_taken||''));
+  if(!_seedTargets.length){toast('No untagged photos in folder','error');return;}
+  document.getElementById('seedModalHint').textContent=
+    `${_seedTargets.length} untagged in "${p.folder||'(root)'}" → "${loc}"`;
+  const list=document.getElementById('seedChecklist'); list.innerHTML='';
+  _seedTargets.forEach((t,i)=>{
+    const dt=t.date_taken?new Date(t.date_taken).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'No date';
+    const item=document.createElement('div'); item.className='seed-item checked'; item.dataset.idx=i;
+    item.innerHTML=`<div class="seed-checkbox">✓</div>
+      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=88" loading="lazy" onerror="this.style.display='none'"/>
+      <div class="seed-item-info"><div class="seed-item-name">${t.filename}</div><div class="seed-item-date">${dt}</div></div>`;
+    item.onclick=()=>{item.classList.toggle('checked');item.querySelector('.seed-checkbox').textContent=item.classList.contains('checked')?'✓':'';updateSeedBtn();};
+    list.appendChild(item);
+  });
+  updateSeedBtn();
+  document.getElementById('seedModal').style.display='flex';
+}
+
+function updateSeedBtn(){
+  const n=document.querySelectorAll('#seedChecklist .seed-item.checked').length;
+  const btn=document.getElementById('seedApplyBtn');
+  btn.textContent=n>0?`Apply to ${n} photo${n!==1?'s':''}`:'Select photos';
+  btn.disabled=n===0;
+}
+function seedCheckAll(v){
+  document.querySelectorAll('#seedChecklist .seed-item').forEach(el=>{
+    el.classList.toggle('checked',v); el.querySelector('.seed-checkbox').textContent=v?'✓':'';});
+  updateSeedBtn();
+}
+function closeSeedModal(e){if(e&&e.target!==document.getElementById('seedModal'))return;document.getElementById('seedModal').style.display='none';}
+
+async function applySeedSelection(){
+  const checked=[...document.querySelectorAll('#seedChecklist .seed-item.checked')];
+  const targets=checked.map(el=>_seedTargets[parseInt(el.dataset.idx)]);
+  if(!targets.length) return;
+  const btn=document.getElementById('seedApplyBtn'); btn.disabled=true;
+  let applied=0;
+  for(const t of targets){
+    const r=await fetch('/api/ai_infer_with_coords',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({photo:t,seed_lat:_seedLat,seed_lon:_seedLon,seed_location:_seedLocation})});
+    const d=await r.json();
+    t.inferred_lat=_seedLat; t.inferred_lon=_seedLon;
+    t.location_name=(!d.limit_reached&&d.location_name)?d.location_name:_seedLocation;
+    t.status='inferred'; applied++;
+    if(d.ai_usage){const el=document.getElementById('aiUsed');if(el)el.textContent=d.ai_usage.used;}
+    btn.textContent=`Applying… ${applied}/${targets.length}`;
+  }
+  document.getElementById('seedModal').style.display='none';
+  document.getElementById('folderSeedBar').style.display='none';
+  updateStats(); renderGrid();
+  toast(`Tagged ${applied} photos with "${_seedLocation}"`,'success');
+}
+
+// ── Folder browser ─────────────────────────────────────────────────
+let _browserPath='';
+
+async function openBrowser(){
+  _browserPath=document.getElementById('folderInput').value.trim()||'/photos';
+  document.getElementById('browserModal').style.display='flex';
+  await loadBrowser(_browserPath);
+}
+async function loadBrowser(path){
+  const r=await fetch('/api/browse?path='+encodeURIComponent(path));
+  const d=await r.json();
+  if(d.error){toast(d.error,'error');return;}
+  _browserPath=d.path;
+  document.getElementById('browserPath').textContent=d.path;
+  document.getElementById('browserUpBtn').disabled=!d.parent;
+  const list=document.getElementById('browserList'); list.innerHTML='';
+  if(!d.dirs.length){
+    list.innerHTML='<div style="color:var(--text-dim);padding:12px;font-size:12px">No subdirectories</div>';return;
+  }
+  d.dirs.forEach(name=>{
+    const item=document.createElement('div'); item.className='browser-item';
+    item.innerHTML=`📁 ${name}`;
+    item.onclick=()=>loadBrowser(d.path+'/'+name);
+    list.appendChild(item);
+  });
+}
+function browserUp(){
+  const p=_browserPath.split('/').slice(0,-1).join('/')||'/';
+  loadBrowser(p);
+}
+function browserSelect(){
+  document.getElementById('folderInput').value=_browserPath;
+  document.getElementById('browserModal').style.display='none';
+}
+function closeBrowser(e){if(e&&e.target!==document.getElementById('browserModal'))return;document.getElementById('browserModal').style.display='none';}
+
+// ── Toast ──────────────────────────────────────────────────────────
+let _tt;
+function toast(msg,type=''){
+  const el=document.getElementById('toast');
+  el.textContent=msg; el.className='toast show'+(type?' '+type:'');
+  clearTimeout(_tt); _tt=setTimeout(()=>el.classList.remove('show'),3200);
+}
+
+// ── Keyboard ───────────────────────────────────────────────────────
+document.addEventListener('keydown',e=>{
+  if(document.getElementById('detailOverlay').style.display!=='none'){
+    if(e.key==='Escape') closeDetail({target:document.getElementById('detailOverlay')});
+    if(e.key==='ArrowLeft') prevPhoto();
+    if(e.key==='ArrowRight') nextPhoto();
+  }
+  if(e.key==='Enter'&&document.activeElement.id==='folderInput') startScan();
+});
+
+// ── Init ───────────────────────────────────────────────────────────
+(async()=>{
+  try{
+    const r=await fetch('/api/config'); const cfg=await r.json();
+    const inp=document.getElementById('folderInput');
+    if(cfg.default_photo_root&&!inp.value) inp.value=inp.placeholder=cfg.default_photo_root;
+    if(cfg.has_ai_key&&cfg.ai_usage){
+      const u=cfg.ai_usage;
+      const pill=document.createElement('div');
+      pill.id='aiUsagePill'; pill.className='stats-pill';
+      pill.title=`Model: ${cfg.ai_model}. Resets midnight.`;
+      pill.innerHTML=`<span>🤖 <span id="aiUsed">${u.used}</span>/${u.limit}</span>`;
+      document.querySelector('.header-actions').prepend(pill);
+    }
+    if(!cfg.has_ai_key){
+      document.querySelectorAll('#aiBtn').forEach(b=>{b.title='Set ANTHROPIC_API_KEY to enable';b.style.opacity='.4';b.disabled=true;});
+    }
+    loadSessions();
+  }catch(e){}
+})();
+</script>
+</body>
+</html>

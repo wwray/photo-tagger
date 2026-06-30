@@ -1,0 +1,144 @@
+<?xml version="1.0"?>
+<Container version="2">
+
+  <!-- ── Basic info ─────────────────────────────────────────────── -->
+  <Name>PhotoTagger</Name>
+  <Repository>phototagger:latest</Repository>
+  <Registry></Registry>
+  <Network>bridge</Network>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support></Support>
+  <Project></Project>
+  <Overview>
+    Self-hosted photo metadata manager. Scans your photo library (JPEG + RAW),
+    reads EXIF date and GPS data, reverse-geocodes coordinates to place names,
+    infers locations for untagged photos from nearby GPS shots, and lets you
+    manually tag + save location and date back directly into the files.
+    AI-powered suggestions via Claude API (optional).
+  </Overview>
+  <Category>MediaApp:Photos</Category>
+  <WebUI>http://[IP]:[PORT:5000]/</WebUI>
+  <TemplateURL></TemplateURL>
+  <Icon>https://raw.githubusercontent.com/simple-icons/simple-icons/develop/icons/camera.svg</Icon>
+  <ExtraParams>--restart=unless-stopped</ExtraParams>
+  <Description>
+    PhotoTagger — browse, geocode, infer and write location + date metadata
+    back into your JPEG and RAW photo library.
+  </Description>
+  <Networking>
+    <Mode>bridge</Mode>
+    <Publish>
+      <HostPort>5000</HostPort>
+      <ContainerPort>5000</ContainerPort>
+      <Protocol>tcp</Protocol>
+    </Publish>
+  </Networking>
+
+  <!-- ── Volumes ────────────────────────────────────────────────── -->
+  <Data>
+    <Volume>
+      <HostDir>/mnt/user/Photos</HostDir>
+      <ContainerDir>/photos</ContainerDir>
+      <Mode>rw</Mode>
+    </Volume>
+  </Data>
+
+  <!-- ── Environment variables ──────────────────────────────────── -->
+  <Environment>
+
+    <Variable>
+      <Value>99</Value>
+      <Name>PUID</Name>
+      <Mode/>
+    </Variable>
+
+    <Variable>
+      <Value>100</Value>
+      <Name>PGID</Name>
+      <Mode/>
+    </Variable>
+
+    <!-- Optional: paste your Anthropic API key here to enable AI location suggestions -->
+    <Variable>
+      <Value></Value>
+      <Name>ANTHROPIC_API_KEY</Name>
+      <Mode/>
+    </Variable>
+
+    <!--
+      Override the default folder that is pre-filled in the UI.
+      This must be a path *inside* the container (i.e. under /photos).
+      Leave as /photos to show the root of your mounted share.
+    -->
+    <Variable>
+      <Value>/photos</Value>
+      <Name>PHOTO_ROOT</Name>
+      <Mode/>
+    </Variable>
+
+  </Environment>
+
+  <!-- ── Labels (optional, cosmetic) ───────────────────────────── -->
+  <Labels/>
+  <Config Name="WebUI Port"
+          Target="5000"
+          Default="5000"
+          Mode="tcp"
+          Description="Port to access the PhotoTagger web interface."
+          Type="Port"
+          Display="always"
+          Required="true"
+          Mask="false">5000</Config>
+
+  <Config Name="Photos Share"
+          Target="/photos"
+          Default="/mnt/user/Photos"
+          Mode="rw"
+          Description="Path to your Unraid photos share. Must be read-write so metadata can be saved back to files."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/Photos</Config>
+
+  <Config Name="PUID"
+          Target="PUID"
+          Default="99"
+          Mode=""
+          Description="User ID for file permissions. Use 99 for Unraid's 'nobody' or match your media user."
+          Type="Variable"
+          Display="always"
+          Required="true"
+          Mask="false">99</Config>
+
+  <Config Name="PGID"
+          Target="PGID"
+          Default="100"
+          Mode=""
+          Description="Group ID for file permissions. Use 100 for Unraid's 'users' group."
+          Type="Variable"
+          Display="always"
+          Required="true"
+          Mask="false">100</Config>
+
+  <Config Name="Anthropic API Key"
+          Target="ANTHROPIC_API_KEY"
+          Default=""
+          Mode=""
+          Description="Optional. Your Anthropic API key (sk-ant-...) to enable AI-powered location suggestions for photos without GPS or nearby context."
+          Type="Variable"
+          Display="always"
+          Required="false"
+          Mask="true"></Config>
+
+  <Config Name="Default Photo Root"
+          Target="PHOTO_ROOT"
+          Default="/photos"
+          Mode=""
+          Description="Container path pre-filled in the scan box on startup. Use a subfolder like /photos/2024 to scope the default scan."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false">/photos</Config>
+
+</Container>

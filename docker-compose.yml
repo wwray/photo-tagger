@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  phototagger:
+    build: .
+    image: phototagger:latest
+    container_name: phototagger
+    ports:
+      - "5000:5000"
+    volumes:
+      - ${PHOTOS_PATH:-/mnt/user/Photos}:/photos:rw
+      - ./data:/app/data
+    env_file:
+      - .env
+    restart: unless-stopped
