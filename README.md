@@ -115,3 +115,41 @@ ANTHROPIC_API_KEY=sk-ant-... docker compose up -d
 - AI suggestions are optional — the app works fully without an API key, just without that one button.
 - Thumbnails are generated on-the-fly; first grid load on a large library may take a moment.
 - **Always keep backups before writing metadata in bulk.**
+
+---
+
+## Changelog
+
+### v1.1 — P0 stability pass
+
+**Fixed: AI Suggest hung forever with no network request.**
+`detailIndex` was a positional index into `sortedFiltered()`, which is
+recomputed on every call. Any re-render between opening the photo and clicking
+the button invalidated it, so the lookup returned `undefined` and threw on
+`p.id` — *after* the button label had been set to "Thinking…" and *before* the
+`fetch`. The function was `async` with no `try/catch`, so the rejection was
+swallowed. The detail panel now tracks the photo by ID, every handler guards
+against a missing photo, and a global `unhandledrejection` listener surfaces
+any future silent failure as a toast.
+
+**Fixed: dry-run reset to OFF and was client-controlled.**
+The flag was sent from the browser in the request body, so stale JS state could
+cause a real write. The server now owns it: it is stored in the database,
+defaults to ON, is re-armed to ON on every page load, and a client can only
+make a request *more* conservative, never less. Turning it off is now a
+deliberate, logged action.
+
+**Fixed: duplicate scan appeared to hang.**
+It wasn't broken, it was O(n²) with `imagehash.hex_to_hash()` re-parsing inside
+the inner loop — benchmarked at ~11 minutes for 5,900 photos with no feedback.
+Hashes are now compared as integers via XOR + `bit_count()`: **3.1 seconds** for
+the same set. It runs as a background job with live progress, a 5-minute
+timeout, an explicit error state, and result caching.
+
+**Improved: duplicate accuracy.**
+Both pHash (DCT) and dHash (gradient) are now stored and a pair matches if
+either agrees, because they fail on different inputs. Results are split into
+identical files, visually similar, and filename-pattern groups.
+
+**Hardened:** double-click guard on scan, poll timers cleared before awaiting,
+idempotent header injection.

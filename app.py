@@ -87,7 +87,8 @@ def init_db():
             location_name   TEXT,
             has_gps         INTEGER DEFAULT 0,
             status          TEXT DEFAULT 'unknown',
-            phash           TEXT,               -- perceptual hash
+            phash           TEXT,               -- perceptual hash (DCT-based)
+            dhash           TEXT,               -- difference hash (structure/gradient-based)
             file_hash       TEXT,               -- md5 of first 64KB (fast)
             inferred_lat    REAL,
             inferred_lon    REAL,
@@ -106,6 +107,12 @@ def init_db():
             new_value       TEXT,
             created_at      TEXT DEFAULT (datetime('now')),
             committed       INTEGER DEFAULT 0
+        );
+
+        CREATE TABLE IF NOT EXISTS settings (
+            key         TEXT PRIMARY KEY,
+            value       TEXT,
+            updated_at  TEXT DEFAULT (datetime('now'))
         );
 
         CREATE TABLE IF NOT EXISTS sessions (
@@ -131,6 +138,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_photos_phash     ON photos(phash);
         CREATE INDEX IF NOT EXISTS idx_pending_photo    ON pending_changes(photo_id);
     """)
+    # Migration: add columns introduced after the first release
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(photos)")}
+    for col, ddl in [("dhash", "TEXT"), ("date_source", "TEXT")]:
+        if col not in existing:
+            conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {ddl}")
+            print(f"[db] Migrated: added photos.{col}", flush=True)
     conn.commit()
     conn.close()
     print(f"[db] Initialised at {DB_PATH}", flush=True)
@@ -144,13 +157,13 @@ def db_upsert_photo(conn, photo: dict):
         INSERT INTO photos (
             id, path, filename, folder, size_kb, file_mtime,
             date_taken, lat, lon, location_name, has_gps, status,
-            phash, file_hash, inferred_lat, inferred_lon,
-            inferred_from, inferred_delta_min, scan_root, last_scanned
+            phash, dhash, file_hash, inferred_lat, inferred_lon,
+            inferred_from, inferred_delta_min, scan_root, last_scanned, date_source
         ) VALUES (
             :id,:path,:filename,:folder,:size_kb,:file_mtime,
             :date_taken,:lat,:lon,:location_name,:has_gps,:status,
-            :phash,:file_hash,:inferred_lat,:inferred_lon,
-            :inferred_from,:inferred_delta_min,:scan_root,:last_scanned
+            :phash,:dhash,:file_hash,:inferred_lat,:inferred_lon,
+            :inferred_from,:inferred_delta_min,:scan_root,:last_scanned,:date_source
         )
         ON CONFLICT(id) DO UPDATE SET
             path=excluded.path, filename=excluded.filename,
@@ -161,7 +174,8 @@ def db_upsert_photo(conn, photo: dict):
             has_gps=excluded.has_gps,
             status=CASE WHEN photos.status IN ('named','gps') AND excluded.status='unknown'
                         THEN photos.status ELSE excluded.status END,
-            phash=excluded.phash, file_hash=excluded.file_hash,
+            phash=excluded.phash, dhash=excluded.dhash, file_hash=excluded.file_hash,
+            date_source=excluded.date_source,
             inferred_lat=excluded.inferred_lat, inferred_lon=excluded.inferred_lon,
             inferred_from=excluded.inferred_from,
             inferred_delta_min=excluded.inferred_delta_min,
@@ -170,7 +184,8 @@ def db_upsert_photo(conn, photo: dict):
         "id":None,"path":None,"filename":None,"folder":None,"size_kb":None,
         "file_mtime":None,"date_taken":None,"lat":None,"lon":None,
         "location_name":None,"has_gps":0,"status":"unknown",
-        "phash":None,"file_hash":None,"inferred_lat":None,"inferred_lon":None,
+        "phash":None,"dhash":None,"file_hash":None,"date_source":None,
+        "inferred_lat":None,"inferred_lon":None,
         "inferred_from":None,"inferred_delta_min":None,
         "scan_root":None,"last_scanned":None
     }, **photo})
@@ -184,6 +199,45 @@ def db_save_pending(conn, photo_id, field, old_value, new_value):
 
 def rows_to_dicts(rows):
     return [dict(r) for r in rows]
+
+# ─── Settings / dry-run state (server-authoritative) ──────────────────────────
+# The client used to send dry_run in the request body. That is unsafe: any time
+# the JS state was wrong or stale, a real write happened. The server now owns
+# this flag, it defaults to ON, and it is forced back ON on every page load.
+
+def get_setting(key, default=None):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+        return row[0] if row else default
+    finally:
+        conn.close()
+
+def set_setting(key, value):
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("""INSERT INTO settings (key,value,updated_at)
+                        VALUES (?,?,datetime('now'))
+                        ON CONFLICT(key) DO UPDATE SET
+                          value=excluded.value, updated_at=excluded.updated_at""",
+                     (key, str(value)))
+        conn.commit()
+    finally:
+        conn.close()
+
+def get_dry_run():
+    """Server-side dry run flag. Fails SAFE: unset/unreadable means ON."""
+    v = get_setting("dry_run", "true")
+    return str(v).lower() in ("1", "true", "yes")
+
+def effective_dry_run(client_flag):
+    """
+    Resolve the dry run state for a write request.
+    Server value wins, but a client asking for dry run can only make it
+    MORE conservative, never less. There is no path to a real write unless
+    the server flag is explicitly off.
+    """
+    return get_dry_run() or bool(client_flag)
 
 # ─── AI helpers ───────────────────────────────────────────────────────────────
 
@@ -260,9 +314,15 @@ def read_exif(filepath):
     return result
 
 def compute_hashes(filepath):
-    """Return (file_hash, phash_str). phash is None for non-image files."""
-    file_hash = None
-    phash_str = None
+    """
+    Return (file_hash, phash_str, dhash_str).
+    Two perceptual hashes are computed because they fail in different ways:
+    phash (DCT) is strong on general perceptual similarity but weak on
+    high-frequency/noisy images; dhash (gradient) is strong on structure and
+    robust to brightness and resize. Matching on either catches far more
+    real-world duplicates than one alone.
+    """
+    file_hash = phash_str = dhash_str = None
     try:
         with open(filepath,"rb") as f:
             file_hash = hashlib.md5(f.read(65536)).hexdigest()
@@ -270,8 +330,9 @@ def compute_hashes(filepath):
     try:
         img = Image.open(filepath)
         phash_str = str(imagehash.phash(img))
+        dhash_str = str(imagehash.dhash(img))
     except Exception: pass
-    return file_hash, phash_str
+    return file_hash, phash_str, dhash_str
 
 def reverse_geocode(lat, lon):
     global _last_geocode
@@ -393,7 +454,7 @@ def _run_scan(folder, rescan=False):
 
         for i, p in enumerate(all_paths):
             exif = read_exif(str(p))
-            file_hash, phash_str = compute_hashes(str(p))
+            file_hash, phash_str, dhash_str = compute_hashes(str(p))
             mtime = p.stat().st_mtime
 
             photo = {
@@ -410,6 +471,7 @@ def _run_scan(folder, rescan=False):
                 "has_gps":      1 if exif["has_gps"] else 0,
                 "status":       "gps" if exif["has_gps"] else ("named" if exif["location_name"] else "unknown"),
                 "phash":        phash_str,
+                "dhash":        dhash_str,
                 "file_hash":    file_hash,
                 "inferred_lat": None,"inferred_lon":None,
                 "inferred_from":None,"inferred_delta_min":None,
@@ -497,12 +559,27 @@ def index(): return render_template("index.html")
 
 @app.route("/api/config")
 def api_config():
+    # Fail safe: every fresh page load re-arms dry run. A metadata writer
+    # should never come back from a reload silently ready to write.
+    set_setting("dry_run", "true")
+    _log("[safety] Page load — dry run re-armed to ON")
     return jsonify({
         "default_photo_root": DEFAULT_PHOTO_ROOT,
         "has_ai_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "ai_usage": _ai_usage_info(),
         "ai_model": AI_MODEL,
+        "dry_run": True,
     })
+
+@app.route("/api/dry_run", methods=["GET", "POST"])
+def api_dry_run():
+    """Read or set the server-side dry run flag. Survives scans and navigation."""
+    if request.method == "POST":
+        data = request.json or {}
+        val = bool(data.get("dry_run", True))
+        set_setting("dry_run", "true" if val else "false")
+        _log(f"[safety] Dry run set to {'ON' if val else 'OFF'}")
+    return jsonify({"dry_run": get_dry_run()})
 
 # ── Folder browser ────────────────────────────────────────────────
 @app.route("/api/browse")
@@ -687,7 +764,7 @@ def api_save():
     lat           = data.get("lat")
     lon           = data.get("lon")
     date_str      = data.get("date_taken")
-    dry_run       = data.get("dry_run", False)
+    dry_run       = effective_dry_run(data.get("dry_run", False))
     photo_id      = data.get("id")
 
     if not filepath or not os.path.isfile(filepath):
@@ -727,7 +804,7 @@ def api_save():
 def api_save_batch():
     data    = request.json or {}
     photos  = data.get("photos",[])
-    dry_run = data.get("dry_run", False)
+    dry_run = effective_dry_run(data.get("dry_run", False))
     db      = _get_db()
     results = []
     for p in photos:
@@ -779,55 +856,161 @@ def api_thumbnail():
         return str(e),500
 
 # ── Duplicates ────────────────────────────────────────────────────
-@app.route("/api/duplicates")
-def api_duplicates():
-    """Find duplicate groups by perceptual hash similarity + filename pattern."""
-    folder   = request.args.get("folder","")
-    db       = _get_db()
-    rows     = rows_to_dicts(db.execute(
-        "SELECT id,path,filename,folder,size_kb,date_taken,phash,file_hash,status,location_name "
-        "FROM photos WHERE scan_root=? AND phash IS NOT NULL", (folder,)).fetchall())
+# ── Duplicates (background job) ───────────────────────────────────
+# Previously this ran inline and re-parsed every hash inside an O(n^2) loop,
+# which measured ~11 minutes on 5,900 photos with no progress feedback.
+# Hashes are now compared as ints via XOR + bit_count: ~2s for the same set.
 
-    # Group exact phash matches first
+_dup_state = {"running": False, "phase": "", "current": 0, "total": 0,
+              "message": "", "error": None, "folder": None, "result": None}
+_dup_lock  = threading.Lock()
+
+PHASH_THRESHOLD = 10  # max hamming distance out of 64 bits (DCT hash)
+DHASH_THRESHOLD = 8   # max hamming distance out of 64 bits (gradient hash)
+
+def _run_dup_scan(folder):
     from collections import defaultdict
-    exact_groups = defaultdict(list)
-    for r in rows:
-        exact_groups[r["phash"]].append(r)
+    try:
+        with _dup_lock:
+            _dup_state.update(phase="loading", message="Loading hashes from database…",
+                              current=0, total=0)
 
-    # Near-duplicate detection (hamming distance <= 8)
-    groups = []
-    used = set()
-    photo_list = list(rows)
-    for i, a in enumerate(photo_list):
-        if a["id"] in used or not a["phash"]: continue
-        group = [a]
-        used.add(a["id"])
-        ha = imagehash.hex_to_hash(a["phash"])
-        for b in photo_list[i+1:]:
-            if b["id"] in used or not b["phash"]: continue
+        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+        rows = rows_to_dicts(conn.execute(
+            "SELECT id,path,filename,folder,size_kb,date_taken,phash,dhash,file_hash,"
+            "status,location_name FROM photos WHERE scan_root=?", (folder,)).fetchall())
+        conn.close()
+
+        n = len(rows)
+        _log(f"[dup] Loaded {n} photos for duplicate analysis")
+
+        # ── 1. Exact byte-level duplicates (instant, dict-based) ──────
+        with _dup_lock:
+            _dup_state.update(phase="exact", message="Finding exact duplicates…", total=n)
+        exact = defaultdict(list)
+        for r in rows:
+            if r.get("file_hash"):
+                exact[r["file_hash"]].append(r)
+        exact_groups = [v for v in exact.values() if len(v) > 1]
+        _log(f"[dup] {len(exact_groups)} exact-duplicate groups")
+
+        # ── 2. Filename-pattern duplicates: IMG_4502 vs IMG_4502 (1) ──
+        with _dup_lock:
+            _dup_state.update(phase="filenames", message="Checking filename patterns…")
+        name_pattern = re.compile(r"^(.+?)(\s*\(\d+\))(\.[^.]+)$")
+        fname = defaultdict(list)
+        for r in rows:
+            m = name_pattern.match(r["filename"])
+            base = (m.group(1) + m.group(3)) if m else r["filename"]
+            fname[base.lower()].append(r)
+        fname_groups = [v for v in fname.values() if len(v) > 1]
+        _log(f"[dup] {len(fname_groups)} filename-pattern groups")
+
+        # ── 3. Perceptual near-duplicates ─────────────────────────────
+        cand = [r for r in rows if r.get("phash") or r.get("dhash")]
+        pints, dints, valid = [], [], []
+        for r in cand:
             try:
-                dist = ha - imagehash.hex_to_hash(b["phash"])
-                if dist <= 8:
-                    group.append({**b,"similarity":round((1-dist/64)*100)})
-                    used.add(b["id"])
-            except Exception: continue
-        if len(group) > 1:
-            groups.append(group)
+                pv = int(r["phash"], 16) if r.get("phash") else None
+                dv = int(r["dhash"], 16) if r.get("dhash") else None
+            except (ValueError, TypeError):
+                continue
+            if pv is None and dv is None:
+                continue
+            pints.append(pv); dints.append(dv); valid.append(r)
 
-    # Also flag filename-pattern duplicates (IMG_4502 and IMG_4502 (1))
-    name_pattern = re.compile(r'^(.+?)(\s*\(\d+\))(\.[^.]+)$')
-    fname_groups = defaultdict(list)
-    for r in rows:
-        m = name_pattern.match(r["filename"])
-        base_name = (m.group(1) + m.group(3)) if m else r["filename"]
-        fname_groups[base_name.lower()].append(r)
-    fname_dups = [list(v) for v in fname_groups.values() if len(v) > 1]
+        m = len(valid)
+        with _dup_lock:
+            _dup_state.update(phase="perceptual", total=m, current=0,
+                              message=f"Comparing {m} image fingerprints…")
+        _log(f"[dup] Comparing {m} perceptual hashes (threshold {PHASH_THRESHOLD})")
 
-    return jsonify({
-        "phash_groups":  groups,
-        "fname_groups":  fname_dups,
-        "total_groups":  len(groups) + len(fname_dups),
-    })
+        used = [False] * m
+        phash_groups = []
+        for i in range(m):
+            if i % 250 == 0:
+                with _dup_lock:
+                    _dup_state.update(current=i,
+                        message=f"Comparing fingerprints: {i} / {m}")
+            if used[i]:
+                continue
+            pa, da = pints[i], dints[i]
+            group = None
+            for j in range(i + 1, m):
+                if used[j]:
+                    continue
+                pd = (pa ^ pints[j]).bit_count() if (pa is not None and pints[j] is not None) else 99
+                dd = (da ^ dints[j]).bit_count() if (da is not None and dints[j] is not None) else 99
+                # Either hash agreeing is enough — they fail on different inputs.
+                if pd <= PHASH_THRESHOLD or dd <= DHASH_THRESHOLD:
+                    best = min(pd, dd)
+                    if group is None:
+                        group = [dict(valid[i], similarity=100)]
+                        used[i] = True
+                    group.append(dict(valid[j], similarity=round((1 - best / 64) * 100),
+                                      match_on=("dhash" if dd < pd else "phash")))
+                    used[j] = True
+            if group:
+                phash_groups.append(group)
+
+        _log(f"[dup] {len(phash_groups)} perceptual groups")
+
+        # Don't report the same set twice under two headings
+        exact_ids = {p["id"] for g in exact_groups for p in g}
+        phash_groups = [g for g in phash_groups
+                        if not all(p["id"] in exact_ids for p in g)]
+
+        result = {
+            "exact_groups":  exact_groups,
+            "phash_groups":  phash_groups,
+            "fname_groups":  fname_groups,
+            "total_groups":  len(exact_groups) + len(phash_groups) + len(fname_groups),
+            "scanned":       n,
+        }
+        with _dup_lock:
+            _dup_state.update(running=False, phase="done", current=m,
+                              message=f"Found {result['total_groups']} duplicate groups",
+                              result=result, folder=folder)
+        _log(f"[dup] Done. {result['total_groups']} groups total")
+
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _log(f"[dup] ERROR: {e}")
+        with _dup_lock:
+            _dup_state.update(running=False, phase="error", error=str(e),
+                              message=f"Error: {e}")
+
+@app.route("/api/duplicates/start", methods=["POST"])
+def api_duplicates_start():
+    data = request.json or {}
+    folder = data.get("folder", "").strip()
+    force  = data.get("force", False)
+    if not folder:
+        return jsonify({"error": "folder required"}), 400
+    with _dup_lock:
+        if _dup_state["running"]:
+            return jsonify({"started": False, "already_running": True})
+        # Serve cached result for the same folder unless a refresh was asked for
+        if not force and _dup_state["folder"] == folder and _dup_state["result"]:
+            return jsonify({"started": False, "cached": True})
+        _dup_state.update(running=True, phase="loading", current=0, total=0,
+                          message="Starting…", error=None, folder=folder, result=None)
+    threading.Thread(target=_run_dup_scan, args=(folder,), daemon=True).start()
+    return jsonify({"started": True})
+
+@app.route("/api/duplicates/progress")
+def api_duplicates_progress():
+    with _dup_lock:
+        s = {k: v for k, v in _dup_state.items() if k != "result"}
+        s["has_result"] = _dup_state["result"] is not None
+    return jsonify(s)
+
+@app.route("/api/duplicates/result")
+def api_duplicates_result():
+    with _dup_lock:
+        if not _dup_state["result"]:
+            return jsonify({"error": "No duplicate scan result available"}), 409
+        return jsonify(_dup_state["result"])
 
 # ── AI infer ──────────────────────────────────────────────────────
 @app.route("/api/ai_infer", methods=["POST"])

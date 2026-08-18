@@ -346,7 +346,9 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   <div id="dupContainer" style="display:none">
     <div class="grid-toolbar">
       <h3>Duplicate groups</h3>
+      <span id="dupSummary" style="font-size:12px;color:var(--text-dim)"></span>
       <div class="toolbar-spacer"></div>
+      <button class="btn btn-ghost btn-sm" onclick="showDuplicates(true)" title="Recompute from scratch">↻ Rescan</button>
       <button class="btn btn-ghost btn-sm" onclick="showGrid()">← Back to grid</button>
     </div>
     <div id="dupList"></div>
@@ -515,13 +517,53 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 <script>
 // ── State ──────────────────────────────────────────────────────────
 let allPhotos=[], filtered=[], selected=new Set();
-let currentFilter='all', currentSort='date', currentFolder=null, detailIndex=-1;
-let dryRun=false, currentScanRoot='';
+let currentFilter='all', currentSort='date', currentFolder=null, detailIndex=-1, detailId=null;
+
+// Resolve the photo currently open in the detail panel BY ID, not by position.
+// sortedFiltered() is recomputed on every call, so a stale positional index
+// silently returns undefined and throws downstream.
+function currentPhoto(){
+  if(detailId){
+    const byId = allPhotos.find(x=>x.id===detailId);
+    if(byId) return byId;
+  }
+  const arr = sortedFiltered();
+  return (detailIndex>=0 && detailIndex<arr.length) ? arr[detailIndex] : null;
+}
+let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
 
+// ── Global error surfacing ─────────────────────────────────────────
+// Without this, a throw inside any async handler is swallowed and the UI
+// just sits in a spinner state forever with no clue what happened.
+window.addEventListener('unhandledrejection', e=>{
+  console.error('Unhandled promise rejection:', e.reason);
+  toast('Error: '+((e.reason&&e.reason.message)||e.reason||'unknown'),'error');
+});
+window.addEventListener('error', e=>{
+  console.error('Uncaught error:', e.error||e.message);
+});
+
 // ── Dry run ────────────────────────────────────────────────────────
-function toggleDryRun(cb) {
+async function toggleDryRun(cb) {
   dryRun = cb.checked;
+  // Persist to the server — it is the authority on whether writes are real.
+  try{
+    const r=await fetch('/api/dry_run',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({dry_run:dryRun})});
+    const d=await r.json();
+    dryRun = d.dry_run;            // trust the server's answer
+    cb.checked = dryRun;
+  }catch(err){
+    // If we can't reach the server, fail safe: assume writes are live and warn.
+    toast('Could not update dry-run state on server','error');
+  }
+  applyDryRunUi();
+}
+
+function applyDryRunUi(announce) {
+  const cb=document.getElementById('dryRunCheck');
+  if(cb) cb.checked=dryRun;
   document.getElementById('dryRunToggle').classList.toggle('active', dryRun);
   const ex = document.getElementById('dryRunBanner');
   if (dryRun && !ex) {
@@ -530,7 +572,12 @@ function toggleDryRun(cb) {
     b.textContent='🧪 Dry run ON — saves preview only, nothing written to disk';
     document.body.appendChild(b);
   } else if (!dryRun && ex) ex.remove();
-  toast(dryRun ? 'Dry run ON' : 'Dry run OFF — saves will write to files', dryRun?'':'success');
+  // OFF is the dangerous state, so flag it in red rather than green.
+  if (announce !== false) {
+    toast(dryRun ? '🧪 Dry run ON — nothing will be written'
+                 : '⚠️ Dry run OFF — saves will write to your files',
+          dryRun ? '' : 'error');
+  }
   refreshPendingBar();
 }
 
@@ -602,9 +649,14 @@ async function discardPending() {
 }
 
 // ── Scan ───────────────────────────────────────────────────────────
+let _scanStarting=false;
 async function startScan(rescan=false) {
   const folder = document.getElementById('folderInput').value.trim();
   if (!folder) return;
+  if (_scanStarting) return;              // guard against double-click
+  _scanStarting = true;
+  clearInterval(_pollInterval);           // clear BEFORE awaiting, not after
+  _pollInterval = null;
   currentScanRoot = folder;
   const btn = document.getElementById('scanBtn');
   btn.disabled=true; btn.textContent='Scanning…';
@@ -613,6 +665,7 @@ async function startScan(rescan=false) {
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({folder, rescan})});
   const d = await r.json();
+  _scanStarting = false;
   if (d.error) { toast(d.error,'error'); btn.disabled=false; btn.textContent='Scan'; return; }
   clearInterval(_pollInterval);
   _pollInterval = setInterval(pollProgress, 800);
@@ -821,7 +874,7 @@ function updateBatchBar(){
 function openDetail(idx) {
   const arr=sortedFiltered();
   if(idx<0||idx>=arr.length) return;
-  detailIndex=idx; const p=arr[idx];
+  detailIndex=idx; const p=arr[idx]; detailId=p?p.id:null;
   document.getElementById('detailFilename').textContent=p.path;
   document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=600';
   document.getElementById('detailLocation').value=p.location_name||'';
@@ -854,8 +907,13 @@ function closeDetail(e){
   if(e&&e.target!==document.getElementById('detailOverlay')) return;
   document.getElementById('detailOverlay').style.display='none';
 }
-function prevPhoto(){if(detailIndex>0)openDetail(detailIndex-1);}
-function nextPhoto(){const a=sortedFiltered();if(detailIndex<a.length-1)openDetail(detailIndex+1);}
+function detailPos(){
+  const a=sortedFiltered();
+  if(detailId){const i=a.findIndex(x=>x.id===detailId); if(i>=0) return i;}
+  return detailIndex;
+}
+function prevPhoto(){const i=detailPos(); if(i>0) openDetail(i-1);}
+function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1) openDetail(i+1);}
 
 async function reverseGeocode(){
   const lat=parseFloat(document.getElementById('detailLat').value);
@@ -871,22 +929,33 @@ async function reverseGeocode(){
 }
 
 async function aiInfer(){
-  const arr=sortedFiltered(); const p=arr[detailIndex];
-  const btn=document.getElementById('aiBtn'); btn.disabled=true; btn.textContent='🤖 Thinking…';
+  const btn=document.getElementById('aiBtn');
+  const p=currentPhoto();
+  if(!p){ toast('No photo selected — reopen the photo and try again','error'); return; }
+  btn.disabled=true; btn.textContent='🤖 Thinking…';
+  try{
   const neighbors=allPhotos.filter(n=>n.location_name&&n.id!==p.id&&n.date_taken&&p.date_taken)
     .filter(n=>Math.abs(new Date(n.date_taken)-new Date(p.date_taken))<7*86400000).slice(0,6);
   const r=await fetch('/api/ai_infer',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({photo:p,neighbors})});
   const d=await r.json();
   if(d.limit_reached){toast('Daily AI limit reached','error');btn.textContent='🤖 Limit reached';return;}
+  if(d.error){toast('AI error: '+d.error,'error');return;}
   if(d.suggestion&&d.suggestion!=='Unknown'){document.getElementById('detailLocation').value=d.suggestion;toast('AI: '+d.suggestion,'success');}
   else toast('AI could not suggest a location','error');
   if(d.ai_usage){const el=document.getElementById('aiUsed');if(el)el.textContent=d.ai_usage.used;}
-  btn.disabled=false; btn.textContent='🤖 AI Suggest';
+  }catch(err){
+    console.error('aiInfer failed:',err);
+    toast('AI Suggest failed: '+(err.message||err),'error');
+  }finally{
+    btn.disabled=false;
+    if(btn.textContent==='🤖 Thinking…') btn.textContent='🤖 AI Suggest';
+  }
 }
 
 async function saveDetail(){
-  const arr=sortedFiltered(); const p=arr[detailIndex];
+  const p=currentPhoto();
+  if(!p){ toast('No photo selected — reopen the photo and try again','error'); return; }
   const btn=document.getElementById('saveDetailBtn'); btn.disabled=true; btn.textContent='Saving…';
   const dv=document.getElementById('detailDate').value;
   const payload={
@@ -968,23 +1037,78 @@ async function batchSave(){
 }
 
 // ── Duplicates ─────────────────────────────────────────────────────
-async function showDuplicates(){
+let _dupPoll=null;
+
+async function showDuplicates(force){
   document.getElementById('emptyState').style.display='none';
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='';
-  document.getElementById('dupList').innerHTML='<div style="color:var(--text-muted);padding:20px">Scanning for duplicates…</div>';
-  const r=await fetch('/api/duplicates?folder='+encodeURIComponent(currentScanRoot));
-  const d=await r.json();
-  const list=document.getElementById('dupList');
-  if(!d.total_groups){list.innerHTML='<div style="color:var(--green);padding:20px">✓ No duplicates found!</div>';return;}
-  list.innerHTML='';
+  if(!currentScanRoot){ toast('Scan a folder first','error'); return; }
 
-  const renderGroup=(photos,label,color)=>{
+  const list=document.getElementById('dupList');
+  list.innerHTML=`<div style="display:flex;flex-direction:column;gap:12px;padding:24px;max-width:420px">
+      <div class="spinner"></div>
+      <div id="dupProgressMsg" style="font-size:13px;color:var(--text-muted)">Starting duplicate scan…</div>
+      <div class="progress-bar-wrap"><div id="dupProgressBar" class="progress-bar-fill" style="width:0%"></div></div>
+    </div>`;
+
+  let started;
+  try{
+    const r=await fetch('/api/duplicates/start',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({folder:currentScanRoot, force: !!force})});
+    started=await r.json();
+  }catch(err){
+    list.innerHTML=`<div style="color:var(--red);padding:20px">Could not start duplicate scan: ${err.message}</div>`;
+    return;
+  }
+  if(started.cached){ await renderDupResult(); return; }
+
+  clearInterval(_dupPoll);
+  let ticks=0;
+  _dupPoll=setInterval(async()=>{
+    ticks++;
+    // Hard timeout so it can never sit forever with no explanation again
+    if(ticks>600){
+      clearInterval(_dupPoll);
+      list.innerHTML='<div style="color:var(--red);padding:20px">Duplicate scan timed out after 5 minutes. Check the Docker logs.</div>';
+      return;
+    }
+    let st;
+    try{ st=await (await fetch('/api/duplicates/progress')).json(); }
+    catch(e){ return; }
+    const msg=document.getElementById('dupProgressMsg');
+    const bar=document.getElementById('dupProgressBar');
+    if(msg) msg.textContent=st.message||st.phase;
+    if(bar) bar.style.width=(st.total>0?Math.round(st.current/st.total*100):0)+'%';
+    if(st.phase==='done'){ clearInterval(_dupPoll); await renderDupResult(); }
+    else if(st.phase==='error'){
+      clearInterval(_dupPoll);
+      list.innerHTML=`<div style="color:var(--red);padding:20px">Duplicate scan failed: ${st.error}</div>`;
+    }
+  },500);
+}
+
+async function renderDupResult(){
+  const list=document.getElementById('dupList');
+  const d=await (await fetch('/api/duplicates/result')).json();
+  if(d.error){ list.innerHTML=`<div style="color:var(--red);padding:20px">${d.error}</div>`; return; }
+  document.getElementById('dupSummary').textContent =
+    `${d.total_groups} group${d.total_groups!==1?'s':''} across ${d.scanned} photos`;
+  if(!d.total_groups){
+    list.innerHTML='<div style="color:var(--green);padding:20px">✓ No duplicates found.</div>';
+    return;
+  }
+  list.innerHTML='';
+  const renderGroup=(photos,label,color,note)=>{
     const g=document.createElement('div'); g.className='dup-group';
-    g.innerHTML=`<div class="dup-group-header"><span style="color:${color};font-weight:700">${label}</span>
-      <span style="color:var(--text-muted)">${photos.length} photos</span></div>
+    g.innerHTML=`<div class="dup-group-header">
+        <span style="color:${color};font-weight:700">${label}</span>
+        <span style="color:var(--text-muted)">${photos.length} photos</span>
+        ${note?`<span style="color:var(--text-dim);font-size:11px">${note}</span>`:''}
+      </div>
       <div class="dup-photos">${photos.map(p=>`
-        <div class="dup-card" title="${p.filename}">
+        <div class="dup-card" title="${p.path}">
           <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
                onerror="this.style.display='none'"/>
           ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
@@ -996,9 +1120,9 @@ async function showDuplicates(){
       </div>`;
     list.appendChild(g);
   };
-
-  d.phash_groups.forEach(g=>renderGroup(g,'🔍 Visual duplicates','var(--purple)'));
-  d.fname_groups.forEach(g=>renderGroup(g,'📄 Filename duplicates','var(--gold)'));
+  (d.exact_groups||[]).forEach(g=>renderGroup(g,'⧉ Identical files','var(--red)','byte-for-byte match'));
+  (d.phash_groups||[]).forEach(g=>renderGroup(g,'🔍 Visually similar','var(--purple)','resized / re-exported / edited'));
+  (d.fname_groups||[]).forEach(g=>renderGroup(g,'📄 Filename pattern','var(--gold)','e.g. name (1).jpg'));
 }
 
 function showGrid(){
@@ -1078,7 +1202,7 @@ async function confirmMapPin(){
 function onCoordsChanged(){
   const lat=parseFloat(document.getElementById('detailLat').value);
   const lon=parseFloat(document.getElementById('detailLon').value);
-  const arr=sortedFiltered(); const p=arr[detailIndex];
+  const p=currentPhoto();
   if(!p) return;
   const bar=document.getElementById('folderSeedBar');
   if(!isNaN(lat)&&!isNaN(lon)){
@@ -1094,7 +1218,7 @@ function seedFolder(){
   const lat=parseFloat(document.getElementById('detailLat').value);
   const lon=parseFloat(document.getElementById('detailLon').value);
   const loc=document.getElementById('detailLocation').value;
-  const arr=sortedFiltered(); const p=arr[detailIndex];
+  const p=currentPhoto();
   if(!p||isNaN(lat)||isNaN(lon)) return;
   _seedLat=lat; _seedLon=lon; _seedLocation=loc;
   _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id&&!x.has_gps&&x.status!=='named')
@@ -1211,7 +1335,10 @@ document.addEventListener('keydown',e=>{
     const r=await fetch('/api/config'); const cfg=await r.json();
     const inp=document.getElementById('folderInput');
     if(cfg.default_photo_root&&!inp.value) inp.value=inp.placeholder=cfg.default_photo_root;
-    if(cfg.has_ai_key&&cfg.ai_usage){
+    // Server re-arms dry run on every page load — reflect that, silently.
+    dryRun = cfg.dry_run !== false;
+    applyDryRunUi(false);
+    if(cfg.has_ai_key&&cfg.ai_usage&&!document.getElementById('aiUsagePill')){
       const u=cfg.ai_usage;
       const pill=document.createElement('div');
       pill.id='aiUsagePill'; pill.className='stats-pill';
