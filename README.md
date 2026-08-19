@@ -231,6 +231,23 @@ honor anyway.
 
 ### Unreleased
 
+**Fixed: switching sessions re-scanned the whole folder from disk every
+time, and could silently break the scan you switched away from.**
+Clicking a saved session always called a full scan, even switching back
+to one already fully loaded a moment ago — for a large library that
+meant every switch cost minutes. Worse: if a scan was still running when
+you clicked a different session, the new attempt got rejected by the
+server (only one scan runs at a time) — but the client had already
+overwritten which folder it was tracking progress for, so the original
+scan's results never made it into the grid when it actually finished; it
+just looked stuck on "Scanning…" forever. Fixed: clicking a session now
+loads its already-scanned data straight from the database instantly, no
+re-scan, unless that folder has genuinely never been scanned before —
+and a rejected scan attempt no longer touches the tracking for whichever
+scan is actually running. Reproduced both symptoms first (confirmed the
+rejected attempt used to corrupt state, and that instant-switch was
+actually triggering a scan), then verified the fix on both.
+
 **Fixed: "database is locked" errors while a scan was running** (e.g.
 using a saved session, or anything else that writes to the database).
 No connection anywhere ever set `PRAGMA busy_timeout` — SQLite's default

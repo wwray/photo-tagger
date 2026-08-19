@@ -927,12 +927,9 @@ async function startScan(rescan=false) {
   if (!folder) return;
   if (_scanStarting) return;              // guard against double-click
   _scanStarting = true;
-  clearInterval(_pollInterval);           // clear BEFORE awaiting, not after
-  _pollInterval = null;
-  currentScanRoot = folder;
   const btn = document.getElementById('scanBtn');
+  const prevBtnText = btn.textContent;
   btn.disabled=true; btn.textContent='Scanning…';
-  reportScanProgress('Starting…', 0, 1);
   const r = await fetch('/api/scan', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({folder, rescan})});
@@ -940,12 +937,20 @@ async function startScan(rescan=false) {
   _scanStarting = false;
   if (d.error) {
     toast(d.error,'error');
-    btn.disabled=false; btn.textContent='Scan';
-    if (_activeView==='empty') showEmpty(`<div class="empty-icon">⚠️</div><h2>Couldn't start scan</h2><p>${d.error}</p>`);
-    else hideScanStatusBar();
+    btn.disabled=false; btn.textContent=prevBtnText;
+    // Deliberately don't touch currentScanRoot/_pollInterval/emptyState
+    // below this point — if this attempt was rejected because a DIFFERENT
+    // scan is already running (409, e.g. from clicking between two
+    // sessions), that scan's own progress tracking must be left
+    // completely alone, or its results never make it into the grid when
+    // it actually finishes — it just looks like it "kept scanning forever".
     return;
   }
+  // Only now that THIS scan actually started do we take ownership of
+  // scan-progress tracking.
   clearInterval(_pollInterval);
+  currentScanRoot = folder;
+  reportScanProgress('Starting…', 0, 1);
   _pollInterval = setInterval(pollProgress, 800);
 }
 
@@ -1174,9 +1179,38 @@ async function loadSessions() {
         onclick="event.stopPropagation();deleteSession(${s.id})">✕</button>`;
     el.onclick=()=>{ document.getElementById('folderInput').value=s.scan_root;
       fetch('/api/sessions/'+s.id+'/use',{method:'POST'});
-      startScan(); };
+      switchToSession(s.scan_root); };
     list.appendChild(el);
   });
+}
+
+// Switching sessions used to just call startScan() unconditionally — every
+// click re-scanned the whole folder from disk, even switching back to one
+// already fully loaded a moment ago. Worse, if another scan was still
+// running, the attempt got rejected (409) but had already stomped
+// currentScanRoot/_pollInterval, so the ACTUAL running scan's results
+// never made it into the grid when it finished — the click just looked
+// like it "kept scanning" forever. Now: if this folder already has saved
+// data, show it instantly (a DB read, not a re-scan); only fall back to a
+// real scan if it's genuinely never been scanned before.
+async function switchToSession(folder){
+  let d;
+  try{
+    d = await (await fetch('/api/scan_result?folder='+encodeURIComponent(folder))).json();
+  }catch(e){ toast('Could not load that session','error'); return; }
+  if(d.total>0){
+    currentScanRoot = folder;
+    allPhotos = d.photos;
+    _hasScannedOnce = true;
+    buildFolderList(); updateStats(); recomputeFiltered();
+    setFilter('all');   // switching sessions is a deliberate nav action — always land on the grid
+    document.getElementById('libraryActions').style.display='';
+    ['statsPill','rescanBtn'].forEach(id=>document.getElementById(id).style.display='');
+    loadSessions(); refreshPendingBar();
+    toast(`Loaded ${d.total} photos`, 'success');
+  } else {
+    startScan();   // nothing saved for this folder yet — there's nothing to switch to
+  }
 }
 
 async function newSession() {
