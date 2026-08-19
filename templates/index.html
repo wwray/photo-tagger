@@ -21,8 +21,15 @@
   --sans:"Inter",system-ui,sans-serif;
 }
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+/* A 2-row grid (auto 1fr) only works if body always has exactly two
+   in-flow children. It doesn't: the pending-changes bar and the scan
+   status bar are optional flow siblings between <header> and .main, and
+   whichever of them is visible steals the 1fr track and stretches to fill
+   it, demoting .main to a squashed auto row. Flex sidesteps the whole
+   problem — any number of auto-height bars can come and go, and .main
+   (flex:1) always claims exactly what's left. */
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
-     min-height:100vh;display:grid;grid-template-rows:auto 1fr}
+     min-height:100vh;display:flex;flex-direction:column}
 
 /* Keyboard focus must stay visible against a dark UI — the browser default
    outline is easy to lose here, so every focusable control gets an explicit
@@ -80,7 +87,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .dry-run-toggle.active .toggle-thumb{transform:translateX(12px)}
 
 /* ── Main layout ── */
-.main{display:grid;grid-template-columns:240px 1fr;min-height:0}
+.main{display:grid;grid-template-columns:240px 1fr;flex:1;min-height:0}
 .sidebar{background:var(--surface);border-right:1px solid var(--border);
   overflow-y:auto;padding:12px 0;display:flex;flex-direction:column;gap:0}
 .sidebar-section{padding:0 12px;margin-bottom:20px}
@@ -185,10 +192,16 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
   display:flex;align-items:center;justify-content:center;padding:16px}
 .detail-panel{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius-lg);width:100%;max-width:860px;max-height:90vh;
-  overflow:hidden;display:grid;grid-template-columns:1fr 310px}
-.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px}
-.detail-img-wrap img{max-width:100%;max-height:68vh;object-fit:contain;display:block}
+  border-radius:var(--radius-lg);width:100%;max-width:min(94vw,1400px);max-height:92vh;
+  overflow:hidden;display:grid;grid-template-columns:1fr 360px}
+.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px;position:relative}
+.detail-img-wrap img{max-width:100%;max-height:82vh;object-fit:contain;display:block;transition:transform .2s}
+.rotate-controls{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);display:flex;gap:6px;
+  background:rgba(15,17,23,.65);border-radius:20px;padding:5px;backdrop-filter:blur(4px)}
+.rotate-controls .btn{background:transparent;color:#fff;border:none;font-size:17px;line-height:1;
+  padding:6px 12px;border-radius:16px}
+.rotate-controls .btn:hover:not(:disabled){background:rgba(255,255,255,.15)}
+.rotate-controls .btn:disabled{opacity:.3}
 .detail-form{padding:20px;overflow-y:auto;border-left:1px solid var(--border);
   display:flex;flex-direction:column;gap:14px}
 .detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
@@ -247,19 +260,26 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   padding:8px 12px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--accent);flex-wrap:wrap}
 .folder-seed-bar button{margin-left:auto;flex-shrink:0}
 
-/* ── Seed checklist ── */
-.seed-item{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--radius);
-  border:1px solid var(--border);background:var(--surface2);cursor:pointer;user-select:none;transition:.1s}
+/* ── Seed checklist ──
+   Large thumbnails on purpose: this is a "does this photo actually belong
+   at that location?" visual check, and a 44x33 thumbnail (the original
+   size) isn't enough to tell a hallway from a trailhead. */
+.seed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
+.seed-item{position:relative;border-radius:var(--radius-lg);border:2px solid var(--border);
+  background:var(--surface2);cursor:pointer;user-select:none;overflow:hidden;
+  transition:border-color .15s,opacity .15s}
 .seed-item:hover{border-color:var(--accent)}
-.seed-item.checked{border-color:var(--accent);background:var(--accent-dim)}
-.seed-item img{width:44px;height:33px;object-fit:cover;border-radius:3px;flex-shrink:0;background:var(--surface)}
-.seed-item-info{flex:1;min-width:0}
+.seed-item.checked{border-color:var(--accent)}
+.seed-item:not(.checked){opacity:.4}
+.seed-item img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface)}
+.seed-item-info{padding:8px 10px}
 .seed-item-name{font-family:var(--mono);font-size:11px;color:var(--text-muted);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.seed-item-date{font-size:10px;color:var(--text-dim);margin-top:1px}
-.seed-checkbox{width:17px;height:17px;border:2px solid var(--border);border-radius:3px;
-  display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:10px}
-.seed-item.checked .seed-checkbox{background:var(--accent);border-color:var(--accent);color:#fff}
+.seed-item-date{font-size:11px;color:var(--text-dim);margin-top:2px}
+.seed-checkbox{position:absolute;top:8px;left:8px;width:24px;height:24px;border-radius:6px;
+  background:rgba(15,17,23,.75);border:2px solid rgba(255,255,255,.4);
+  display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;color:#fff;z-index:1}
+.seed-item.checked .seed-checkbox{background:var(--accent);border-color:var(--accent)}
 
 /* ── Duplicates view ── */
 .dup-group{background:var(--surface);border:1px solid var(--purple);border-radius:var(--radius-lg);
@@ -287,6 +307,16 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .hist-import-row.status-error{border-color:var(--red)}
 .hist-import-row.status-importing{border-color:var(--gold)}
 .hist-mini-progress{display:flex;flex-direction:column;gap:6px;padding:8px 0}
+.hist-explainer{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  padding:12px 14px;font-size:12px;color:var(--text-muted);line-height:1.6}
+.hist-explainer p{margin-bottom:8px}
+.hist-explainer p:last-of-type{margin-bottom:10px}
+.hist-explainer strong{color:var(--text)}
+.hist-steps{list-style:none;display:flex;flex-direction:column;gap:5px;counter-reset:hist-step}
+.hist-steps li{position:relative;padding-left:22px}
+.hist-steps li::before{counter-increment:hist-step;content:counter(hist-step);position:absolute;left:0;top:0;
+  width:16px;height:16px;border-radius:50%;background:var(--accent-dim);color:var(--accent);
+  font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center}
 
 /* ── Logs view ──────────────────────────────────────────────── */
 .log-view{background:#0a0c12;border:1px solid var(--border);border-radius:var(--radius-lg);
@@ -355,6 +385,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
     <div class="header-group">
       <button class="btn btn-ghost btn-sm" id="historyBtn" onclick="openHistoryModal()" title="Import GPS location history to fill gaps">🛰️ History</button>
       <button class="btn btn-ghost btn-sm" id="logsBtn" onclick="showLogs()" title="View live server logs">🪵 Logs</button>
+      <button class="btn btn-ghost btn-sm" id="settingsBtn" onclick="openSettingsModal()" title="Settings">⚙️</button>
     </div>
   </div>
 </header>
@@ -449,7 +480,13 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 <!-- Detail overlay -->
 <div class="detail-overlay" id="detailOverlay" style="display:none" onclick="closeDetail(event)">
   <div class="detail-panel" onclick="event.stopPropagation()">
-    <div class="detail-img-wrap"><img id="detailImg" src="" alt=""/></div>
+    <div class="detail-img-wrap">
+      <img id="detailImg" src="" alt=""/>
+      <div class="rotate-controls" id="rotateControls">
+        <button class="btn btn-ghost btn-sm" id="rotateLeftBtn" onclick="rotateDetail(-90)" title="Rotate left 90°">⟲</button>
+        <button class="btn btn-ghost btn-sm" id="rotateRightBtn" onclick="rotateDetail(90)" title="Rotate right 90°">⟳</button>
+      </div>
+    </div>
     <div class="detail-form">
       <div class="detail-header">
         <div class="detail-filename" id="detailFilename"></div>
@@ -551,13 +588,13 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 
 <!-- Seed checklist modal -->
 <div class="map-modal" id="seedModal" style="display:none" onclick="closeSeedModal(event)">
-  <div class="map-panel" style="max-width:600px" onclick="event.stopPropagation()">
+  <div class="map-panel" style="max-width:min(96vw,1180px)" onclick="event.stopPropagation()">
     <div class="map-header">
       <h3>📁 Propagate to folder</h3>
       <span class="map-hint" id="seedModalHint"></span>
       <button class="close-btn" onclick="closeSeedModal()">✕</button>
     </div>
-    <div id="seedChecklist" style="overflow-y:auto;max-height:400px;padding:10px 14px;display:flex;flex-direction:column;gap:6px"></div>
+    <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;max-height:min(72vh,720px);padding:16px"></div>
     <div class="map-footer" style="gap:8px">
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)">All</button>
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)">None</button>
@@ -610,10 +647,26 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   <div class="map-panel" style="max-width:640px" onclick="event.stopPropagation()">
     <div class="map-header">
       <h3>🛰️ Location history</h3>
-      <span class="map-hint">Fill GPS gaps from a Google Takeout export or GPX track</span>
+      <span class="map-hint">Fill in photos that have no GPS</span>
       <button class="close-btn" onclick="closeHistoryModal()">✕</button>
     </div>
     <div style="padding:14px 16px;display:flex;flex-direction:column;gap:16px;max-height:70vh;overflow-y:auto">
+      <div class="hist-explainer">
+        <p><strong>What this is:</strong> if your phone logged a location history — a Google
+        Takeout export, or a GPX track from a GPS watch or tracking app — PhotoTagger can use
+        it to guess where a photo was taken when the photo itself has no GPS. It works by
+        matching each photo's timestamp to the closest recorded point in time.</p>
+        <p><strong>Why it's worth using:</strong> it's based on where <em>you</em> actually
+        were, not a guess from a nearby photo's location or folder name — so it's usually more
+        accurate than the automatic "Inferred" matches. It also runs entirely offline: no
+        data leaves this server, and no API key is needed.</p>
+        <ol class="hist-steps">
+          <li><strong>Import</strong> a history file below (once — it's saved for reuse).</li>
+          <li><strong>Match</strong> it against your current library.</li>
+          <li><strong>Review</strong> the matches in the grid, same as any other suggestion —
+          nothing is written to a file until you save.</li>
+        </ol>
+      </div>
       <div class="field-group">
         <div class="field-label">Import from a server path</div>
         <div style="display:flex;gap:6px">
@@ -663,6 +716,31 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   </div>
 </div>
 
+<!-- Settings modal -->
+<div class="detail-overlay" id="settingsModal" style="display:none" onclick="closeSettingsModal(event)">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+              width:100%;max-width:420px;padding:22px" onclick="event.stopPropagation()">
+    <h3 style="margin-bottom:14px">⚙️ Settings</h3>
+    <div class="field-group" style="margin-bottom:6px">
+      <div class="field-label">AI model</div>
+      <input class="field-input" id="settingsAiModel" type="text" list="aiModelOptions" placeholder="claude-haiku-4-5"/>
+      <datalist id="aiModelOptions">
+        <option value="claude-haiku-4-5">
+        <option value="claude-sonnet-5">
+        <option value="claude-opus-5">
+        <option value="claude-fable-5">
+      </datalist>
+      <div class="field-hint">Used for 🤖 AI Suggest. Haiku is the cheapest/fastest — worth
+      trying a bigger model if suggestions are often wrong. Takes effect on the next AI
+      Suggest click, no restart needed.</div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn btn-primary" onclick="saveSettings()">Save</button>
+      <button class="btn btn-ghost" onclick="closeSettingsModal()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast" id="toast"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
@@ -683,6 +761,8 @@ function currentPhoto(){
 }
 let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
+let _aiModel='';
+let detailRotationDeg=0;   // pending rotation for the open photo — applied on Save, like every other field
 // Explicit flag rather than inferring "first scan" from allPhotos.length===0
 // — a scan that legitimately finds zero photos would otherwise look
 // identical to "never scanned yet" and keep forcing the grid view open on
@@ -767,13 +847,14 @@ async function openPendingModal() {
     d.pending.forEach(p => {
       const item = document.createElement('div');
       item.className = 'pending-item';
-      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date'};
+      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date', rotate_degrees:'Rotation'};
+      const fmtVal = (field,v) => field==='rotate_degrees' && v ? v+'°' : (v||'—');
       const changes = p.changes.map(c => `
         <div class="pending-change">
           <span class="pending-field">${fieldLabels[c.field]||c.field}</span>
-          <span class="pending-old">${c.old_value||'—'}</span>
+          <span class="pending-old">${fmtVal(c.field,c.old_value)}</span>
           <span class="pending-arrow">→</span>
-          <span class="pending-new">${c.new_value||'—'}</span>
+          <span class="pending-new">${fmtVal(c.field,c.new_value)}</span>
         </div>`).join('');
       item.innerHTML = `
         <div class="pending-item-header">
@@ -996,7 +1077,7 @@ function renderGrid() {
       <div class="select-checkbox" onclick="toggleSelect(event,'${p.id.replace(/'/g,"\\'")}')">
         ${selected.has(p.id)?'✓':''}
       </div>
-      <img class="photo-thumb" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220"
+      <img class="photo-thumb" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220${p._thumbCacheBust?'&t='+p._thumbCacheBust:''}"
            loading="lazy" onerror="this.outerHTML='<div class=\\'photo-thumb-placeholder\\'>📷</div>'"/>
       <div class="status-badge ${bc}">${bl}</div>
       <div class="photo-info">
@@ -1096,7 +1177,16 @@ function openDetail(idx) {
   if(idx<0||idx>=arr.length) return;
   detailIndex=idx; const p=arr[idx]; detailId=p?p.id:null;
   document.getElementById('detailFilename').textContent=p.path;
-  document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=600';
+  // 1400 matches .detail-panel's new max-width — below that, the old
+  // size=600 fetch was the real ceiling on how big the image could look,
+  // no matter how much room the enlarged panel/CSS max-height gave it.
+  document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400';
+  detailRotationDeg=0;
+  document.getElementById('detailImg').style.transform='';
+  const canRotate=/\.(jpe?g)$/i.test(p.filename);
+  document.getElementById('rotateLeftBtn').disabled=!canRotate;
+  document.getElementById('rotateRightBtn').disabled=!canRotate;
+  document.getElementById('rotateControls').title=canRotate?'':"Rotation only works on JPEGs right now — RAW can't be re-encoded";
   document.getElementById('detailLocation').value=p.location_name||'';
   document.getElementById('detailLat').value=p.lat||p.inferred_lat||p.history_lat||'';
   document.getElementById('detailLon').value=p.lon||p.inferred_lon||p.history_lon||'';
@@ -1139,6 +1229,14 @@ function detailPos(){
 }
 function prevPhoto(){const i=detailPos(); if(i>0) openDetail(i-1);}
 function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1) openDetail(i+1);}
+
+// Live preview only — a CSS transform, nothing is written until Save sends
+// rotate_degrees through the same dry-run-gated path as every other field.
+function rotateDetail(delta){
+  if(document.getElementById('rotateLeftBtn').disabled) return;
+  detailRotationDeg=(detailRotationDeg+delta+360)%360;
+  document.getElementById('detailImg').style.transform=`rotate(${detailRotationDeg}deg)`;
+}
 
 async function reverseGeocode(){
   const lat=parseFloat(document.getElementById('detailLat').value);
@@ -1188,7 +1286,8 @@ async function saveDetail(){
     location_name:document.getElementById('detailLocation').value,
     lat:parseFloat(document.getElementById('detailLat').value)||null,
     lon:parseFloat(document.getElementById('detailLon').value)||null,
-    date_taken:dv?dv+':00':null, dry_run:dryRun
+    date_taken:dv?dv+':00':null, dry_run:dryRun,
+    rotate_degrees: detailRotationDeg || undefined,
   };
   const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
   const d=await r.json();
@@ -1197,6 +1296,18 @@ async function saveDetail(){
     if(orig){Object.assign(orig,{location_name:payload.location_name,lat:payload.lat,lon:payload.lon,
       date_taken:payload.date_taken,
       status:payload.lat&&payload.lon?'gps':(payload.location_name?'named':'unknown')});}
+    // Rotation actually re-encoded the file's pixels (unless dry-run) — the
+    // CSS preview transform no longer applies, and both the detail image
+    // and grid thumbnail need a fresh fetch, since the browser would
+    // otherwise keep showing the cached, pre-rotation bytes at the same URL.
+    if(detailRotationDeg && !dryRun){
+      detailRotationDeg=0;
+      const bust=Date.now();
+      const img=document.getElementById('detailImg');
+      img.style.transform='';
+      img.src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400&t='+bust;
+      if(orig) orig._thumbCacheBust=bust;
+    }
     updateStats(); renderGrid();
     toast(d.dry_run?'✓ Dry run preview saved':'Saved!',d.dry_run?'':'success');
     if(dryRun) refreshPendingBar();
@@ -1437,6 +1548,28 @@ function closeHistoryModal(e){
   clearInterval(_histMatchPoll); _histMatchPoll=null;
 }
 
+// ── Settings ───────────────────────────────────────────────────────
+function openSettingsModal(){
+  document.getElementById('settingsAiModel').value=_aiModel;
+  document.getElementById('settingsModal').style.display='flex';
+}
+function closeSettingsModal(e){
+  if(e&&e.target!==document.getElementById('settingsModal')) return;
+  document.getElementById('settingsModal').style.display='none';
+}
+async function saveSettings(){
+  const model=document.getElementById('settingsAiModel').value.trim();
+  const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ai_model:model})});
+  const d=await r.json();
+  _aiModel=d.ai_model;
+  document.getElementById('settingsAiModel').value=_aiModel;
+  const pill=document.getElementById('aiUsagePill');
+  if(pill) pill.title=`Model: ${_aiModel}. Resets midnight.`;
+  toast('Settings saved — model: '+_aiModel,'success');
+  closeSettingsModal();
+}
+
 async function loadHistoryImports(){
   const d=await (await fetch('/api/history/imports')).json();
   document.getElementById('historyPointTotal').textContent=
@@ -1663,7 +1796,7 @@ function seedFolder(){
     const dt=t.date_taken?new Date(t.date_taken).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'No date';
     const item=document.createElement('div'); item.className='seed-item checked'; item.dataset.idx=i;
     item.innerHTML=`<div class="seed-checkbox">✓</div>
-      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=88" loading="lazy" onerror="this.style.display='none'"/>
+      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
       <div class="seed-item-info"><div class="seed-item-name">${t.filename}</div><div class="seed-item-date">${dt}</div></div>`;
     item.onclick=()=>{item.classList.toggle('checked');item.querySelector('.seed-checkbox').textContent=item.classList.contains('checked')?'✓':'';updateSeedBtn();};
     list.appendChild(item);
@@ -1765,6 +1898,7 @@ document.addEventListener('keydown',e=>{
 (async()=>{
   try{
     const r=await fetch('/api/config'); const cfg=await r.json();
+    _aiModel = cfg.ai_model||'';
     const inp=document.getElementById('folderInput');
     if(cfg.default_photo_root&&!inp.value) inp.value=inp.placeholder=cfg.default_photo_root;
     // Server re-arms dry run on every page load — reflect that, silently.

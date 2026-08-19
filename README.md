@@ -59,6 +59,7 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Location history import**: match un-GPS-tagged photos against an imported Google Takeout `Records.json` or GPX track by timestamp — offline, no API key, and more reliable than inferring from other photos since it's where *you* actually were (see below)
 - **AI suggestions** via Claude API for photos that can't be auto-inferred (optional)
 - **Writes metadata back** directly into JPEG EXIF, or XMP sidecar files for RAW formats
+- **Rotate**: 90°/180°/270° rotation from the detail view, previewed live before saving, applied through the same dry-run flow as everything else (JPEG only — see below)
 - **Batch operations**: geocode all, tag a selection, save all at once
 - **Dry run by default**: every write is staged as a pending change and reviewed before anything touches disk (see below)
 - **Sessions**: save named scan roots so you can jump back into a library without re-typing the path
@@ -194,6 +195,13 @@ timezone (UTC is the safe case); there's no per-import offset setting.
 | `.jpg` / `.jpeg` | EXIF `ImageDescription` (location) + GPS IFD + DateTimeOriginal |
 | `.cr2`, `.nef`, `.arw`, `.orf`, `.rw2`, `.dng` | XMP sidecar `.xmp` file (picked up by Lightroom, Capture One, etc.) |
 
+Rotation is JPEG-only: it physically re-encodes the pixels (any existing EXIF
+orientation flag is normalized first, so it isn't applied twice), which PIL
+can do for a JPEG but not for a RAW format — there's no RAW codec here to
+decode/re-encode one. The rotate buttons are disabled for RAW files rather
+than pretending to support them via a sidecar hint most RAW viewers won't
+honor anyway.
+
 ---
 
 ## Notes
@@ -215,6 +223,40 @@ timezone (UTC is the safe case); there's no per-import offset setting.
 ## Changelog
 
 ### Unreleased
+
+**Added: rotate controls.** ⟲/⟳ buttons in the detail view, previewed live
+with a CSS transform before saving, applied via the same dry-run-gated
+`/api/save` path as every other field (JPEG only — see "How metadata is
+written").
+
+**Added: configurable AI model.** A ⚙️ Settings modal lets you change the
+model used for AI Suggest without restarting the container. Also fixed the
+shipped default, which had an incorrect date suffix (`claude-haiku-4-5-20251001`
+→ `claude-haiku-4-5`) — current Anthropic model IDs don't take one.
+
+**Improved: detail view and "Propagate to folder" modal are no longer
+cramped.** The photo detail panel was capped at 860px wide with the image
+further limited to 68vh (and fetched at only 600px regardless of screen
+size); it now scales up to `min(94vw, 1400px)` and fetches images at
+1400px. The propagate-to-folder checklist had 44×33px thumbnails that made
+it hard to tell whether a photo actually belonged at the target location;
+thumbnails are now full-size grid cards (~200px+, fetched at 420px).
+
+**Improved: the location-history modal explains itself.** It previously
+jumped straight to "Import from a server path" with no framing; it now
+opens with what the feature is, why it's more trustworthy than the
+automatic "Inferred" guess, and a 3-step outline of the actual workflow.
+
+**Fixed: scan progress could stretch a status bar to fill most of the
+screen.** `body` used a 2-row CSS grid (`auto 1fr`) that only accounts for
+exactly two always-visible children — header and `.main`. Any optional
+in-flow sibling that becomes visible between them (the pending-changes
+bar, and the new scan-status bar) got auto-placed into the `1fr` row and
+stretched to fill it, squashing `.main` into an auto-sized row instead.
+This was a latent bug affecting the pending-changes bar too, whenever it
+was visible — the new status bar just triggered it far more often. Fixed
+by switching `body` to a flex column with `.main{flex:1}`, which doesn't
+care how many optional bars come and go.
 
 **Added: location history import.** Import a Google Takeout `Records.json`
 or GPX track and match un-GPS-tagged photos against it by timestamp

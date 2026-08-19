@@ -21,7 +21,7 @@ import piexif
 import imagehash
 import requests
 from flask import Flask, jsonify, request, send_file, render_template, g
-from PIL import Image
+from PIL import Image, ImageOps
 
 app = Flask(__name__)
 
@@ -75,7 +75,7 @@ PHOTO_EXTENSIONS   = {".jpg", ".jpeg", ".cr2", ".nef", ".arw", ".orf", ".rw2", "
 GEOCODE_DELAY      = 1.1
 DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
 AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
-AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5-20251001")
+AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5")
 DB_PATH            = os.environ.get("DB_PATH", "/app/data/phototagger.db")
 
 _geocode_lock = threading.Lock()
@@ -352,6 +352,12 @@ def effective_dry_run(client_flag):
     """
     return get_dry_run() or bool(client_flag)
 
+def get_ai_model():
+    """The model used for AI Suggest calls. Overridable from the UI
+    (Settings), persisted in the settings table; falls back to the
+    AI_MODEL env var / built-in default when nothing's been saved yet."""
+    return get_setting("ai_model", AI_MODEL)
+
 # ─── AI helpers ───────────────────────────────────────────────────────────────
 
 def _ai_allowed():
@@ -516,6 +522,39 @@ def _write_xmp_sidecar(filepath, location_name, lat=None, lon=None, date_str=Non
   </rdf:RDF>
 </x:xmpmeta>
 <?xpacket end='w'?>""", encoding="utf-8")
+
+# JPEG only: PIL can decode/re-encode a JPEG's pixels, but not a RAW format,
+# so there's no way to physically rotate a CR2/NEF/etc. without a RAW codec
+# this app doesn't have. Rather than fake it with an XMP orientation hint
+# that many RAW viewers ignore, rotation is just not offered for RAW files
+# (the UI disables the buttons) — same honesty-over-guessing approach as
+# everywhere else that only does what it can actually guarantee.
+ROTATABLE_EXTENSIONS = {".jpg", ".jpeg"}
+
+def rotate_image_file(filepath, degrees):
+    """
+    Physically rotate a JPEG's pixels clockwise by `degrees` (90/180/270) and
+    re-save. Any existing EXIF orientation flag is normalized first — via
+    exif_transpose — so a photo that already carries one doesn't end up
+    rotated twice (once by the flag any viewer applies, once by us); the
+    flag is then reset to 1 (normal) since the pixels themselves are now
+    upright. EXIF (GPS, description, dates) is preserved by re-embedding it
+    after PIL's save, which otherwise drops it.
+    """
+    degrees = int(degrees) % 360
+    if degrees == 0:
+        return
+    if Path(filepath).suffix.lower() not in ROTATABLE_EXTENSIONS:
+        raise ValueError("Rotation is only supported for JPEG files")
+    try:
+        exif_dict = piexif.load(filepath)
+    except Exception:
+        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+    img = ImageOps.exif_transpose(Image.open(filepath))
+    # PIL's rotate() is counter-clockwise; the UI's ⟳ is clockwise, so negate.
+    img = img.rotate(-degrees, expand=True)
+    exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
+    img.convert("RGB").save(filepath, "jpeg", quality=92, exif=piexif.dump(exif_dict))
 
 # ─── Scan (background thread) ─────────────────────────────────────────────────
 
@@ -683,9 +722,24 @@ def api_config():
         "default_photo_root": DEFAULT_PHOTO_ROOT,
         "has_ai_key": bool(os.environ.get("ANTHROPIC_API_KEY")),
         "ai_usage": _ai_usage_info(),
-        "ai_model": AI_MODEL,
+        "ai_model": get_ai_model(),
+        "ai_model_default": AI_MODEL,
         "dry_run": True,
     })
+
+@app.route("/api/settings", methods=["GET", "POST"])
+def api_settings():
+    """User-configurable settings that aren't safety-critical enough to need
+    their own endpoint (c.f. /api/dry_run, which is deliberately separate
+    and more defensive). Currently just the AI model; add keys here as
+    the settings surface grows."""
+    if request.method == "POST":
+        data = request.json or {}
+        if "ai_model" in data:
+            model = (data.get("ai_model") or "").strip()
+            set_setting("ai_model", model or AI_MODEL)
+            _log(f"[settings] AI model set to {model or AI_MODEL}")
+    return jsonify({"ai_model": get_ai_model()})
 
 @app.route("/api/logs")
 def api_logs():
@@ -859,6 +913,8 @@ def api_commit_pending():
                 float(fields["lon"]) if fields.get("lon") else None,
                 fields.get("date_taken"),
             )
+            if fields.get("rotate_degrees"):
+                rotate_image_file(info["path"], int(fields["rotate_degrees"]))
             db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
                        (photo_id,))
             results.append({"photo_id":photo_id,"ok":True})
@@ -897,6 +953,7 @@ def api_save():
     lat           = data.get("lat")
     lon           = data.get("lon")
     date_str      = data.get("date_taken")
+    rotate_deg    = data.get("rotate_degrees") or 0
     dry_run       = effective_dry_run(data.get("dry_run", False))
     photo_id      = data.get("id")
 
@@ -912,14 +969,20 @@ def api_save():
             row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
             if row:
                 for field, new_val in [("location_name",location_name),
-                                        ("lat",lat),("lon",lon),("date_taken",date_str)]:
+                                        ("lat",lat),("lon",lon),("date_taken",date_str),
+                                        ("rotate_degrees", rotate_deg or None)]:
                     if new_val is not None:
-                        db_save_pending(db, photo_id, field, row[field], new_val)
+                        # rotate_degrees has no photos.* column of its own (it's an
+                        # action, not a stored field) — row[field] would KeyError.
+                        old_val = row[field] if field in row.keys() else None
+                        db_save_pending(db, photo_id, field, old_val, new_val)
             db.commit()
         return jsonify({"ok":True,"dry_run":True})
 
     try:
         write_location_to_exif(filepath, location_name, lat, lon, date_str)
+        if rotate_deg:
+            rotate_image_file(filepath, rotate_deg)
         # Update DB
         if photo_id:
             db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,date_taken=?,
@@ -1501,7 +1564,7 @@ def api_ai_infer():
     )
     try:
         msg = anthropic.Anthropic().messages.create(
-            model=AI_MODEL, max_tokens=30,
+            model=get_ai_model(), max_tokens=30,
             messages=[{"role":"user","content":prompt}])
         _ai_increment()
         suggestion = msg.content[0].text.strip()
@@ -1542,7 +1605,7 @@ def api_ai_infer_with_coords():
     )
     try:
         msg = anthropic.Anthropic().messages.create(
-            model=AI_MODEL, max_tokens=30,
+            model=get_ai_model(), max_tokens=30,
             messages=[{"role":"user","content":prompt}])
         _ai_increment()
         location_name = msg.content[0].text.strip()
