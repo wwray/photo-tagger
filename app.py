@@ -279,13 +279,23 @@ def db_upsert_photo(conn, photo: dict):
             folder=excluded.folder, size_kb=excluded.size_kb,
             file_mtime=excluded.file_mtime, date_taken=excluded.date_taken,
             lat=excluded.lat, lon=excluded.lon,
-            location_name=COALESCE(excluded.location_name, photos.location_name),
+            -- A fresh read finding nothing normally keeps the old name (a
+            -- transient EXIF read failure shouldn't wipe a real one) — but
+            -- if the old name is a camera firmware default like "OLYMPUS
+            -- DIGITAL CAMERA" rather than something anyone actually typed,
+            -- a rescan should be allowed to clear it, not preserve it forever.
+            location_name=CASE WHEN excluded.location_name IS NOT NULL THEN excluded.location_name
+                               WHEN is_junk_desc(photos.location_name) THEN NULL
+                               ELSE photos.location_name END,
             has_gps=excluded.has_gps,
             -- 'history' is a suggestion (from imported location history), not
             -- read straight from the file, so it's just as fragile to a
             -- rescan re-deriving 'unknown' as 'named'/'gps' would be — treat
             -- it the same way rather than silently discarding the match.
+            -- Exception: a 'named' status backed only by junk description
+            -- text was never a real name to protect — let it downgrade.
             status=CASE WHEN photos.status IN ('named','gps','history') AND excluded.status='unknown'
+                             AND NOT (photos.status='named' AND is_junk_desc(photos.location_name))
                         THEN photos.status ELSE excluded.status END,
             phash=excluded.phash, dhash=excluded.dhash, file_hash=excluded.file_hash,
             date_source=excluded.date_source,
@@ -392,6 +402,24 @@ def _dms_to_decimal(dms, ref):
     except Exception:
         return None
 
+# Some cameras write a firmware default into ImageDescription instead of
+# leaving it empty — "OLYMPUS DIGITAL CAMERA" is the classic, widely
+# documented case, and other manufacturers have their own "<BRAND> DIGITAL
+# CAMERA"-shaped defaults. None of these are a caption or location a
+# person entered; treating them as one made photos look "already tagged"
+# (status='named') when nothing meaningful was actually saved on them —
+# which then blocked Propagate-to-folder and other "don't overwrite
+# confirmed data" logic from touching them at all.
+_JUNK_DESCRIPTION_RE = re.compile(r"^[a-z0-9 ]+ digital camera$", re.IGNORECASE)
+
+def _is_junk_description(text):
+    if not text:
+        return True
+    t = text.strip()
+    if not t:
+        return True
+    return bool(_JUNK_DESCRIPTION_RE.match(t))
+
 def read_exif(filepath):
     result = {"date_taken":None,"lat":None,"lon":None,
               "location_name":None,"has_gps":False,"error":None,
@@ -415,7 +443,9 @@ def read_exif(filepath):
             if lat is not None and lon is not None:
                 result["lat"] = lat; result["lon"] = lon; result["has_gps"] = True
         if "Image ImageDescription" in tags:
-            result["location_name"] = str(tags["Image ImageDescription"])
+            desc = str(tags["Image ImageDescription"]).strip()
+            if not _is_junk_description(desc):
+                result["location_name"] = desc
     except Exception as e:
         result["error"] = str(e)
 
@@ -602,6 +632,7 @@ def _run_scan(folder, rescan=False):
         # ── EXIF + hashes ──────────────────────────────────────────
         conn = sqlite3.connect(DB_PATH)
         conn.row_factory = sqlite3.Row
+        conn.create_function("is_junk_desc", 1, _is_junk_description)
         photos_batch = []
 
         for i, p in enumerate(all_paths):
