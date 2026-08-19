@@ -517,20 +517,20 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       </div>
       <div class="field-group">
         <div class="field-label">Location</div>
-        <input class="field-input" id="detailLocation" type="text" placeholder="e.g. Paris, France"/>
+        <input class="field-input" id="detailLocation" type="text" placeholder="e.g. Paris, France" oninput="markDetailDirty()"/>
         <div class="field-hint" id="detailLocationHint"></div>
         <button class="btn btn-ghost btn-sm" onclick="aiInfer()" id="aiBtn">🤖 AI Suggest</button>
       </div>
       <div class="field-group">
         <div class="field-label">Date Taken</div>
-        <input class="field-input" id="detailDate" type="datetime-local"/>
+        <input class="field-input" id="detailDate" type="datetime-local" oninput="markDetailDirty()"/>
         <div class="field-hint" id="detailDateHint"></div>
       </div>
       <div class="field-group">
         <div class="field-label">GPS Coordinates</div>
         <div class="gps-row">
-          <input class="field-input" id="detailLat" type="number" step="0.000001" placeholder="Latitude" oninput="onCoordsChanged()"/>
-          <input class="field-input" id="detailLon" type="number" step="0.000001" placeholder="Longitude" oninput="onCoordsChanged()"/>
+          <input class="field-input" id="detailLat" type="number" step="0.000001" placeholder="Latitude" oninput="markDetailDirty();onCoordsChanged()"/>
+          <input class="field-input" id="detailLon" type="number" step="0.000001" placeholder="Longitude" oninput="markDetailDirty();onCoordsChanged()"/>
         </div>
         <div style="display:flex;gap:5px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="reverseGeocode()" id="geocodeBtn">🌍 Geocode</button>
@@ -556,7 +556,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <div class="batch-bar" id="batchBar" style="display:none">
   <span><strong id="batchCount">0</strong> selected</span>
   <button class="btn btn-primary btn-sm" onclick="batchSetLocation()">📍 Set location…</button>
-  <button class="btn btn-green btn-sm" onclick="batchSave()">💾 Save</button>
+  <button class="btn btn-green btn-sm" id="batchSaveBtn" onclick="batchSave()">💾 Save</button>
   <button class="btn btn-ghost btn-sm" onclick="clearSelection()">✕</button>
 </div>
 
@@ -786,6 +786,7 @@ let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
 let _aiModel='';
 let detailRotationDeg=0;   // pending rotation for the open photo — applied on Save, like every other field
+let detailDirty=false;     // true once a detail field has been edited since openDetail() populated it
 let _lastGridClick=null;   // index of the last card clicked — anchor for shift-click range select
 // Explicit flag rather than inferring "first scan" from allPhotos.length===0
 // — a scan that legitimately finds zero photos would otherwise look
@@ -1316,6 +1317,7 @@ function openDetail(idx) {
   const arr=sortedFiltered();
   if(idx<0||idx>=arr.length) return;
   detailIndex=idx; const p=arr[idx]; detailId=p?p.id:null;
+  detailDirty=false; // fields below are about to be overwritten with p's own values
   document.getElementById('detailFilename').textContent=p.path;
   // 1400 matches .detail-panel's new max-width — below that, the old
   // size=600 fetch was the real ceiling on how big the image could look,
@@ -1331,8 +1333,11 @@ function openDetail(idx) {
   document.getElementById('detailLat').value=p.lat||p.inferred_lat||p.history_lat||'';
   document.getElementById('detailLon').value=p.lon||p.inferred_lon||p.history_lon||'';
   const di=document.getElementById('detailDate');
+  // Clear first: on a malformed date_taken the try below throws before
+  // assigning di.value, and an empty catch used to leave whatever the
+  // *previous* photo's date was still showing against this new photo.
+  di.value='';
   if(p.date_taken){try{di.value=p.date_taken.replace(' ','T').slice(0,16);}catch(e){}}
-  else di.value='';
   const ib=document.getElementById('inferBar');
   if(p.status==='inferred'){ib.style.display='flex';
     document.getElementById('inferBarText').textContent=`Inferred from "${p.inferred_from}" (${p.inferred_delta_min} min apart)`;}
@@ -1358,8 +1363,17 @@ function openDetail(idx) {
   document.getElementById('detailOverlay').style.display='flex';
   onCoordsChanged();
 }
+function markDetailDirty(){ detailDirty=true; }
+// Nothing here auto-saves — Prev/Next/✕/Escape used to silently discard
+// whatever was typed into Location/Date/GPS with zero warning. This is the
+// one gate all of those paths go through before actually navigating away.
+function confirmDiscardIfDirty(){
+  if(!detailDirty) return true;
+  return confirm('You have unsaved changes to this photo. Discard them?');
+}
 function closeDetail(e){
   if(e&&e.target!==document.getElementById('detailOverlay')) return;
+  if(!confirmDiscardIfDirty()) return;
   document.getElementById('detailOverlay').style.display='none';
 }
 function detailPos(){
@@ -1367,8 +1381,8 @@ function detailPos(){
   if(detailId){const i=a.findIndex(x=>x.id===detailId); if(i>=0) return i;}
   return detailIndex;
 }
-function prevPhoto(){const i=detailPos(); if(i>0) openDetail(i-1);}
-function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1) openDetail(i+1);}
+function prevPhoto(){const i=detailPos(); if(i>0&&confirmDiscardIfDirty()) openDetail(i-1);}
+function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1&&confirmDiscardIfDirty()) openDetail(i+1);}
 
 // Live preview only — a CSS transform, nothing is written until Save sends
 // rotate_degrees through the same dry-run-gated path as every other field.
@@ -1427,6 +1441,14 @@ async function aiInfer(){
   }
 }
 
+// parseFloat(x)||null used to silently coerce a legitimate 0 (equator /
+// prime-meridian coordinate) to null, since 0 is falsy. Only NaN means
+// "not a number here".
+function numOrNull(str){
+  const n=parseFloat(str);
+  return Number.isNaN(n)?null:n;
+}
+
 async function saveDetail(){
   const p=currentPhoto();
   if(!p){ toast('No photo selected — reopen the photo and try again','error'); return; }
@@ -1435,61 +1457,72 @@ async function saveDetail(){
   const payload={
     id:p.id, path:p.path,
     location_name:document.getElementById('detailLocation').value,
-    lat:parseFloat(document.getElementById('detailLat').value)||null,
-    lon:parseFloat(document.getElementById('detailLon').value)||null,
+    lat:numOrNull(document.getElementById('detailLat').value),
+    lon:numOrNull(document.getElementById('detailLon').value),
     date_taken:dv?dv+':00':null, dry_run:dryRun,
     rotate_degrees: detailRotationDeg || undefined,
   };
-  const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
-  const d=await r.json();
-  if(d.ok){
-    const orig=allPhotos.find(x=>x.id===p.id);
-    if(orig){Object.assign(orig,{location_name:payload.location_name,lat:payload.lat,lon:payload.lon,
-      date_taken:payload.date_taken,
-      status:payload.lat&&payload.lon?'gps':(payload.location_name?'named':'unknown')});}
-    // Rotation actually re-encoded the file's pixels (unless dry-run) — the
-    // CSS preview transform no longer applies, and both the detail image
-    // and grid thumbnail need a fresh fetch, since the browser would
-    // otherwise keep showing the cached, pre-rotation bytes at the same URL.
-    if(detailRotationDeg && !dryRun){
-      detailRotationDeg=0;
-      const bust=Date.now();
-      const img=document.getElementById('detailImg');
-      img.style.transform='';
-      img.src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400&t='+bust;
-      if(orig) orig._thumbCacheBust=bust;
-    }
-    updateStats(); renderGrid();
-    toast(d.dry_run?'✓ Dry run preview saved':'Saved!',d.dry_run?'':'success');
-    if(dryRun) refreshPendingBar();
-  } else toast('Save failed: '+d.error,'error');
-  btn.disabled=false; btn.textContent='💾 Save to file';
+  try{
+    const r=await fetch('/api/save',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});
+    const d=await r.json();
+    if(d.ok){
+      detailDirty=false; // just committed — no more "discard?" prompt on navigating away
+      const orig=allPhotos.find(x=>x.id===p.id);
+      if(orig){Object.assign(orig,{location_name:payload.location_name,lat:payload.lat,lon:payload.lon,
+        date_taken:payload.date_taken,
+        status:payload.lat&&payload.lon?'gps':(payload.location_name?'named':'unknown')});}
+      // Rotation actually re-encoded the file's pixels (unless dry-run) — the
+      // CSS preview transform no longer applies, and both the detail image
+      // and grid thumbnail need a fresh fetch, since the browser would
+      // otherwise keep showing the cached, pre-rotation bytes at the same URL.
+      if(detailRotationDeg && !dryRun){
+        detailRotationDeg=0;
+        const bust=Date.now();
+        const img=document.getElementById('detailImg');
+        img.style.transform='';
+        img.src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400&t='+bust;
+        if(orig) orig._thumbCacheBust=bust;
+      }
+      updateStats(); renderGrid();
+      toast(d.dry_run?'✓ Dry run preview saved':'Saved!',d.dry_run?'':'success');
+      if(dryRun) refreshPendingBar();
+    } else toast('Save failed: '+d.error,'error');
+  }finally{
+    btn.disabled=false; btn.textContent='💾 Save to file';
+  }
 }
 
 // ── Batch ──────────────────────────────────────────────────────────
 async function batchGeocode(){
   const need=allPhotos.filter(p=>p.has_gps&&!p.location_name);
   if(!need.length){toast('All GPS photos geocoded','success');return;}
+  const btn=document.getElementById('geoBtn');
+  btn.disabled=true; // a slow Nominatim round-trip + an impatient double-click used to fire two overlapping runs
   toast(`Geocoding ${need.length} photos…`);
-  let done=0;
-  for(const p of need){
-    const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:p.lat,lon:p.lon})});
-    const d=await r.json();
-    if(d.location_name){p.location_name=d.location_name;p.status='gps';}
-    done++; if(done%10===0){updateStats();renderGrid();toast(`Geocoded ${done}/${need.length}…`);}
-  }
-  updateStats();renderGrid();toast(`Geocoded ${done} photos`,'success');
+  try{
+    let done=0;
+    for(const p of need){
+      const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:p.lat,lon:p.lon})});
+      const d=await r.json();
+      if(d.location_name){p.location_name=d.location_name;p.status='gps';}
+      done++; if(done%10===0){updateStats();renderGrid();toast(`Geocoded ${done}/${need.length}…`);}
+    }
+    updateStats();renderGrid();toast(`Geocoded ${done} photos`,'success');
+  }finally{ btn.disabled=false; }
 }
 
 async function saveAll(){
   if(!confirm(`Write location data to ${allPhotos.filter(p=>p.location_name||p.lat).length} files?`)) return;
-  const toSave=allPhotos.filter(p=>p.location_name||p.lat);
-  const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({photos:toSave,dry_run:dryRun})});
-  const d=await r.json();
-  const ok=d.results.filter(x=>x.ok).length;
-  toast(d.dry_run?`Dry run: ${ok} previewed`:` Saved ${ok}`,d.dry_run?'':'success');
-  if(dryRun) refreshPendingBar();
+  const btn=document.getElementById('saveAllBtn'); btn.disabled=true;
+  try{
+    const toSave=allPhotos.filter(p=>p.location_name||p.lat);
+    const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({photos:toSave,dry_run:dryRun})});
+    const d=await r.json();
+    const ok=d.results.filter(x=>x.ok).length;
+    toast(d.dry_run?`Dry run: ${ok} previewed`:` Saved ${ok}`,d.dry_run?'':'success');
+    if(dryRun) refreshPendingBar();
+  }finally{ btn.disabled=false; }
 }
 
 function batchSetLocation(){
@@ -1505,22 +1538,28 @@ function closeBatchPrompt(e){
 }
 function applyBatchLocation(){
   const loc=document.getElementById('batchLocation').value;
-  const lat=parseFloat(document.getElementById('batchLat').value)||null;
-  const lon=parseFloat(document.getElementById('batchLon').value)||null;
+  const lat=numOrNull(document.getElementById('batchLat').value);
+  const lon=numOrNull(document.getElementById('batchLon').value);
   selected.forEach(id=>{const p=allPhotos.find(x=>x.id===id);if(!p)return;
-    if(loc)p.location_name=loc;if(lat)p.lat=lat;if(lon)p.lon=lon;
-    p.status=lat&&lon?'gps':(loc?'named':p.status);});
+    if(loc)p.location_name=loc;if(lat!==null)p.lat=lat;if(lon!==null)p.lon=lon;
+    p.status=lat!==null&&lon!==null?'gps':(loc?'named':p.status);});
   updateStats();renderGrid();document.getElementById('batchPrompt').style.display='none';
   toast(`Applied to ${selected.size} photos`,'success');
 }
 async function batchSave(){
   const toSave=allPhotos.filter(p=>selected.has(p.id));
-  const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({photos:toSave,dry_run:dryRun})});
-  const d=await r.json();
-  const ok=d.results.filter(x=>x.ok).length;
-  toast(d.dry_run?`Dry run: ${ok} previewed`:`Saved ${ok}`,'success');
-  if(dryRun) refreshPendingBar();
+  // Same real-write risk as "Save All" (dry run off means this hits disk for
+  // every selected photo), but this path skipped the confirmation.
+  if(!confirm(`Write location data to ${toSave.length} selected file(s)?`)) return;
+  const btn=document.getElementById('batchSaveBtn'); btn.disabled=true;
+  try{
+    const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({photos:toSave,dry_run:dryRun})});
+    const d=await r.json();
+    const ok=d.results.filter(x=>x.ok).length;
+    toast(d.dry_run?`Dry run: ${ok} previewed`:`Saved ${ok}`,'success');
+    if(dryRun) refreshPendingBar();
+  }finally{ btn.disabled=false; }
 }
 
 // ── Duplicates ─────────────────────────────────────────────────────
@@ -2088,9 +2127,13 @@ function toast(msg,type=''){
 // ── Keyboard ───────────────────────────────────────────────────────
 document.addEventListener('keydown',e=>{
   if(document.getElementById('detailOverlay').style.display!=='none'){
+    // Left/Right used to always jump photos, even while the user's cursor
+    // was inside Location/Date/Lat/Lon moving through typed text — every
+    // arrow-key edit near either end of the field silently discarded it.
+    const inTextField=['INPUT','TEXTAREA'].includes(document.activeElement.tagName);
     if(e.key==='Escape') closeDetail({target:document.getElementById('detailOverlay')});
-    if(e.key==='ArrowLeft') prevPhoto();
-    if(e.key==='ArrowRight') nextPhoto();
+    if(e.key==='ArrowLeft'&&!inTextField) prevPhoto();
+    if(e.key==='ArrowRight'&&!inTextField) nextPhoto();
   }
   if(e.key==='Enter'&&document.activeElement.id==='folderInput') startScan();
 });

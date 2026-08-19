@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import contextlib
 import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 from array import array
 from collections import deque
 from pathlib import Path
@@ -45,15 +46,25 @@ class _TeeStream:
         self._real = real_stream
         self._level = level
         self._partial = ""
+        self._partial_lock = threading.Lock()
 
     def write(self, data):
         self._real.write(data)
         global _log_seq
-        self._partial += data
-        while "\n" in self._partial:
-            line, self._partial = self._partial.split("\n", 1)
-            if line.strip():
-                with _log_buffer_lock:
+        # stdout/stderr are shared singletons written concurrently by the
+        # scan/dup-scan/history threads and every request thread — without
+        # a lock around this read-modify-write, two interleaved writes can
+        # corrupt _partial's line boundaries and garble the log viewer.
+        with self._partial_lock:
+            self._partial += data
+            lines = []
+            while "\n" in self._partial:
+                line, self._partial = self._partial.split("\n", 1)
+                if line.strip():
+                    lines.append(line)
+        if lines:
+            with _log_buffer_lock:
+                for line in lines:
                     _log_seq += 1
                     _log_buffer.append({"id": _log_seq,
                                          "ts": datetime.now().isoformat(timespec="seconds"),
@@ -80,7 +91,6 @@ DB_PATH            = os.environ.get("DB_PATH", "/app/data/phototagger.db")
 
 _geocode_lock = threading.Lock()
 _last_geocode = 0.0
-_ai_usage     = {"date": None, "count": 0}
 _ai_lock      = threading.Lock()
 
 # PUID/PGID for Unraid.
@@ -408,26 +418,38 @@ def get_ai_model():
     return get_setting("ai_model", AI_MODEL)
 
 # ─── AI helpers ───────────────────────────────────────────────────────────────
+# Usage is persisted in the settings table (same pattern as dry_run/ai_model)
+# rather than kept only in a module-level dict — an in-memory-only counter
+# means AI_DAILY_LIMIT isn't actually a daily cap in practice, since any
+# restart (update, crash, host reboot) silently resets it to 0.
+
+def _ai_load_usage():
+    """(date, count) for today, from persisted storage. A stored date that
+    isn't today reads as 0 without writing anything — the row only actually
+    rolls over on the next _ai_increment()."""
+    today = datetime.now().date().isoformat()
+    stored_date = get_setting("ai_usage_date")
+    if stored_date != today:
+        return today, 0
+    return today, int(get_setting("ai_usage_count", "0") or 0)
 
 def _ai_allowed():
     with _ai_lock:
-        today = datetime.now().date().isoformat()
-        if _ai_usage["date"] != today:
-            _ai_usage["date"] = today; _ai_usage["count"] = 0
-        if _ai_usage["count"] >= AI_DAILY_LIMIT:
+        _, count = _ai_load_usage()
+        if count >= AI_DAILY_LIMIT:
             return False, f"Daily AI limit of {AI_DAILY_LIMIT} reached."
         return True, ""
 
 def _ai_increment():
-    with _ai_lock: _ai_usage["count"] += 1
+    with _ai_lock:
+        today, count = _ai_load_usage()
+        set_setting("ai_usage_date", today)
+        set_setting("ai_usage_count", str(count + 1))
 
 def _ai_usage_info():
     with _ai_lock:
-        today = datetime.now().date().isoformat()
-        if _ai_usage["date"] != today:
-            return {"used":0,"limit":AI_DAILY_LIMIT,"remaining":AI_DAILY_LIMIT}
-        used = _ai_usage["count"]
-        return {"used":used,"limit":AI_DAILY_LIMIT,"remaining":max(0,AI_DAILY_LIMIT-used)}
+        _, count = _ai_load_usage()
+        return {"used":count,"limit":AI_DAILY_LIMIT,"remaining":max(0,AI_DAILY_LIMIT-count)}
 
 # ─── EXIF helpers ─────────────────────────────────────────────────────────────
 
@@ -461,7 +483,11 @@ def read_exif(filepath):
         if lat_tag and lon_tag and lat_ref and lon_ref:
             lat = _dms_to_decimal(lat_tag.values, str(lat_ref))
             lon = _dms_to_decimal(lon_tag.values, str(lon_ref))
-            if lat is not None and lon is not None:
+            # (0,0) is "Null Island" — some cameras/apps write this instead of
+            # omitting the GPS tags entirely when a GPS lock fails. Treating
+            # it as real would reverse-geocode a lock failure into a bogus
+            # Gulf-of-Guinea location and mark the photo confidently "gps".
+            if lat is not None and lon is not None and (abs(lat) > 1e-6 or abs(lon) > 1e-6):
                 result["lat"] = lat; result["lon"] = lon; result["has_gps"] = True
         if "Image ImageDescription" in tags:
             desc = str(tags["Image ImageDescription"]).strip()
@@ -530,8 +556,18 @@ def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str
         _write_xmp_sidecar(filepath, location_name, lat, lon, date_str)
 
 def _write_jpeg_exif(filepath, location_name, lat=None, lon=None, date_str=None):
-    try:    exif_dict = piexif.load(filepath)
-    except: exif_dict = {"0th":{},"Exif":{},"GPS":{},"1st":{}}
+    # piexif.load() does NOT raise just because a JPEG has no EXIF segment —
+    # it only raises when a segment exists but can't be parsed (unusual
+    # maker-notes, a corrupt block, etc). A bare except here would silently
+    # start from an empty dict and wipe every existing EXIF field (camera,
+    # lens, exposure...) on this "safe" write. Refuse instead, so the save
+    # surfaces as an error the user can see rather than quietly losing data.
+    try:
+        exif_dict = piexif.load(filepath)
+    except Exception as e:
+        _log(f"[exif] Refusing to write {filepath}: existing EXIF could not be "
+             f"parsed ({e}) — writing anyway would discard it")
+        raise
     if location_name:
         exif_dict["0th"][piexif.ImageIFD.ImageDescription] = location_name.encode("utf-8")
     if lat is not None and lon is not None:
@@ -558,6 +594,11 @@ def _write_xmp_sidecar(filepath, location_name, lat=None, lon=None, date_str=Non
     lon_s = f"{abs(lon):.6f}" if lon is not None else ""
     lat_r = ("N" if lat>=0 else "S") if lat is not None else ""
     lon_r = ("E" if lon>=0 else "W") if lon is not None else ""
+    # location_name/date_str are free text (user-typed or AI-suggested) —
+    # unescaped, a name containing & < or > (e.g. "Smith & Sons Farm")
+    # produces invalid XML that Lightroom/Capture One silently fail to read.
+    location_esc = xml_escape(location_name) if location_name else ""
+    date_esc = xml_escape(date_str) if date_str else ""
     sidecar.write_text(f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
 <x:xmpmeta xmlns:x='adobe:ns:meta/'>
   <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
@@ -565,10 +606,10 @@ def _write_xmp_sidecar(filepath, location_name, lat=None, lon=None, date_str=Non
       xmlns:dc='http://purl.org/dc/elements/1.1/'
       xmlns:exif='http://ns.adobe.com/exif/1.0/'
       xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
-      <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{location_name or ''}</rdf:li></rdf:Alt></dc:description>
+      <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{location_esc}</rdf:li></rdf:Alt></dc:description>
       <exif:GPSLatitude>{lat_s}{lat_r}</exif:GPSLatitude>
       <exif:GPSLongitude>{lon_s}{lon_r}</exif:GPSLongitude>
-      <xmp:CreateDate>{date_str or ''}</xmp:CreateDate>
+      <xmp:CreateDate>{date_esc}</xmp:CreateDate>
     </rdf:Description>
   </rdf:RDF>
 </x:xmpmeta>
@@ -597,10 +638,14 @@ def rotate_image_file(filepath, degrees):
         return
     if Path(filepath).suffix.lower() not in ROTATABLE_EXTENSIONS:
         raise ValueError("Rotation is only supported for JPEG files")
+    # Same reasoning as _write_jpeg_exif: an unparseable EXIF segment is a
+    # reason to refuse, not to silently start from empty and drop it all.
     try:
         exif_dict = piexif.load(filepath)
-    except Exception:
-        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}}
+    except Exception as e:
+        _log(f"[exif] Refusing to rotate {filepath}: existing EXIF could not be "
+             f"parsed ({e}) — rotating anyway would discard it")
+        raise
     img = ImageOps.exif_transpose(Image.open(filepath))
     # PIL's rotate() is counter-clockwise; the UI's ⟳ is clockwise, so negate.
     img = img.rotate(-degrees, expand=True)
