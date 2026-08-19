@@ -5,6 +5,9 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>PhotoTagger</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
 :root {
   --bg:#0f1117; --surface:#181c27; --surface2:#1e2334; --border:#2a3148;
@@ -21,12 +24,26 @@
 body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
      min-height:100vh;display:grid;grid-template-rows:auto 1fr}
 
+/* Keyboard focus must stay visible against a dark UI — the browser default
+   outline is easy to lose here, so every focusable control gets an explicit
+   one instead of relying on it. */
+:focus{outline:none}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+
+@media (prefers-reduced-motion: reduce){
+  *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
+    transition-duration:.001ms !important;scroll-behavior:auto !important}
+}
+
 /* ── Header ── */
 header{background:var(--surface);border-bottom:1px solid var(--border);
-  padding:0 16px;display:flex;align-items:center;gap:12px;height:56px;
+  padding:0 16px;display:flex;align-items:center;gap:10px;height:58px;
   position:sticky;top:0;z-index:100;overflow-x:auto}
-.logo{font-size:15px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px;white-space:nowrap}
+.logo{font-size:15px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px;white-space:nowrap;
+  letter-spacing:-.01em}
 .logo span{color:var(--accent)}
+.header-divider{width:1px;align-self:stretch;margin:12px 2px;background:var(--border);flex-shrink:0}
+.header-group{display:flex;align-items:center;gap:6px;flex-shrink:0}
 .scan-bar{display:flex;gap:6px;flex:1;max-width:560px;min-width:200px}
 .scan-bar input{flex:1;background:var(--surface2);border:1px solid var(--border);
   border-radius:var(--radius);color:var(--text);padding:7px 10px;
@@ -147,6 +164,22 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .pending-bar{background:var(--gold-dim);border-bottom:1px solid var(--gold);padding:8px 16px;
   display:flex;align-items:center;gap:10px;font-size:13px;color:var(--gold)}
 .pending-bar strong{color:#fff}
+
+/* ── Scan status bar ──────────────────────────────────────────
+   Persistent, non-blocking: a scan/rescan reports progress here instead
+   of taking over whatever view (grid/duplicates/logs) is currently on
+   screen. Only the very first scan (nothing loaded yet) uses the bigger
+   centered spinner in the empty state. */
+.scan-status-bar{background:var(--accent-dim);border-bottom:1px solid var(--accent);padding:7px 16px;
+  display:flex;align-items:center;gap:10px;font-size:12px;color:var(--accent)}
+.scan-status-bar.error{background:var(--red-dim);border-bottom-color:var(--red);color:var(--red)}
+.scan-status-dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex-shrink:0;
+  animation:scan-pulse 1.2s ease-in-out infinite}
+@keyframes scan-pulse{0%,100%{opacity:1}50%{opacity:.3}}
+.scan-status-bar.error .scan-status-dot{animation:none}
+.scan-status-count{font-family:var(--mono);color:var(--text-muted);white-space:nowrap}
+.scan-status-track{flex:0 1 220px;height:4px;background:rgba(255,255,255,.08);border-radius:4px;overflow:hidden}
+.scan-status-fill{height:100%;background:currentColor;transition:width .3s;border-radius:4px}
 
 /* ── Detail overlay ── */
 .detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
@@ -293,6 +326,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 
 <header>
   <div class="logo">📷 <span>Photo</span>Tagger</div>
+  <div class="header-divider"></div>
   <div class="scan-bar">
     <input id="folderInput" type="text" placeholder="/photos"/>
     <button class="btn btn-ghost btn-sm" onclick="openBrowser()" title="Browse folders">📁</button>
@@ -308,15 +342,30 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
     <div class="stats-pill" id="statsPill" style="display:none">
       <span><span class="dot dot-green"></span><span id="statGps">0</span> GPS</span>
       <span><span class="dot dot-gold"></span><span id="statInf">0</span> Inf</span>
+      <span><span class="dot" style="background:var(--teal)"></span><span id="statHist">0</span> Hist</span>
       <span><span class="dot dot-red"></span><span id="statUnk">0</span> Unk</span>
     </div>
-    <button class="btn btn-ghost btn-sm" id="dupBtn" style="display:none" onclick="showDuplicates()">🔍 Duplicates</button>
-    <button class="btn btn-gold btn-sm" id="geoBtn" style="display:none" onclick="batchGeocode()">🌍 Geocode</button>
-    <button class="btn btn-green btn-sm" id="saveAllBtn" style="display:none" onclick="saveAll()">💾 Save All</button>
-    <button class="btn btn-ghost btn-sm" id="historyBtn" onclick="openHistoryModal()" title="Import GPS location history to fill gaps">🛰️ History</button>
-    <button class="btn btn-ghost btn-sm" id="logsBtn" onclick="showLogs()" title="View live server logs">🪵 Logs</button>
+    <div class="header-divider"></div>
+    <div class="header-group" id="libraryActions" style="display:none">
+      <button class="btn btn-ghost btn-sm" id="dupBtn" onclick="showDuplicates()">🔍 Duplicates</button>
+      <button class="btn btn-gold btn-sm" id="geoBtn" onclick="batchGeocode()">🌍 Geocode</button>
+      <button class="btn btn-green btn-sm" id="saveAllBtn" onclick="saveAll()">💾 Save All</button>
+    </div>
+    <div class="header-divider"></div>
+    <div class="header-group">
+      <button class="btn btn-ghost btn-sm" id="historyBtn" onclick="openHistoryModal()" title="Import GPS location history to fill gaps">🛰️ History</button>
+      <button class="btn btn-ghost btn-sm" id="logsBtn" onclick="showLogs()" title="View live server logs">🪵 Logs</button>
+    </div>
   </div>
 </header>
+
+<!-- Persistent scan/rescan status — never covers whatever view is on screen -->
+<div id="scanStatusBar" class="scan-status-bar" style="display:none">
+  <span class="scan-status-dot"></span>
+  <span id="scanStatusMsg">Scanning…</span>
+  <span id="scanStatusCount" class="scan-status-count"></span>
+  <div class="scan-status-track"><div id="scanStatusFill" class="scan-status-fill" style="width:0%"></div></div>
+</div>
 
 <!-- pending dry-run bar -->
 <div id="pendingBar" class="pending-bar" style="display:none">
@@ -634,6 +683,15 @@ function currentPhoto(){
 }
 let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
+// Explicit flag rather than inferring "first scan" from allPhotos.length===0
+// — a scan that legitimately finds zero photos would otherwise look
+// identical to "never scanned yet" and keep forcing the grid view open on
+// every later rescan.
+let _hasScannedOnce=false;
+// Which main-content panel is on screen: 'empty' | 'grid' | 'dup' | 'logs'.
+// Anything that runs on a timer (scan polling, log tailing) checks this
+// before touching the DOM, instead of assuming it owns the view.
+let _activeView='empty';
 
 // ── Global error surfacing ─────────────────────────────────────────
 // Without this, a throw inside any async handler is swallowed and the UI
@@ -751,6 +809,13 @@ async function discardPending() {
 }
 
 // ── Scan ───────────────────────────────────────────────────────────
+// Scan progress used to always take over the main content area — which
+// meant a background rescan poll tick would silently rip you out of
+// whatever you were looking at (Logs, Duplicates, a filtered grid), even
+// mid-read. The rule now is: progress only ever takes over the screen when
+// there's nothing else to show yet (the empty state). Any other time it
+// reports into the persistent status bar under the header instead, and the
+// current view is left completely alone.
 let _scanStarting=false;
 async function startScan(rescan=false) {
   const folder = document.getElementById('folderInput').value.trim();
@@ -762,13 +827,19 @@ async function startScan(rescan=false) {
   currentScanRoot = folder;
   const btn = document.getElementById('scanBtn');
   btn.disabled=true; btn.textContent='Scanning…';
-  showProgress('Starting…', 0, 1);
+  reportScanProgress('Starting…', 0, 1);
   const r = await fetch('/api/scan', {method:'POST',
     headers:{'Content-Type':'application/json'},
     body:JSON.stringify({folder, rescan})});
   const d = await r.json();
   _scanStarting = false;
-  if (d.error) { toast(d.error,'error'); btn.disabled=false; btn.textContent='Scan'; return; }
+  if (d.error) {
+    toast(d.error,'error');
+    btn.disabled=false; btn.textContent='Scan';
+    if (_activeView==='empty') showEmpty(`<div class="empty-icon">⚠️</div><h2>Couldn't start scan</h2><p>${d.error}</p>`);
+    else hideScanStatusBar();
+    return;
+  }
   clearInterval(_pollInterval);
   _pollInterval = setInterval(pollProgress, 800);
 }
@@ -779,22 +850,52 @@ async function pollProgress() {
   const r = await fetch('/api/scan_progress');
   const s = await r.json();
   const labels={counting:'Counting',reading:'Reading EXIF',inferring:'Inferring',geocoding:'Geocoding',done:'Done',error:'Error'};
-  showProgress(s.message || labels[s.phase] || s.phase, s.current, s.total||1);
-  if (s.phase==='done') { clearInterval(_pollInterval); await loadResult(); }
+  const msg = s.message || labels[s.phase] || s.phase;
+  reportScanProgress(msg, s.current, s.total||1);
+  if (s.phase==='done') { clearInterval(_pollInterval); hideScanStatusBar(); await loadResult(); }
   else if (s.phase==='error') {
     clearInterval(_pollInterval);
     const btn=document.getElementById('scanBtn'); btn.disabled=false; btn.textContent='Scan';
-    showEmpty(`<div class="empty-icon">⚠️</div><h2>Scan failed</h2><p>${s.error}</p>`);
+    if (_activeView==='empty') {
+      showEmpty(`<div class="empty-icon">⚠️</div><h2>Scan failed</h2><p>${s.error}</p>`);
+    } else {
+      reportScanProgress('Scan failed: '+s.error, 0, 1, true);
+      setTimeout(hideScanStatusBar, 6000);
+    }
     toast('Scan failed: '+s.error,'error');
   }
 }
 
+// Routes progress to the big centered spinner (nothing else to show yet)
+// or the slim persistent bar (anything else is currently on screen).
+function reportScanProgress(msg, cur, tot, isError=false){
+  if (_activeView==='empty' && !isError) showProgress(msg, cur, tot);
+  else updateScanStatusBar(msg, cur, tot, isError);
+}
+function updateScanStatusBar(msg, cur, tot, isError=false){
+  const bar=document.getElementById('scanStatusBar');
+  bar.style.display='flex';
+  bar.classList.toggle('error', isError);
+  document.getElementById('scanStatusMsg').textContent=msg;
+  document.getElementById('scanStatusCount').textContent = (cur>0 && tot>1) ? `${cur} / ${tot}` : '';
+  document.getElementById('scanStatusFill').style.width = (tot>0 ? Math.round(cur/tot*100) : 0)+'%';
+}
+function hideScanStatusBar(){ document.getElementById('scanStatusBar').style.display='none'; }
+
 async function loadResult() {
   const r = await fetch('/api/scan_result?folder='+encodeURIComponent(currentScanRoot));
   const d = await r.json();
+  const firstLoad = !_hasScannedOnce;
+  _hasScannedOnce = true;
   allPhotos = d.photos;
-  buildFolderList(); applyFilter('all'); updateStats();
-  ['statsPill','geoBtn','saveAllBtn','dupBtn','rescanBtn'].forEach(id=>document.getElementById(id).style.display='');
+  buildFolderList(); updateStats(); recomputeFiltered();
+  // A first scan has nowhere else to land, so jump to the grid. A
+  // background rescan should only refresh the grid in place if that's
+  // actually what's on screen — never yank the user back to it.
+  if (firstLoad) setFilter('all');
+  else if (_activeView==='grid') renderGrid();
+  document.getElementById('libraryActions').style.display='';
+  ['statsPill','rescanBtn'].forEach(id=>document.getElementById(id).style.display='');
   document.getElementById('scanBtn').disabled=false;
   document.getElementById('scanBtn').textContent='Scan';
   loadSessions(); refreshPendingBar();
@@ -812,19 +913,21 @@ function showProgress(msg, cur, tot) {
         </div>
         <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
       </div>
-      <p style="font-size:11px;color:var(--text-dim)">Check Docker logs for live detail</p>
+      <p style="font-size:11px;color:var(--text-dim)">Watch it live in the 🪵 Logs tab</p>
     </div>`;
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='none';
-  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
+  _activeView='empty';
 }
 
 function showEmpty(html) {
   document.getElementById('emptyState').innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;gap:14px;min-height:60vh;justify-content:center">${html}</div>`;
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
+  document.getElementById('dupContainer').style.display='none';
   document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
+  _activeView='empty';
 }
 
 // ── Filter & sort ──────────────────────────────────────────────────
@@ -835,9 +938,16 @@ function setFilter(f) {
   document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
   applyFilter(f);
 }
-function applyFilter(f) {
-  filtered = f==='all' ? [...allPhotos] : allPhotos.filter(p=>p.status===f);
+// Recomputes `filtered` from currentFilter/currentFolder without touching
+// which view is on screen — safe to call from a background refresh (e.g.
+// after a rescan) whether or not the grid happens to be visible right now.
+function recomputeFiltered() {
+  filtered = currentFilter==='all' ? [...allPhotos] : allPhotos.filter(p=>p.status===currentFilter);
   if (currentFolder) filtered=filtered.filter(p=>p.folder===currentFolder);
+}
+function applyFilter(f) {
+  currentFilter=f;
+  recomputeFiltered();
   showGrid(); renderGrid();
 }
 function setSort(s) { currentSort=s; renderGrid(); }
@@ -856,6 +966,7 @@ function showGrid() {
   document.getElementById('gridContainer').style.display='';
   document.getElementById('dupContainer').style.display='none';
   document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
+  _activeView='grid';
 }
 
 function renderGrid() {
@@ -907,6 +1018,7 @@ function updateStats() {
   allPhotos.forEach(p=>c[p.status]=(c[p.status]||0)+1);
   document.getElementById('statGps').textContent=c.gps||0;
   document.getElementById('statInf').textContent=c.inferred||0;
+  document.getElementById('statHist').textContent=c.history||0;
   document.getElementById('statUnk').textContent=c.unknown||0;
   document.getElementById('cnt-all').textContent=allPhotos.length;
   document.getElementById('cnt-gps').textContent=c.gps||0;
@@ -1157,6 +1269,7 @@ async function showDuplicates(force){
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
   document.getElementById('dupContainer').style.display='';
+  _activeView='dup';
   if(!currentScanRoot){ toast('Scan a folder first','error'); return; }
 
   const list=document.getElementById('dupList');
@@ -1239,13 +1352,6 @@ async function renderDupResult(){
   (d.fname_groups||[]).forEach(g=>renderGroup(g,'📄 Filename pattern','var(--gold)','e.g. name (1).jpg'));
 }
 
-function showGrid(){
-  document.getElementById('emptyState').style.display='none';
-  document.getElementById('gridContainer').style.display='';
-  document.getElementById('dupContainer').style.display='none';
-  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
-}
-
 // ── Logs ───────────────────────────────────────────────────────────
 let _logsSinceId=0, _logsPollTimer=null, _logsPaused=false, _logsFollow=true;
 
@@ -1254,6 +1360,7 @@ function showLogs(){
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='none';
   document.getElementById('logsContainer').style.display='';
+  _activeView='logs';
   if(_logsPollTimer) return;              // already watching
   _logsSinceId=0; _logsPaused=false;
   document.getElementById('logsView').innerHTML='<div class="logs-empty">Loading logs…</div>';
