@@ -11,6 +11,7 @@
   --accent:#4f8ef7; --accent-dim:#1e3a6e; --gold:#f0b429; --gold-dim:#4a3500;
   --green:#3ecf8e; --green-dim:#0d3d28; --red:#f47373; --red-dim:#4a1010;
   --purple:#a78bfa; --purple-dim:#2e1a5e;
+  --teal:#2dd4bf; --teal-dim:#0d3d38;
   --text:#e8eaf0; --text-muted:#7a84a0; --text-dim:#3d4560;
   --radius:8px; --radius-lg:14px;
   --mono:"JetBrains Mono","Fira Code",ui-monospace,monospace;
@@ -136,6 +137,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .badge-named{background:var(--accent-dim);color:var(--accent)}
 .badge-unknown{background:var(--red-dim);color:var(--red)}
 .badge-dup{background:var(--purple-dim);color:var(--purple)}
+.badge-history{background:var(--teal-dim);color:var(--teal)}
 .select-checkbox{position:absolute;top:7px;left:7px;width:18px;height:18px;
   background:rgba(15,17,23,.7);border:2px solid var(--border);border-radius:4px;
   display:flex;align-items:center;justify-content:center;font-size:11px;transition:.1s}
@@ -171,6 +173,8 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .field-hint{font-size:11px;color:var(--text-dim);margin-top:1px}
 .infer-bar{background:var(--gold-dim);border:1px solid var(--gold);border-radius:var(--radius);
   padding:8px 10px;font-size:12px;color:var(--gold);display:flex;align-items:center;gap:7px}
+.history-bar{background:var(--teal-dim);border:1px solid var(--teal);border-radius:var(--radius);
+  padding:8px 10px;font-size:12px;color:var(--teal);display:flex;align-items:center;gap:7px}
 .detail-actions{display:flex;flex-direction:column;gap:6px;margin-top:auto;
   padding-top:8px;border-top:1px solid var(--border)}
 
@@ -242,6 +246,26 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .sim-badge{position:absolute;top:4px;right:4px;background:var(--purple-dim);color:var(--purple);
   border-radius:10px;padding:2px 6px;font-size:9px;font-weight:700}
 
+/* ── Location history modal ────────────────────────────────── */
+.hist-import-row{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:var(--radius);
+  border:1px solid var(--border);background:var(--surface2);font-size:12px}
+.hist-import-name{font-family:var(--mono);flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-import-meta{color:var(--text-dim);font-size:11px;white-space:nowrap}
+.hist-import-row.status-error{border-color:var(--red)}
+.hist-import-row.status-importing{border-color:var(--gold)}
+.hist-mini-progress{display:flex;flex-direction:column;gap:6px;padding:8px 0}
+
+/* ── Logs view ──────────────────────────────────────────────── */
+.log-view{background:#0a0c12;border:1px solid var(--border);border-radius:var(--radius-lg);
+  padding:10px 12px;height:calc(100vh - 200px);min-height:300px;overflow-y:auto;
+  font-family:var(--mono);font-size:11.5px;line-height:1.65;white-space:pre-wrap;word-break:break-all}
+.log-line{color:var(--text-muted);border-bottom:1px solid rgba(255,255,255,.02);padding:1px 0}
+.log-line .log-ts{color:var(--text-dim);margin-right:8px}
+.log-line.log-err{color:var(--red)}
+.log-line.log-warn{color:var(--gold)}
+.log-line.log-startup{color:var(--accent)}
+.logs-empty{color:var(--text-dim);padding:16px;text-align:center}
+
 /* ── Pending modal ───────────────────────────────────────────── */
 .pending-item{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
 .pending-item-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
@@ -289,6 +313,8 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
     <button class="btn btn-ghost btn-sm" id="dupBtn" style="display:none" onclick="showDuplicates()">🔍 Duplicates</button>
     <button class="btn btn-gold btn-sm" id="geoBtn" style="display:none" onclick="batchGeocode()">🌍 Geocode</button>
     <button class="btn btn-green btn-sm" id="saveAllBtn" style="display:none" onclick="saveAll()">💾 Save All</button>
+    <button class="btn btn-ghost btn-sm" id="historyBtn" onclick="openHistoryModal()" title="Import GPS location history to fill gaps">🛰️ History</button>
+    <button class="btn btn-ghost btn-sm" id="logsBtn" onclick="showLogs()" title="View live server logs">🪵 Logs</button>
   </div>
 </header>
 
@@ -307,6 +333,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
     <button class="filter-btn" onclick="setFilter('gps')" id="filter-gps"><span style="color:var(--green)">●</span> GPS <span class="count" id="cnt-gps">0</span></button>
     <button class="filter-btn" onclick="setFilter('inferred')" id="filter-inferred"><span style="color:var(--gold)">●</span> Inferred <span class="count" id="cnt-inferred">0</span></button>
     <button class="filter-btn" onclick="setFilter('named')" id="filter-named"><span style="color:var(--accent)">●</span> Named <span class="count" id="cnt-named">0</span></button>
+    <button class="filter-btn" onclick="setFilter('history')" id="filter-history"><span style="color:var(--teal)">●</span> History <span class="count" id="cnt-history">0</span></button>
     <button class="filter-btn" onclick="setFilter('unknown')" id="filter-unknown"><span style="color:var(--red)">●</span> Untagged <span class="count" id="cnt-unknown">0</span></button>
   </div>
   <div class="sidebar-section">
@@ -353,6 +380,20 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
     </div>
     <div id="dupList"></div>
   </div>
+  <div id="logsContainer" style="display:none">
+    <div class="grid-toolbar">
+      <h3>🪵 Server logs</h3>
+      <span id="logsStatus" style="font-size:12px;color:var(--text-dim)"></span>
+      <div class="toolbar-spacer"></div>
+      <label style="display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-muted);cursor:pointer">
+        <input type="checkbox" id="logsFollowCheck" checked onchange="_logsFollow=this.checked"/> Follow
+      </label>
+      <button class="btn btn-ghost btn-sm" id="logsPauseBtn" onclick="toggleLogsPause()">⏸ Pause</button>
+      <button class="btn btn-ghost btn-sm" onclick="clearLogsView()">Clear</button>
+      <button class="btn btn-ghost btn-sm" onclick="showGrid()">← Back to grid</button>
+    </div>
+    <div id="logsView" class="log-view"><div class="logs-empty">Loading logs…</div></div>
+  </div>
 </main>
 </div>
 
@@ -367,6 +408,9 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
       </div>
       <div id="inferBar" class="infer-bar" style="display:none">
         <span>🤖</span><span id="inferBarText"></span>
+      </div>
+      <div id="historyBar" class="history-bar" style="display:none">
+        <span>🛰️</span><span id="historyBarText"></span>
       </div>
       <div class="field-group">
         <div class="field-label">Location</div>
@@ -508,6 +552,64 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
       <button class="btn btn-ghost btn-sm" onclick="closePendingModal()">Cancel</button>
       <button class="btn btn-red btn-sm" onclick="discardPending()">Discard all</button>
       <button class="btn btn-gold btn-sm" onclick="commitPending()">✓ Write to files</button>
+    </div>
+  </div>
+</div>
+
+<!-- Location history modal -->
+<div class="map-modal" id="historyModal" style="display:none" onclick="closeHistoryModal(event)">
+  <div class="map-panel" style="max-width:640px" onclick="event.stopPropagation()">
+    <div class="map-header">
+      <h3>🛰️ Location history</h3>
+      <span class="map-hint">Fill GPS gaps from a Google Takeout export or GPX track</span>
+      <button class="close-btn" onclick="closeHistoryModal()">✕</button>
+    </div>
+    <div style="padding:14px 16px;display:flex;flex-direction:column;gap:16px;max-height:70vh;overflow-y:auto">
+      <div class="field-group">
+        <div class="field-label">Import from a server path</div>
+        <div style="display:flex;gap:6px">
+          <input class="field-input" id="historyPathInput" type="text" placeholder="/photos/Takeout/Records.json or /photos/track.gpx"/>
+          <button class="btn btn-primary btn-sm" onclick="startHistoryImport('path')" id="historyPathBtn">Import</button>
+        </div>
+        <div class="field-hint">A path the container can already see — best for large (1GB+) Takeout exports, since nothing has to travel over the network.</div>
+      </div>
+      <div class="field-group">
+        <div class="field-label">…or upload a file</div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <input type="file" id="historyFileInput" accept=".json,.gpx" style="flex:1;font-size:12px;color:var(--text-muted)"/>
+          <button class="btn btn-ghost btn-sm" onclick="startHistoryImport('upload')" id="historyUploadBtn">Upload</button>
+        </div>
+      </div>
+      <div id="historyImportProgress" class="hist-mini-progress" style="display:none">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)">
+          <span id="historyImportMsg"></span>
+        </div>
+        <div class="progress-bar-wrap"><div id="historyImportBar" class="progress-bar-fill" style="width:0%"></div></div>
+      </div>
+      <div class="field-group">
+        <div class="field-label" style="display:flex;justify-content:space-between;align-items:center">
+          Imported sources
+          <span style="font-size:11px;color:var(--text-dim);font-weight:400;text-transform:none;letter-spacing:0" id="historyPointTotal"></span>
+        </div>
+        <div id="historyImportList" style="display:flex;flex-direction:column;gap:6px"></div>
+      </div>
+      <div class="field-group" style="border-top:1px solid var(--border);padding-top:14px">
+        <div class="field-label">Match current library against imported history</div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input class="field-input" id="historyTolerance" type="number" min="1" value="60" style="max-width:90px"/>
+          <span style="font-size:12px;color:var(--text-muted)">minutes tolerance</span>
+          <div style="flex:1"></div>
+          <button class="btn btn-gold btn-sm" onclick="runHistoryMatch()" id="historyMatchBtn">🔎 Match photos</button>
+        </div>
+        <div class="field-hint">Only touches photos with no GPS and no location name yet — never overwrites an existing GPS tag or confirmed name. Populates suggestions for you to review; nothing is written to a file until you save.</div>
+        <div class="field-hint">Assumes your camera clock and the imported history use the same clock/timezone (UTC is safest) — matching compares timestamps directly.</div>
+        <div id="historyMatchProgress" class="hist-mini-progress" style="display:none">
+          <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--text-muted)">
+            <span id="historyMatchMsg"></span>
+          </div>
+          <div class="progress-bar-wrap"><div id="historyMatchBar" class="progress-bar-fill" style="width:0%"></div></div>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -715,12 +817,14 @@ function showProgress(msg, cur, tot) {
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
 }
 
 function showEmpty(html) {
   document.getElementById('emptyState').innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;gap:14px;min-height:60vh;justify-content:center">${html}</div>`;
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
 }
 
 // ── Filter & sort ──────────────────────────────────────────────────
@@ -742,7 +846,7 @@ function sortedFiltered() {
   if (currentSort==='date') a.sort((x,y)=>(x.date_taken||'').localeCompare(y.date_taken||''));
   else if (currentSort==='name') a.sort((x,y)=>x.filename.localeCompare(y.filename));
   else if (currentSort==='folder') a.sort((x,y)=>x.folder.localeCompare(y.folder));
-  else { const o={gps:0,named:1,inferred:2,unknown:3}; a.sort((x,y)=>(o[x.status]||0)-(o[y.status]||0)); }
+  else { const o={gps:0,named:1,history:2,inferred:3,unknown:4}; a.sort((x,y)=>(o[x.status]||0)-(o[y.status]||0)); }
   return a;
 }
 
@@ -751,6 +855,7 @@ function showGrid() {
   document.getElementById('emptyState').style.display='none';
   document.getElementById('gridContainer').style.display='';
   document.getElementById('dupContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
 }
 
 function renderGrid() {
@@ -762,13 +867,15 @@ function renderGrid() {
   grid.innerHTML='';
   arr.forEach((p,i)=>{
     const card=document.createElement('div');
-    const bc={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',unknown:'badge-unknown'}[p.status]||'badge-unknown';
-    const bl={gps:'GPS',inferred:'Inf',named:'Tagged',unknown:'?'}[p.status];
+    const bc={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',history:'badge-history',unknown:'badge-unknown'}[p.status]||'badge-unknown';
+    const bl={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'}[p.status];
     const loc = p.location_name
       ? `<span style="color:var(--text)">${p.location_name}</span>`
       : p.status==='inferred'
         ? `<span style="color:var(--gold)">≈ inferred</span>`
-        : `<span style="color:var(--red)">Untagged</span>`;
+        : p.status==='history'
+          ? `<span style="color:var(--teal)">🛰️ history match</span>`
+          : `<span style="color:var(--red)">Untagged</span>`;
     const dt = p.date_taken
       ? new Date(p.date_taken).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'})
       : 'No date';
@@ -796,7 +903,7 @@ function renderGrid() {
 
 // ── Stats & sidebar ────────────────────────────────────────────────
 function updateStats() {
-  const c={gps:0,inferred:0,named:0,unknown:0};
+  const c={gps:0,inferred:0,named:0,history:0,unknown:0};
   allPhotos.forEach(p=>c[p.status]=(c[p.status]||0)+1);
   document.getElementById('statGps').textContent=c.gps||0;
   document.getElementById('statInf').textContent=c.inferred||0;
@@ -805,6 +912,7 @@ function updateStats() {
   document.getElementById('cnt-gps').textContent=c.gps||0;
   document.getElementById('cnt-inferred').textContent=c.inferred||0;
   document.getElementById('cnt-named').textContent=c.named||0;
+  document.getElementById('cnt-history').textContent=c.history||0;
   document.getElementById('cnt-unknown').textContent=c.unknown||0;
 }
 
@@ -878,8 +986,8 @@ function openDetail(idx) {
   document.getElementById('detailFilename').textContent=p.path;
   document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=600';
   document.getElementById('detailLocation').value=p.location_name||'';
-  document.getElementById('detailLat').value=p.lat||p.inferred_lat||'';
-  document.getElementById('detailLon').value=p.lon||p.inferred_lon||'';
+  document.getElementById('detailLat').value=p.lat||p.inferred_lat||p.history_lat||'';
+  document.getElementById('detailLon').value=p.lon||p.inferred_lon||p.history_lon||'';
   const di=document.getElementById('detailDate');
   if(p.date_taken){try{di.value=p.date_taken.replace(' ','T').slice(0,16);}catch(e){}}
   else di.value='';
@@ -887,6 +995,11 @@ function openDetail(idx) {
   if(p.status==='inferred'){ib.style.display='flex';
     document.getElementById('inferBarText').textContent=`Inferred from "${p.inferred_from}" (${p.inferred_delta_min} min apart)`;}
   else ib.style.display='none';
+  const hb=document.getElementById('historyBar');
+  if(p.status==='history'&&p.history_lat!=null){hb.style.display='flex';
+    document.getElementById('historyBarText').textContent=
+      `${p.history_delta_min} min from a recorded location point — click 🌍 Geocode for a name`;}
+  else hb.style.display='none';
   document.getElementById('detailLocationHint').textContent=
     p.has_gps?`GPS: ${(p.lat||0).toFixed(5)}, ${(p.lon||0).toFixed(5)}`:'No GPS in file';
   // Date source hint
@@ -1042,6 +1155,7 @@ let _dupPoll=null;
 async function showDuplicates(force){
   document.getElementById('emptyState').style.display='none';
   document.getElementById('gridContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
   document.getElementById('dupContainer').style.display='';
   if(!currentScanRoot){ toast('Scan a folder first','error'); return; }
 
@@ -1129,6 +1243,217 @@ function showGrid(){
   document.getElementById('emptyState').style.display='none';
   document.getElementById('gridContainer').style.display='';
   document.getElementById('dupContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='none'; stopLogsPolling();
+}
+
+// ── Logs ───────────────────────────────────────────────────────────
+let _logsSinceId=0, _logsPollTimer=null, _logsPaused=false, _logsFollow=true;
+
+function showLogs(){
+  document.getElementById('emptyState').style.display='none';
+  document.getElementById('gridContainer').style.display='none';
+  document.getElementById('dupContainer').style.display='none';
+  document.getElementById('logsContainer').style.display='';
+  if(_logsPollTimer) return;              // already watching
+  _logsSinceId=0; _logsPaused=false;
+  document.getElementById('logsView').innerHTML='<div class="logs-empty">Loading logs…</div>';
+  document.getElementById('logsPauseBtn').textContent='⏸ Pause';
+  pollLogs();
+  _logsPollTimer=setInterval(pollLogs, 1500);
+}
+
+function stopLogsPolling(){
+  if(_logsPollTimer){ clearInterval(_logsPollTimer); _logsPollTimer=null; }
+}
+
+function toggleLogsPause(){
+  _logsPaused=!_logsPaused;
+  document.getElementById('logsPauseBtn').textContent = _logsPaused ? '▶ Resume' : '⏸ Pause';
+}
+
+function clearLogsView(){
+  document.getElementById('logsView').innerHTML='';
+}
+
+const _LOG_LEVEL_CLASS = line =>
+  /\bERROR\b|Traceback|error:/i.test(line) ? 'log-err'
+  : /\bWARNING\b|WARN\b/i.test(line)       ? 'log-warn'
+  : line.startsWith('[startup]')           ? 'log-startup'
+  : '';
+
+async function pollLogs(){
+  if(_logsPaused) return;
+  let d;
+  try{ d=await (await fetch('/api/logs?since='+_logsSinceId)).json(); }
+  catch(err){ return; }              // transient network blip — just try again next tick
+  if(!d.lines || !d.lines.length){
+    if(_logsSinceId===0) document.getElementById('logsView').innerHTML='<div class="logs-empty">No log output yet.</div>';
+    return;
+  }
+  const view=document.getElementById('logsView');
+  if(_logsSinceId===0) view.innerHTML='';   // clear the "Loading…" placeholder on first fill
+  const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 8;
+  const frag=document.createDocumentFragment();
+  d.lines.forEach(l=>{
+    const row=document.createElement('div');
+    row.className='log-line '+_LOG_LEVEL_CLASS(l.line);
+    row.innerHTML=`<span class="log-ts">${l.ts.replace('T',' ')}</span>${l.line.replace(/</g,'&lt;')}`;
+    frag.appendChild(row);
+  });
+  view.appendChild(frag);
+  // Cap how much DOM we keep around — the buffer itself already caps at 2000 lines.
+  while(view.children.length>2000) view.removeChild(view.firstChild);
+  if(_logsFollow && atBottom) view.scrollTop=view.scrollHeight;
+  _logsSinceId=d.last_id;
+  document.getElementById('logsStatus').textContent=`${view.children.length} lines shown`;
+}
+
+// ── Location history ─────────────────────────────────────────────
+// Import a GPS trail (Google Takeout Records.json or a GPX track) and match
+// it against photos with no embedded GPS. This never writes anything itself
+// — a match just fills in history_lat/lon on the photo, same as an
+// "inferred" guess, and goes through the normal detail-panel → Save flow
+// (which is dry-run gated like every other write in the app).
+let _histImportPoll=null, _histMatchPoll=null;
+
+function openHistoryModal(){
+  document.getElementById('historyModal').style.display='flex';
+  loadHistoryImports();
+  // Resume watching an in-flight import/match started before the modal was reopened.
+  pollHistoryImportOnce();
+  pollHistoryMatchOnce();
+}
+function closeHistoryModal(e){
+  if(e&&e.target!==document.getElementById('historyModal')) return;
+  document.getElementById('historyModal').style.display='none';
+  clearInterval(_histImportPoll); _histImportPoll=null;
+  clearInterval(_histMatchPoll); _histMatchPoll=null;
+}
+
+async function loadHistoryImports(){
+  const d=await (await fetch('/api/history/imports')).json();
+  document.getElementById('historyPointTotal').textContent=
+    d.total_points ? `${d.total_points.toLocaleString()} points total` : '';
+  const list=document.getElementById('historyImportList');
+  list.innerHTML='';
+  if(!d.imports.length){
+    list.innerHTML='<div style="color:var(--text-dim);font-size:12px;padding:6px 2px">No location history imported yet.</div>';
+    return;
+  }
+  d.imports.forEach(im=>{
+    const row=document.createElement('div');
+    row.className='hist-import-row status-'+im.status;
+    const icon={google_takeout:'🌐',gpx:'🛰️'}[im.source_type]||'📄';
+    const statusText = im.status==='importing' ? 'importing…'
+      : im.status==='error' ? `error: ${im.error||'unknown'}`
+      : `${im.point_count.toLocaleString()} points`;
+    row.innerHTML=`
+      <span>${icon}</span>
+      <span class="hist-import-name" title="${im.source_name}">${im.source_name}</span>
+      <span class="hist-import-meta">${statusText}</span>
+      <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px" onclick="deleteHistoryImport(${im.id})">✕</button>`;
+    list.appendChild(row);
+  });
+}
+
+async function deleteHistoryImport(id){
+  if(!confirm('Remove this import? Any photo suggestions it produced will be cleared.')) return;
+  await fetch('/api/history/imports/'+id,{method:'DELETE'});
+  toast('Import removed');
+  loadHistoryImports();
+  if(currentScanRoot) await loadResult();  // refresh any photos that lost their suggestion
+}
+
+async function startHistoryImport(mode){
+  const btn=document.getElementById(mode==='path'?'historyPathBtn':'historyUploadBtn');
+  btn.disabled=true;
+  try{
+    let r;
+    if(mode==='path'){
+      const path=document.getElementById('historyPathInput').value.trim();
+      if(!path){ toast('Enter a server-side path first','error'); return; }
+      r=await fetch('/api/history/import',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({path})});
+    } else {
+      const input=document.getElementById('historyFileInput');
+      if(!input.files.length){ toast('Choose a file first','error'); return; }
+      const fd=new FormData(); fd.append('file',input.files[0]);
+      r=await fetch('/api/history/import',{method:'POST',body:fd});
+    }
+    const d=await r.json();
+    if(d.error){ toast(d.error,'error'); return; }
+    toast('Import started','success');
+    document.getElementById('historyImportProgress').style.display='block';
+    clearInterval(_histImportPoll);
+    _histImportPoll=setInterval(pollHistoryImportOnce,700);
+  } finally {
+    btn.disabled=false;
+  }
+}
+
+async function pollHistoryImportOnce(){
+  const wasWatching=!!_histImportPoll;   // were WE the ones who started this run?
+  let p;
+  try{ p=await (await fetch('/api/history/import_progress')).json(); }
+  catch(e){ return; }
+  if(!p.running){
+    document.getElementById('historyImportProgress').style.display='none';
+    if(_histImportPoll){ clearInterval(_histImportPoll); _histImportPoll=null; }
+    // Only announce completion for a run we were actively watching — avoids
+    // re-toasting a finished import just because the modal was reopened.
+    if(wasWatching){
+      if(p.phase==='error') toast('Import failed: '+p.error,'error');
+      else if(p.phase==='done') toast(p.message,'success');
+      loadHistoryImports();
+    }
+    return;
+  }
+  document.getElementById('historyImportProgress').style.display='block';
+  document.getElementById('historyImportMsg').textContent=p.message||p.phase;
+  const pct = p.total>0 ? Math.round(p.current/p.total*100) : 5;
+  document.getElementById('historyImportBar').style.width=pct+'%';
+  // Still running but nothing is polling it (e.g. modal was closed and
+  // reopened mid-import) — resume watching so it isn't stuck at one frame.
+  if(!_histImportPoll) _histImportPoll=setInterval(pollHistoryImportOnce,700);
+}
+
+async function runHistoryMatch(){
+  if(!currentScanRoot){ toast('Scan a folder first','error'); return; }
+  const tolerance=parseInt(document.getElementById('historyTolerance').value)||60;
+  const btn=document.getElementById('historyMatchBtn');
+  btn.disabled=true;
+  const r=await fetch('/api/history/match',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({folder:currentScanRoot, tolerance_minutes:tolerance})});
+  const d=await r.json();
+  if(d.error){ toast(d.error,'error'); btn.disabled=false; return; }
+  document.getElementById('historyMatchProgress').style.display='block';
+  clearInterval(_histMatchPoll);
+  _histMatchPoll=setInterval(pollHistoryMatchOnce,600);
+}
+
+async function pollHistoryMatchOnce(){
+  const wasWatching=!!_histMatchPoll;
+  let p;
+  try{ p=await (await fetch('/api/history/match_progress')).json(); }
+  catch(e){ return; }
+  document.getElementById('historyMatchBtn').disabled=p.running;
+  if(!p.running){
+    document.getElementById('historyMatchProgress').style.display='none';
+    if(_histMatchPoll){ clearInterval(_histMatchPoll); _histMatchPoll=null; }
+    if(wasWatching){
+      if(p.phase==='error'){ toast('Match failed: '+p.error,'error'); return; }
+      if(p.result){
+        toast(`Matched ${p.result.matched} of ${p.result.candidates} candidate photos`,'success');
+        if(currentScanRoot) await loadResult();  // pull in the new history_lat/lon + status
+      }
+    }
+    return;
+  }
+  document.getElementById('historyMatchProgress').style.display='block';
+  document.getElementById('historyMatchMsg').textContent=p.message||p.phase;
+  const pct = p.total>0 ? Math.round(p.current/p.total*100) : 5;
+  document.getElementById('historyMatchBar').style.width=pct+'%';
+  if(!_histMatchPoll) _histMatchPoll=setInterval(pollHistoryMatchOnce,600);
 }
 
 // ── Map picker ─────────────────────────────────────────────────────

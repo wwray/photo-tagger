@@ -1,14 +1,21 @@
 import os
 import re
+import sys
 import time
 import json
+import bisect
+import calendar
 import hashlib
 import sqlite3
 import threading
 import contextlib
+import xml.etree.ElementTree as ET
+from array import array
+from collections import deque
 from pathlib import Path
 from datetime import datetime
 
+import ijson
 import exifread
 import piexif
 import imagehash
@@ -17,6 +24,50 @@ from flask import Flask, jsonify, request, send_file, render_template, g
 from PIL import Image
 
 app = Flask(__name__)
+
+# ─── In-app log viewer ──────────────────────────────────────────────────────
+# Everything printed to stdout/stderr (our own `_log()` calls, init_db's
+# prints, the [startup] privilege-drop lines, traceback.print_exc(), even
+# Flask/werkzeug's own request logging) previously only went to `docker
+# logs`. That's fine if you have shell access, but on Unraid etc. it means
+# a scan or startup error is invisible from the UI. Wrapping the streams
+# tees every line into a small ring buffer that /api/logs can serve, with
+# zero changes needed at each of the ~40 existing print() call sites.
+_LOG_BUFFER_MAX = 2000
+_log_buffer      = deque(maxlen=_LOG_BUFFER_MAX)
+_log_buffer_lock = threading.Lock()
+_log_seq         = 0
+
+class _TeeStream:
+    """Writes through to the real stream and also appends whole lines to
+    the in-memory log buffer, so the UI can tail server output."""
+    def __init__(self, real_stream, level):
+        self._real = real_stream
+        self._level = level
+        self._partial = ""
+
+    def write(self, data):
+        self._real.write(data)
+        global _log_seq
+        self._partial += data
+        while "\n" in self._partial:
+            line, self._partial = self._partial.split("\n", 1)
+            if line.strip():
+                with _log_buffer_lock:
+                    _log_seq += 1
+                    _log_buffer.append({"id": _log_seq,
+                                         "ts": datetime.now().isoformat(timespec="seconds"),
+                                         "level": self._level,
+                                         "line": line})
+
+    def flush(self):
+        self._real.flush()
+
+    def isatty(self):
+        return False
+
+sys.stdout = _TeeStream(sys.stdout, "out")
+sys.stderr = _TeeStream(sys.stderr, "err")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -162,15 +213,43 @@ def init_db():
             undone          INTEGER DEFAULT 0
         );
 
+        -- Imported location-history sources (Google Takeout Records.json, GPX
+        -- tracks). One row per import so a bad one can be removed cleanly
+        -- without touching any other source's points.
+        CREATE TABLE IF NOT EXISTS location_imports (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_name     TEXT NOT NULL,
+            source_type     TEXT NOT NULL,      -- 'google_takeout' | 'gpx'
+            point_count     INTEGER DEFAULT 0,
+            status          TEXT DEFAULT 'importing',  -- importing|done|error
+            error           TEXT,
+            imported_at     TEXT DEFAULT (datetime('now'))
+        );
+
+        -- Raw GPS trail points from imported sources. Can run into the
+        -- millions of rows for a multi-year Takeout export — kept as bare
+        -- floats with an index on timestamp for fast nearest-in-time lookup.
+        CREATE TABLE IF NOT EXISTS location_points (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            import_id       INTEGER NOT NULL REFERENCES location_imports(id) ON DELETE CASCADE,
+            timestamp_epoch REAL NOT NULL,
+            lat             REAL NOT NULL,
+            lon             REAL NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_photos_folder    ON photos(folder);
         CREATE INDEX IF NOT EXISTS idx_photos_status    ON photos(status);
         CREATE INDEX IF NOT EXISTS idx_photos_scan_root ON photos(scan_root);
         CREATE INDEX IF NOT EXISTS idx_photos_phash     ON photos(phash);
         CREATE INDEX IF NOT EXISTS idx_pending_photo    ON pending_changes(photo_id);
+        CREATE INDEX IF NOT EXISTS idx_location_points_ts     ON location_points(timestamp_epoch);
+        CREATE INDEX IF NOT EXISTS idx_location_points_import ON location_points(import_id);
     """)
     # Migration: add columns introduced after the first release
     existing = {r[1] for r in conn.execute("PRAGMA table_info(photos)")}
-    for col, ddl in [("dhash", "TEXT"), ("date_source", "TEXT")]:
+    for col, ddl in [("dhash", "TEXT"), ("date_source", "TEXT"),
+                      ("history_lat", "REAL"), ("history_lon", "REAL"),
+                      ("history_delta_min", "INTEGER"), ("history_import_id", "INTEGER")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {ddl}")
             print(f"[db] Migrated: added photos.{col}", flush=True)
@@ -202,7 +281,11 @@ def db_upsert_photo(conn, photo: dict):
             lat=excluded.lat, lon=excluded.lon,
             location_name=COALESCE(excluded.location_name, photos.location_name),
             has_gps=excluded.has_gps,
-            status=CASE WHEN photos.status IN ('named','gps') AND excluded.status='unknown'
+            -- 'history' is a suggestion (from imported location history), not
+            -- read straight from the file, so it's just as fragile to a
+            -- rescan re-deriving 'unknown' as 'named'/'gps' would be — treat
+            -- it the same way rather than silently discarding the match.
+            status=CASE WHEN photos.status IN ('named','gps','history') AND excluded.status='unknown'
                         THEN photos.status ELSE excluded.status END,
             phash=excluded.phash, dhash=excluded.dhash, file_hash=excluded.file_hash,
             date_source=excluded.date_source,
@@ -531,7 +614,10 @@ def _run_scan(folder, rescan=False):
 
         inferred = 0
         for photo in all_db:
-            if photo["has_gps"] or photo["status"] in ("named","inferred") or not photo["date_taken"]:
+            # 'history' (matched against imported location history, if any)
+            # is a stronger signal than a same-folder GPS-cluster guess —
+            # don't let this pass clobber it back down to 'inferred'.
+            if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"]:
                 continue
             try: dt = datetime.fromisoformat(photo["date_taken"])
             except ValueError: continue
@@ -600,6 +686,23 @@ def api_config():
         "ai_model": AI_MODEL,
         "dry_run": True,
     })
+
+@app.route("/api/logs")
+def api_logs():
+    """
+    Tail server stdout/stderr for the in-app Logs view.
+    Pass `since` (last `id` you've already seen) to long-poll-style fetch
+    only new lines; omit it (or pass 0) for an initial backfill of the last
+    `limit` lines. Cheap: it's just filtering an in-memory deque.
+    """
+    since = request.args.get("since", 0, type=int)
+    limit = request.args.get("limit", 500, type=int)
+    with _log_buffer_lock:
+        lines = [l for l in _log_buffer if l["id"] > since]
+        if since <= 0:
+            lines = lines[-limit:]
+        last_id = _log_buffer[-1]["id"] if _log_buffer else since
+    return jsonify({"lines": lines, "last_id": last_id})
 
 @app.route("/api/dry_run", methods=["GET", "POST"])
 def api_dry_run():
@@ -1041,6 +1144,333 @@ def api_duplicates_result():
         if not _dup_state["result"]:
             return jsonify({"error": "No duplicate scan result available"}), 409
         return jsonify(_dup_state["result"])
+
+# ─── Location history import ───────────────────────────────────────────────
+# Fills GPS gaps using an imported location history (Google Takeout
+# Records.json, or a GPX track) instead of guessing from nearby photos or
+# folder/filename text: it's ground truth about where the *person* was.
+# This only ever produces suggestions (history_lat/lon + a time-gap on the
+# photo row) — nothing is written to a file except through the normal
+# dry-run → review → /api/save(_batch) path everything else already uses.
+#
+# Records.json can be 1GB+ with millions of points, so this never loads the
+# whole file into memory: parsing is streamed (ijson), points are inserted
+# in batches, and matching loads only compact array('d', ...) columns
+# (~70MB for ~3M points, vs 300MB+ as plain Python floats/tuples) sorted by
+# time for an O(log n) bisect per photo instead of an O(n) scan.
+
+def _parse_takeout_json(filepath):
+    """
+    Google Takeout Records.json: {"locations": [{"latitudeE7":.., "longitudeE7":..,
+    "timestamp":"...Z", ...possibly nested objects with their own "timestamp",
+    e.g. "activity":[...]}, ...]}.
+
+    ijson.items(f, "locations.item") reconstructs each array element as one
+    complete Python dict before handing it back, so item["timestamp"] is
+    unambiguously the record's own field — a nested "activity" sub-object's
+    "timestamp" key never gets confused with it, unlike a naive text/regex
+    scan would risk. Only one item is materialized in memory at a time.
+    """
+    with open(filepath, "rb") as f:
+        for item in ijson.items(f, "locations.item"):
+            ts_raw = item.get("timestamp")
+            lat_e7 = item.get("latitudeE7")
+            lon_e7 = item.get("longitudeE7")
+            if ts_raw is None or lat_e7 is None or lon_e7 is None:
+                continue
+            try:
+                dt = datetime.fromisoformat(str(ts_raw).replace("Z", "+00:00"))
+                epoch = dt.timestamp()  # tz-aware -> exact epoch, independent of host TZ
+            except (ValueError, TypeError):
+                continue
+            yield epoch, lat_e7 / 1e7, lon_e7 / 1e7
+
+def _parse_gpx(filepath):
+    """
+    GPX track: <trkpt lat=".." lon=".."><time>...</time></trkpt>, one per
+    recorded fix. Streamed with iterparse + per-point clearing so a large
+    track doesn't build the whole XML tree in memory.
+    """
+    for _event, elem in ET.iterparse(filepath, events=("end",)):
+        tag = elem.tag.rsplit("}", 1)[-1]  # strip the GPX XML namespace
+        if tag != "trkpt":
+            continue
+        lat, lon = elem.get("lat"), elem.get("lon")
+        time_text = None
+        for child in elem:
+            if child.tag.rsplit("}", 1)[-1] == "time":
+                time_text = child.text
+                break
+        if lat and lon and time_text:
+            try:
+                dt = datetime.fromisoformat(time_text.strip().replace("Z", "+00:00"))
+                yield dt.timestamp(), float(lat), float(lon)
+            except (ValueError, TypeError):
+                pass
+        elem.clear()
+
+# Pluggable by file extension so another format can be added without
+# touching the import job or the matching logic below.
+LOCATION_PARSERS      = {".json": _parse_takeout_json, ".gpx": _parse_gpx}
+LOCATION_SOURCE_LABEL = {".json": "google_takeout",    ".gpx": "gpx"}
+
+def _wallclock_epoch(dt):
+    """
+    Epoch-like seconds from a naive datetime's literal wall-clock fields —
+    NOT the host container's timezone (that's what plain .timestamp() on a
+    naive datetime would use, which would make matches silently depend on
+    how the container happens to be configured).
+
+    EXIF dates have no timezone at all, so this is the best available
+    without more metadata than the app has today: it compares the camera's
+    wall-clock reading directly against the location history's wall-clock
+    reading. That's exact if both are in the same zone (both UTC is the
+    safe case) and off by a fixed offset otherwise.
+    """
+    return calendar.timegm(dt.timetuple())
+
+def _insert_points_batch(conn, import_id, batch):
+    conn.executemany(
+        "INSERT INTO location_points (import_id, timestamp_epoch, lat, lon) VALUES (?,?,?,?)",
+        [(import_id, ts, lat, lon) for ts, lat, lon in batch])
+
+def _load_sorted_points(conn):
+    """
+    All imported points (across every import) as parallel array('d'/'q')
+    columns sorted by time, for a bisect-based nearest-in-time lookup.
+    Fetched in chunks rather than one big fetchall() to keep peak memory
+    bounded even at millions of rows.
+    """
+    ts, lat, lon, imp = array("d"), array("d"), array("d"), array("q")
+    cur = conn.execute(
+        "SELECT timestamp_epoch, lat, lon, import_id FROM location_points ORDER BY timestamp_epoch")
+    while True:
+        rows = cur.fetchmany(20000)
+        if not rows:
+            break
+        for r in rows:
+            ts.append(r[0]); lat.append(r[1]); lon.append(r[2]); imp.append(r[3])
+    return ts, lat, lon, imp
+
+def _find_nearest_point(ts_arr, epoch):
+    """Nearest point in time to `epoch`. Checks both neighbors around the
+    bisect insertion point and returns (delta_seconds, index)."""
+    n = len(ts_arr)
+    if n == 0:
+        return None, None
+    i = bisect.bisect_left(ts_arr, epoch)
+    candidates = [j for j in (i - 1, i) if 0 <= j < n]
+    best = min(candidates, key=lambda j: abs(ts_arr[j] - epoch))
+    return abs(ts_arr[best] - epoch), best
+
+# ── Import job (background thread) ─────────────────────────────────
+_hist_import_state = {"running": False, "phase": "", "current": 0, "total": 0,
+                       "message": "", "error": None, "import_id": None}
+_hist_import_lock  = threading.Lock()
+_HIST_BATCH_SIZE   = 5000
+
+def _run_history_import(import_id, filepath, ext, cleanup_path=None):
+    conn = sqlite3.connect(DB_PATH)
+    count = 0
+    batch = []
+    try:
+        with _hist_import_lock:
+            _hist_import_state.update(phase="parsing", message="Parsing…", current=0, total=0)
+        for epoch, lat, lon in LOCATION_PARSERS[ext](filepath):
+            batch.append((epoch, lat, lon))
+            if len(batch) >= _HIST_BATCH_SIZE:
+                _insert_points_batch(conn, import_id, batch)
+                conn.commit()
+                count += len(batch)
+                batch = []
+                with _hist_import_lock:
+                    _hist_import_state.update(current=count, message=f"Imported {count:,} points…")
+        if batch:
+            _insert_points_batch(conn, import_id, batch)
+            conn.commit()
+            count += len(batch)
+
+        conn.execute("UPDATE location_imports SET point_count=?, status='done' WHERE id=?",
+                     (count, import_id))
+        conn.commit()
+        _log(f"[history] Import #{import_id} done: {count:,} points from {filepath}")
+        with _hist_import_lock:
+            _hist_import_state.update(running=False, phase="done", current=count, total=count,
+                                       message=f"Imported {count:,} location points")
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        conn.execute("UPDATE location_imports SET status='error', error=? WHERE id=?",
+                     (str(e), import_id))
+        conn.commit()
+        _log(f"[history] Import #{import_id} FAILED: {e}")
+        with _hist_import_lock:
+            _hist_import_state.update(running=False, phase="error", error=str(e), message=f"Error: {e}")
+    finally:
+        conn.close()
+        if cleanup_path:
+            try: os.remove(cleanup_path)
+            except OSError: pass
+
+# ── Matching job (background thread) ───────────────────────────────
+_hist_match_state = {"running": False, "phase": "", "current": 0, "total": 0,
+                      "message": "", "error": None, "result": None}
+_hist_match_lock  = threading.Lock()
+
+def _run_history_match(folder, tolerance_minutes):
+    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    try:
+        with _hist_match_lock:
+            _hist_match_state.update(phase="loading", message="Loading location history…",
+                                      current=0, total=0)
+        ts_arr, lat_arr, lon_arr, imp_arr = _load_sorted_points(conn)
+        if not ts_arr:
+            with _hist_match_lock:
+                _hist_match_state.update(running=False, phase="done",
+                    message="No location history imported yet.",
+                    result={"matched": 0, "candidates": 0})
+            return
+
+        # Eligible = no embedded GPS and no confirmed name yet. This also
+        # covers photos currently 'inferred' from a sibling-photo cluster —
+        # a history match is ground truth about the *person*, not a guess
+        # from nearby files, so it's allowed to supersede that weaker guess.
+        rows = rows_to_dicts(conn.execute("""
+            SELECT id, date_taken FROM photos
+            WHERE scan_root=? AND has_gps=0
+              AND (location_name IS NULL OR location_name='')
+              AND date_taken IS NOT NULL
+        """, (folder,)).fetchall())
+
+        tol_seconds = tolerance_minutes * 60
+        total = len(rows)
+        matched = 0
+        with _hist_match_lock:
+            _hist_match_state.update(phase="matching", total=total, current=0,
+                                      message=f"Matching {total} candidate photos…")
+
+        for i, row in enumerate(rows):
+            try:
+                dt = datetime.fromisoformat(row["date_taken"])
+            except ValueError:
+                continue
+            delta, idx = _find_nearest_point(ts_arr, _wallclock_epoch(dt))
+            if delta is not None and delta <= tol_seconds:
+                conn.execute("""UPDATE photos SET history_lat=?, history_lon=?,
+                    history_delta_min=?, history_import_id=?, status='history' WHERE id=?""",
+                    (lat_arr[idx], lon_arr[idx], round(delta / 60), imp_arr[idx], row["id"]))
+                matched += 1
+            if i % 200 == 0:
+                conn.commit()
+                with _hist_match_lock:
+                    _hist_match_state.update(current=i + 1,
+                        message=f"Matching: {i+1}/{total} ({matched} matched so far)")
+        conn.commit()
+        _log(f"[history] Match done: {matched}/{total} within {tolerance_minutes} min")
+        with _hist_match_lock:
+            _hist_match_state.update(running=False, phase="done", current=total, total=total,
+                message=f"Matched {matched} of {total} candidate photos",
+                result={"matched": matched, "candidates": total})
+    except Exception as e:
+        import traceback; traceback.print_exc()
+        _log(f"[history] Match ERROR: {e}")
+        with _hist_match_lock:
+            _hist_match_state.update(running=False, phase="error", error=str(e), message=f"Error: {e}")
+    finally:
+        conn.close()
+
+# ── Routes ────────────────────────────────────────────────────────
+@app.route("/api/history/imports")
+def api_history_imports():
+    db = _get_db()
+    rows = db.execute("SELECT * FROM location_imports ORDER BY imported_at DESC").fetchall()
+    total_points = db.execute("SELECT COUNT(*) c FROM location_points").fetchone()["c"]
+    return jsonify({"imports": rows_to_dicts(rows), "total_points": total_points})
+
+@app.route("/api/history/import", methods=["POST"])
+def api_history_import():
+    with _hist_import_lock:
+        if _hist_import_state["running"]:
+            return jsonify({"error": "An import is already running"}), 409
+
+    upload = request.files.get("file")
+    cleanup_path = None
+    if upload and upload.filename:
+        ext = Path(upload.filename).suffix.lower()
+        if ext not in LOCATION_PARSERS:
+            return jsonify({"error": f"Unsupported file type: {ext or '(none)'}"}), 400
+        tmp_dir = Path(DB_PATH).parent / "tmp_imports"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        source_name = upload.filename
+        filepath = str(tmp_dir / f"upload_{int(time.time())}{ext}")
+        upload.save(filepath)  # Werkzeug streams this to disk in chunks, not buffered in memory
+        cleanup_path = filepath
+    else:
+        data = request.form or request.get_json(silent=True) or {}
+        path = (data.get("path") or "").strip()
+        if not path:
+            return jsonify({"error": "Provide a file upload or a server-side path"}), 400
+        ext = Path(path).suffix.lower()
+        if ext not in LOCATION_PARSERS:
+            return jsonify({"error": f"Unsupported file type: {ext or '(none)'}"}), 400
+        if not os.path.isfile(path):
+            return jsonify({"error": f"File not found: {path}"}), 400
+        filepath = path
+        source_name = Path(path).name
+
+    db = _get_db()
+    cur = db.execute("INSERT INTO location_imports (source_name, source_type, status) VALUES (?,?,'importing')",
+                      (source_name, LOCATION_SOURCE_LABEL[ext]))
+    db.commit()
+    import_id = cur.lastrowid
+
+    with _hist_import_lock:
+        _hist_import_state.update(running=True, phase="starting", current=0, total=0,
+                                   message="Starting import…", error=None, import_id=import_id)
+    threading.Thread(target=_run_history_import,
+                      args=(import_id, filepath, ext, cleanup_path), daemon=True).start()
+    return jsonify({"started": True, "import_id": import_id})
+
+@app.route("/api/history/import_progress")
+def api_history_import_progress():
+    with _hist_import_lock:
+        return jsonify(dict(_hist_import_state))
+
+@app.route("/api/history/imports/<int:import_id>", methods=["DELETE"])
+def api_delete_history_import(import_id):
+    db = _get_db()
+    # A removed import invalidates any suggestion it produced — reset those
+    # photos rather than leaving a 'history' status backed by nothing.
+    db.execute("""UPDATE photos SET history_lat=NULL, history_lon=NULL,
+                  history_delta_min=NULL, history_import_id=NULL,
+                  status=CASE WHEN status='history' THEN 'unknown' ELSE status END
+                  WHERE history_import_id=?""", (import_id,))
+    db.execute("DELETE FROM location_points WHERE import_id=?", (import_id,))
+    db.execute("DELETE FROM location_imports WHERE id=?", (import_id,))
+    db.commit()
+    return jsonify({"ok": True})
+
+@app.route("/api/history/match", methods=["POST"])
+def api_history_match():
+    data = request.json or {}
+    folder = data.get("folder", "").strip()
+    try:
+        tolerance = max(1, int(data.get("tolerance_minutes", 60)))
+    except (TypeError, ValueError):
+        tolerance = 60
+    if not folder:
+        return jsonify({"error": "folder required"}), 400
+    with _hist_match_lock:
+        if _hist_match_state["running"]:
+            return jsonify({"error": "A match run is already in progress"}), 409
+        _hist_match_state.update(running=True, phase="starting", current=0, total=0,
+                                  message="Starting…", error=None, result=None)
+    threading.Thread(target=_run_history_match, args=(folder, tolerance), daemon=True).start()
+    return jsonify({"started": True})
+
+@app.route("/api/history/match_progress")
+def api_history_match_progress():
+    with _hist_match_lock:
+        return jsonify(dict(_hist_match_state))
 
 # ── AI infer ──────────────────────────────────────────────────────
 @app.route("/api/ai_infer", methods=["POST"])

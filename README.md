@@ -56,6 +56,7 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Reads EXIF**: date taken, GPS coordinates, existing location tags
 - **Reverse geocodes** GPS coordinates to human-readable city/country names (OpenStreetMap, free, no API key)
 - **Infers locations** for un-GPS-tagged photos based on nearby timestamped photos (±4 hour window)
+- **Location history import**: match un-GPS-tagged photos against an imported Google Takeout `Records.json` or GPX track by timestamp — offline, no API key, and more reliable than inferring from other photos since it's where *you* actually were (see below)
 - **AI suggestions** via Claude API for photos that can't be auto-inferred (optional)
 - **Writes metadata back** directly into JPEG EXIF, or XMP sidecar files for RAW formats
 - **Batch operations**: geocode all, tag a selection, save all at once
@@ -151,6 +152,41 @@ the suggestions you're about to write.
 
 ---
 
+## Location history import
+
+If you have an exported location history — a Google Takeout `Records.json`,
+or a GPX track from a phone/GPS device — PhotoTagger can use it to fill in
+photos that have no embedded GPS, by matching each photo's timestamp against
+the nearest recorded point. This is ground truth about where *you* were, so
+it's generally more trustworthy than guessing from nearby photos, and it's
+entirely offline (no Nominatim, no API key).
+
+Click **🛰️ History** in the header to:
+
+1. **Import** a `Records.json` or `.gpx` file, either by server-side path
+   (recommended for large exports — Takeout files can be 1GB+ with millions
+   of points, and this avoids uploading that over the network) or by
+   uploading it directly. Import runs as a background job and streams the
+   file rather than loading it all into memory.
+2. **Match** the current library against everything imported so far, with an
+   adjustable time tolerance (default 60 minutes). Only photos with no GPS
+   and no location name yet are considered — it never overwrites an existing
+   GPS tag or a confirmed name, and it can supersede a weaker "inferred from
+   sibling photos" guess.
+3. Matched photos show up with a **History** badge and, in the detail panel,
+   the time gap to the point that matched (e.g. "3 min from a recorded
+   location point"). Coordinates are pre-filled — click **🌍 Geocode** to
+   turn them into a name, then **Save** like any other photo. Nothing is
+   written to a file by the match itself; it only produces a suggestion that
+   goes through the same dry-run review as everything else.
+
+A bad import can be removed from the History panel — this also clears any
+suggestions it produced. Note: matching compares timestamps directly, so it
+assumes your camera clock and the imported history are in the same
+timezone (UTC is the safe case); there's no per-import offset setting.
+
+---
+
 ## How metadata is written
 
 | Format | Method |
@@ -179,6 +215,16 @@ the suggestions you're about to write.
 ## Changelog
 
 ### Unreleased
+
+**Added: location history import.** Import a Google Takeout `Records.json`
+or GPX track and match un-GPS-tagged photos against it by timestamp
+(configurable tolerance, default 60 min). Streamed/batched throughout so a
+1GB+, multi-million-point export doesn't need to fit in memory at once —
+import and matching both run as background jobs with progress, matches are
+persisted (not just held in memory), and a bad import can be removed
+cleanly. Produces suggestions only, through the existing dry-run review
+flow — see the new "Location history import" section above. Adds a new
+`ijson` dependency for streaming JSON parsing.
 
 **Fixed: `PUID`/`PGID` had no effect.**
 The Dockerfile ran the process as a fixed `appuser` (uid 1000) before
