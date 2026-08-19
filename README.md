@@ -95,6 +95,7 @@ docker run -d \
   --restart unless-stopped \
   -p 5000:5000 \
   -v /mnt/user/Photos:/photos:rw \
+  -v /mnt/user/appdata/phototagger:/app/data \
   -e PUID=99 \
   -e PGID=100 \
   -e ANTHROPIC_API_KEY=sk-ant-YOUR_KEY_HERE \
@@ -102,6 +103,12 @@ docker run -d \
 ```
 
 Replace `/mnt/user/Photos` with the path to your Unraid photos share.
+
+> ⚠️ The `/app/data` mount is not optional. It's where the database lives —
+> sessions, scan cache, pending dry-run changes. Skip it and that data
+> lives only in the container's disposable layer, silently gone the next
+> time the container is recreated (an update, a rebuild, anything short of
+> `docker start` on the exact same container).
 
 ### 3. Open the UI
 
@@ -223,6 +230,23 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Fixed: database didn't survive a container rebuild on Unraid.** Neither
+the Community Applications template nor the README's manual Unraid
+`docker run` command mounted `/app/data` to a persistent path — only the
+photos share was mounted. That meant the SQLite database (sessions, scan
+cache, pending dry-run changes) lived in the container's disposable
+writable layer and was silently wiped on every recreate (Force Update, a
+rebuild, anything short of starting the *exact same* container). The
+`docker-compose.yml` path was never affected — it already mounted
+`/app/data` correctly. Fixed in both the XML template (new `/app/data` →
+`/mnt/user/appdata/phototagger` volume) and the README's manual command.
+**If you deployed before this fix**, copy your current database out
+before redeploying with the new volume, or it's lost like everything
+else that was in the old layer:
+`docker cp phototagger:/app/data/phototagger.db /mnt/user/appdata/phototagger/`
+(create that host folder first) — then update the container definition
+and recreate it.
 
 **Added: drag-to-select in the grid.** Click and drag to select every
 card the rectangle touches (Ctrl/Cmd-drag extends the existing selection

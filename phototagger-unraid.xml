@@ -42,6 +42,15 @@
       <ContainerDir>/photos</ContainerDir>
       <Mode>rw</Mode>
     </Volume>
+    <!-- Without this, the SQLite database (sessions, scan cache, pending
+         changes) lives only in the container's disposable writable layer
+         and is wiped every time the container is recreated (a Force
+         Update, or any rebuild) — not just on an explicit "remove". -->
+    <Volume>
+      <HostDir>/mnt/user/appdata/phototagger</HostDir>
+      <ContainerDir>/app/data</ContainerDir>
+      <Mode>rw</Mode>
+    </Volume>
   </Data>
 
   <!-- ── Environment variables ──────────────────────────────────── -->
@@ -100,6 +109,16 @@
           Display="always"
           Required="true"
           Mask="false">/mnt/user/Photos</Config>
+
+  <Config Name="App Data"
+          Target="/app/data"
+          Default="/mnt/user/appdata/phototagger"
+          Mode="rw"
+          Description="Where PhotoTagger's database lives (sessions, scan cache, pending changes). Must be a persistent path — do not remove this or point it at a temporary location, or that data is lost on every container update."
+          Type="Path"
+          Display="always"
+          Required="true"
+          Mask="false">/mnt/user/appdata/phototagger</Config>
 
   <Config Name="PUID"
           Target="PUID"
