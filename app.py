@@ -32,14 +32,25 @@ _last_geocode = 0.0
 _ai_usage     = {"date": None, "count": 0}
 _ai_lock      = threading.Lock()
 
-# PUID/PGID for Unraid
+# PUID/PGID for Unraid.
+# The container now starts as root (see Dockerfile) specifically so this can
+# work: we create/own the data dir as root, then drop to the requested
+# uid/gid before Flask ever touches a file. /photos is a host bind mount —
+# its ownership is the host's responsibility, so it's deliberately not
+# chowned here (that could take a long time and rewrite a whole library).
 _puid = int(os.environ.get("PUID", 0))
 _pgid = int(os.environ.get("PGID", 0))
-if _puid and _pgid:
+if _puid and _pgid and hasattr(os, "geteuid") and os.geteuid() == 0:
     try:
-        os.setgid(_pgid); os.setuid(_puid)
-    except (OSError, AttributeError):
-        pass
+        data_dir = Path(os.environ.get("DB_PATH", "/app/data/phototagger.db")).parent
+        data_dir.mkdir(parents=True, exist_ok=True)
+        os.chown(data_dir, _puid, _pgid)
+        os.setgid(_pgid)
+        os.setuid(_puid)
+        print(f"[startup] Dropped privileges to uid={_puid} gid={_pgid}", flush=True)
+    except (OSError, AttributeError) as e:
+        print(f"[startup] WARNING: could not drop privileges to "
+              f"{_puid}:{_pgid}: {e} — continuing as current user", flush=True)
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 

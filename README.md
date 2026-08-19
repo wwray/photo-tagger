@@ -20,7 +20,35 @@ docker run -d \
   phototagger:latest
 ```
 
+PowerShell equivalent for the `docker run` line:
+
+```powershell
+docker run -d `
+  --name phototagger `
+  --restart unless-stopped `
+  -p 5000:5000 `
+  -v C:\path\to\your\photos:/photos:rw `
+  -v ${PWD}/data:/app/data `
+  --env-file .env `
+  phototagger:latest
+```
+
 Open `http://localhost:5000` (or your server IP).
+
+A prebuilt image is also published to GHCR on every push to `master` — see
+[`.github/workflows/docker-publish.yml`](.github/workflows/docker-publish.yml) —
+so you can skip the `docker build` step and pull instead:
+
+```bash
+docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
+```
+
+> ⚠️ **This app has no authentication and no path restriction on the
+> filesystem browser/scanner.** Anyone who can reach port 5000 can browse and
+> read directories anywhere the container's user can see, not just your
+> photo share. It's meant to run on a trusted LAN — don't expose it directly
+> to the internet without putting it behind a reverse proxy with auth (or a
+> VPN).
 
 ## Features
 
@@ -31,6 +59,9 @@ Open `http://localhost:5000` (or your server IP).
 - **AI suggestions** via Claude API for photos that can't be auto-inferred (optional)
 - **Writes metadata back** directly into JPEG EXIF, or XMP sidecar files for RAW formats
 - **Batch operations**: geocode all, tag a selection, save all at once
+- **Dry run by default**: every write is staged as a pending change and reviewed before anything touches disk (see below)
+- **Sessions**: save named scan roots so you can jump back into a library without re-typing the path
+- **Duplicate detection**: exact-byte, filename-pattern, and perceptual (pHash + dHash) matches, run as a background job with progress
 
 ---
 
@@ -97,6 +128,26 @@ ANTHROPIC_API_KEY=sk-ant-... docker compose up -d
 | `PGID` | `100` | Group ID for file writes (100 = Unraid users) |
 | `ANTHROPIC_API_KEY` | *(empty)* | Enables AI location suggestions (optional) |
 | `PHOTO_ROOT` | `/photos` | Container path pre-filled in the scan box |
+| `AI_DAILY_LIMIT` | `50` | Max AI suggestion calls per day (cost control) |
+| `AI_MODEL` | `claude-haiku-4-5-20251001` | Anthropic model used for AI suggestions |
+
+---
+
+## Dry run mode (default ON)
+
+PhotoTagger never writes to a file unless you explicitly turn dry run off.
+This flag is **server-side**, not client-side — the browser can only ever make
+a request *more* conservative, never less, and every fresh page load re-arms
+it to ON. Concretely:
+
+1. With dry run on, saves are recorded as **pending changes** in the database
+   instead of touching any file.
+2. Review them (per-photo or in bulk) before anything happens on disk.
+3. **Commit** writes the reviewed changes to the actual files/sidecars, or
+   **discard** drops them with no effect.
+
+Turning dry run off is a deliberate, logged action — do it once you trust
+the suggestions you're about to write.
 
 ---
 
@@ -115,10 +166,30 @@ ANTHROPIC_API_KEY=sk-ant-... docker compose up -d
 - AI suggestions are optional — the app works fully without an API key, just without that one button.
 - Thumbnails are generated on-the-fly; first grid load on a large library may take a moment.
 - **Always keep backups before writing metadata in bulk.**
+- Back up `data/phototagger.db` too — it holds your sessions, hash cache, and any pending (not-yet-committed) changes. Losing it doesn't touch your photos, but you'd lose that state and have to rescan.
+
+---
+
+## License
+
+[MIT](LICENSE)
 
 ---
 
 ## Changelog
+
+### Unreleased
+
+**Fixed: `PUID`/`PGID` had no effect.**
+The Dockerfile ran the process as a fixed `appuser` (uid 1000) before
+`CMD`, so app.py's `os.setuid()` call — meant to drop root down to the
+requested `PUID`/`PGID` — was unreachable: a non-root process can't
+`setuid` to an arbitrary other user, and the failure was swallowed by a
+bare `except`. Files ended up owned by uid 1000 regardless of what
+`PUID`/`PGID` were set to. The container now starts as root so the
+existing privilege-drop code actually runs, the data directory is chowned
+to the target uid/gid before the drop, and a failed drop now logs a
+warning instead of failing silently.
 
 ### v1.1 — P0 stability pass
 
