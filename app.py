@@ -44,7 +44,26 @@ if _puid and _pgid and hasattr(os, "geteuid") and os.geteuid() == 0:
     try:
         data_dir = Path(os.environ.get("DB_PATH", "/app/data/phototagger.db")).parent
         data_dir.mkdir(parents=True, exist_ok=True)
+
+        before = data_dir.stat()
+        print(f"[startup] {data_dir} currently owned by uid={before.st_uid} "
+              f"gid={before.st_gid} — target is uid={_puid} gid={_pgid}", flush=True)
+
+        # Re-own the directory AND anything already in it (e.g. a db file
+        # left over from a previous PUID/PGID, or from before this uid/gid
+        # drop existed at all) — chowning just the directory entry leaves
+        # existing files owned by whoever created them, and the dropped-
+        # privilege process then can't write to them ("attempt to write a
+        # readonly database" from sqlite is the classic symptom of that).
         os.chown(data_dir, _puid, _pgid)
+        children = list(data_dir.rglob("*"))
+        for child in children:
+            os.chown(child, _puid, _pgid)
+
+        after = data_dir.stat()
+        print(f"[startup] {data_dir} and {len(children)} existing file(s) now "
+              f"owned by uid={after.st_uid} gid={after.st_gid}", flush=True)
+
         os.setgid(_pgid)
         os.setuid(_puid)
         print(f"[startup] Dropped privileges to uid={_puid} gid={_pgid}", flush=True)
