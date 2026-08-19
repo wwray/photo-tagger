@@ -231,6 +231,30 @@ honor anyway.
 
 ### Unreleased
 
+**Fixed: "database is locked" errors while a scan was running** (e.g.
+using a saved session, or anything else that writes to the database).
+No connection anywhere ever set `PRAGMA busy_timeout` — SQLite's default
+is 0, so any write that found the database locked failed immediately
+instead of waiting. It was easy to hit in practice because a scan's
+connection holds SQLite's single writer lock for its *entire* commit
+batch (Python's `sqlite3` module opens an implicit transaction on the
+first write and doesn't release the lock until `.commit()`), which is
+several seconds of EXIF/hash-reading time for every 50 photos. All
+connections now go through one shared helper that sets a 30-second
+`busy_timeout`, so a concurrent write waits briefly instead of failing.
+Reproduced the original error and confirmed the fix with a real
+two-thread lock-contention test, not just by reasoning about it.
+
+**Fixed: photos already tagged only with a camera's firmware-default
+description (e.g. "OLYMPUS DIGITAL CAMERA") showed up as Named/Tagged.**
+That text was never a caption anyone entered; treating it as one made
+those photos look already-confirmed and blocked Propagate-to-folder and
+similar "don't overwrite confirmed data" logic. New scans now recognize
+the `"<anything> DIGITAL CAMERA"` pattern and treat it as empty; a full
+**Scan** (not **↻ Rescan**, which skips unchanged files) also self-heals
+photos already mis-tagged this way from before the fix, without
+disturbing genuinely-named photos.
+
 **Fixed: database didn't survive a container rebuild on Unraid.** Neither
 the Community Applications template nor the README's manual Unraid
 `docker run` command mounted `/app/data` to a persistent path — only the

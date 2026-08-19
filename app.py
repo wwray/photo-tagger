@@ -124,12 +124,55 @@ if _puid and _pgid and hasattr(os, "geteuid") and os.geteuid() == 0:
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
+# Some cameras write a firmware default into ImageDescription instead of
+# leaving it empty — "OLYMPUS DIGITAL CAMERA" is the classic, widely
+# documented case, and other manufacturers have their own "<BRAND> DIGITAL
+# CAMERA"-shaped defaults. None of these are a caption or location a
+# person entered; treating them as one made photos look "already tagged"
+# (status='named') when nothing meaningful was actually saved on them —
+# which then blocked Propagate-to-folder and other "don't overwrite
+# confirmed data" logic from touching them at all. Defined up here (rather
+# than near read_exif, where it's used) so it exists before _connect_db —
+# which registers it as a SQL function for db_upsert_photo's self-healing
+# CASE clause — is ever called, including by init_db() at import time.
+_JUNK_DESCRIPTION_RE = re.compile(r"^[a-z0-9 ]+ digital camera$", re.IGNORECASE)
+
+def _is_junk_description(text):
+    if not text:
+        return True
+    t = text.strip()
+    if not t:
+        return True
+    return bool(_JUNK_DESCRIPTION_RE.match(t))
+
+def _connect_db():
+    """
+    Every connection — request-scoped or a background thread's own — goes
+    through here so WAL mode, busy_timeout, and the custom SQL function
+    db_upsert_photo relies on are all set up consistently, instead of each
+    call site remembering to repeat them (and one inevitably forgetting).
+
+    The busy_timeout matters more than it looks: a background scan holds
+    SQLite's single writer lock for its entire commit batch (Python's
+    sqlite3 module opens an implicit transaction on the first write and
+    doesn't release the lock until .commit()), which can be several
+    seconds of EXIF/hash-reading time for 50 photos. Without an explicit
+    busy_timeout, SQLite's default is 0 — any other connection that tries
+    to write during that window fails immediately with "database is
+    locked" instead of just waiting a moment, which is exactly what turned
+    "use a saved session while a scan is running" into a 500.
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
+    conn.create_function("is_junk_desc", 1, _is_junk_description)
+    return conn
+
 def _get_db():
     if "db" not in g:
         Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA journal_mode=WAL")
+        g.db = _connect_db()
         g.db.execute("PRAGMA foreign_keys=ON")
     return g.db
 
@@ -145,15 +188,11 @@ def _db():
             return _get_db()
         except RuntimeError:
             pass
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+    return _connect_db()
 
 def init_db():
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    conn = _connect_db()
     conn.executescript("""
         CREATE TABLE IF NOT EXISTS photos (
             id              TEXT PRIMARY KEY,   -- relative path from scan root
@@ -329,7 +368,7 @@ def rows_to_dicts(rows):
 # this flag, it defaults to ON, and it is forced back ON on every page load.
 
 def get_setting(key, default=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect_db()
     try:
         row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         return row[0] if row else default
@@ -337,7 +376,7 @@ def get_setting(key, default=None):
         conn.close()
 
 def set_setting(key, value):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect_db()
     try:
         conn.execute("""INSERT INTO settings (key,value,updated_at)
                         VALUES (?,?,datetime('now'))
@@ -401,24 +440,6 @@ def _dms_to_decimal(dms, ref):
         return -dec if ref in ("S","W") else dec
     except Exception:
         return None
-
-# Some cameras write a firmware default into ImageDescription instead of
-# leaving it empty — "OLYMPUS DIGITAL CAMERA" is the classic, widely
-# documented case, and other manufacturers have their own "<BRAND> DIGITAL
-# CAMERA"-shaped defaults. None of these are a caption or location a
-# person entered; treating them as one made photos look "already tagged"
-# (status='named') when nothing meaningful was actually saved on them —
-# which then blocked Propagate-to-folder and other "don't overwrite
-# confirmed data" logic from touching them at all.
-_JUNK_DESCRIPTION_RE = re.compile(r"^[a-z0-9 ]+ digital camera$", re.IGNORECASE)
-
-def _is_junk_description(text):
-    if not text:
-        return True
-    t = text.strip()
-    if not t:
-        return True
-    return bool(_JUNK_DESCRIPTION_RE.match(t))
 
 def read_exif(filepath):
     result = {"date_taken":None,"lat":None,"lon":None,
@@ -610,8 +631,7 @@ def _run_scan(folder, rescan=False):
 
         # ── Diff against DB (rescan) ───────────────────────────────
         if rescan:
-            conn = sqlite3.connect(DB_PATH)
-            conn.row_factory = sqlite3.Row
+            conn = _connect_db()
             existing = {r["id"]: r["file_mtime"]
                         for r in conn.execute(
                             "SELECT id,file_mtime FROM photos WHERE scan_root=?",
@@ -630,9 +650,7 @@ def _run_scan(folder, rescan=False):
                                message=f"Found {total} photos — reading EXIF…")
 
         # ── EXIF + hashes ──────────────────────────────────────────
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        conn.create_function("is_junk_desc", 1, _is_junk_description)
+        conn = _connect_db()
         photos_batch = []
 
         for i, p in enumerate(all_paths):
@@ -1102,7 +1120,7 @@ def _run_dup_scan(folder):
             _dup_state.update(phase="loading", message="Loading hashes from database…",
                               current=0, total=0)
 
-        conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+        conn = _connect_db()
         rows = rows_to_dicts(conn.execute(
             "SELECT id,path,filename,folder,size_kb,date_taken,phash,dhash,file_hash,"
             "status,location_name FROM photos WHERE scan_root=?", (folder,)).fetchall())
@@ -1364,7 +1382,7 @@ _hist_import_lock  = threading.Lock()
 _HIST_BATCH_SIZE   = 5000
 
 def _run_history_import(import_id, filepath, ext, cleanup_path=None):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect_db()
     count = 0
     batch = []
     try:
@@ -1411,7 +1429,7 @@ _hist_match_state = {"running": False, "phase": "", "current": 0, "total": 0,
 _hist_match_lock  = threading.Lock()
 
 def _run_history_match(folder, tolerance_minutes):
-    conn = sqlite3.connect(DB_PATH); conn.row_factory = sqlite3.Row
+    conn = _connect_db()
     try:
         with _hist_match_lock:
             _hist_match_state.update(phase="loading", message="Loading location history…",
