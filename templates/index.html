@@ -146,7 +146,12 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .photo-card:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 6px 20px rgba(0,0,0,.4)}
 .photo-card.selected{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
 .photo-card.duplicate-flag{border-color:var(--purple)}
-.photo-thumb{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface2)}
+body.marquee-dragging{user-select:none}
+body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
+.marquee-box{position:fixed;border:1px solid var(--accent);background:rgba(79,142,247,.15);
+  pointer-events:none;z-index:500}
+.photo-thumb{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface2);
+  -webkit-user-drag:none;user-drag:none}
 .photo-thumb-placeholder{width:100%;aspect-ratio:4/3;background:var(--surface2);
   display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:24px}
 .photo-info{padding:8px 10px}
@@ -162,9 +167,15 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .badge-unknown{background:var(--red-dim);color:var(--red)}
 .badge-dup{background:var(--purple-dim);color:var(--purple)}
 .badge-history{background:var(--teal-dim);color:var(--teal)}
-.select-checkbox{position:absolute;top:7px;left:7px;width:18px;height:18px;
+/* The visible checkbox stays small and tidy, but its actual click target
+   is a much bigger invisible corner (select-hit) — an 18px box was easy
+   to miss, and missing it opened the photo instead of selecting it. */
+.select-hit{position:absolute;top:0;left:0;width:44px;height:44px;z-index:2;
+  display:flex;align-items:flex-start;justify-content:flex-start;padding:7px;cursor:pointer}
+.select-checkbox{width:19px;height:19px;flex-shrink:0;
   background:rgba(15,17,23,.7);border:2px solid var(--border);border-radius:4px;
   display:flex;align-items:center;justify-content:center;font-size:11px;transition:.1s}
+.select-hit:hover .select-checkbox{border-color:var(--accent)}
 .photo-card.selected .select-checkbox{background:var(--accent);border-color:var(--accent)}
 
 /* ── Pending bar ── */
@@ -280,6 +291,12 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   background:rgba(15,17,23,.75);border:2px solid rgba(255,255,255,.4);
   display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;color:#fff;z-index:1}
 .seed-item.checked .seed-checkbox{background:var(--accent);border-color:var(--accent)}
+.seed-tabs{display:flex;gap:6px;padding:12px 16px 0;flex-wrap:wrap}
+.seed-tab{padding:5px 12px;border-radius:14px;border:1px solid var(--border);background:var(--surface2);
+  color:var(--text-muted);font-size:12px;cursor:pointer;transition:border-color .1s,color .1s}
+.seed-tab:hover{border-color:var(--accent);color:var(--text)}
+.seed-tab.active{background:var(--accent-dim);border-color:var(--accent);color:var(--accent);font-weight:600}
+.seed-tab .count{opacity:.7;font-family:var(--mono);font-size:11px}
 
 /* ── Duplicates view ── */
 .dup-group{background:var(--surface);border:1px solid var(--purple);border-radius:var(--radius-lg);
@@ -546,17 +563,21 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 <!-- Batch location prompt -->
 <div class="detail-overlay" id="batchPrompt" style="display:none" onclick="closeBatchPrompt(event)">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
-              width:100%;max-width:400px;padding:22px" onclick="event.stopPropagation()">
+              width:100%;max-width:420px;padding:22px" onclick="event.stopPropagation()">
     <h3 style="margin-bottom:14px">Set location for selected</h3>
     <div class="field-group" style="margin-bottom:10px">
       <div class="field-label">Location Name</div>
       <input class="field-input" id="batchLocation" type="text" placeholder="e.g. Tokyo, Japan"/>
     </div>
-    <div class="gps-row" style="margin-bottom:14px">
+    <div class="gps-row" style="margin-bottom:6px">
       <div class="field-group"><div class="field-label">Latitude</div>
         <input class="field-input" id="batchLat" type="number" step="0.000001" placeholder="Optional"/></div>
       <div class="field-group"><div class="field-label">Longitude</div>
         <input class="field-input" id="batchLon" type="number" step="0.000001" placeholder="Optional"/></div>
+    </div>
+    <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:14px">
+      <button class="btn btn-ghost btn-sm" onclick="geocodeBatchPrompt()" id="batchGeocodeBtn">🌍 Geocode</button>
+      <button class="btn btn-ghost btn-sm" onclick="openMapPicker('batch')">🗺️ Map</button>
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-primary" onclick="applyBatchLocation()">Apply to <span id="batchCountPrompt">0</span></button>
@@ -594,10 +615,12 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
       <span class="map-hint" id="seedModalHint"></span>
       <button class="close-btn" onclick="closeSeedModal()">✕</button>
     </div>
+    <div id="seedFilterTabs" class="seed-tabs" style="display:none"></div>
+    <div style="padding:10px 16px 0;font-size:11px;color:var(--text-dim)">Photos already tagged with GPS or a name start unchecked — check one to deliberately overwrite it.</div>
     <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;max-height:min(72vh,720px);padding:16px"></div>
     <div class="map-footer" style="gap:8px">
-      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)">All</button>
-      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)">None</button>
+      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)" title="Checks only the photos in the current tab">Check shown</button>
+      <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)" title="Unchecks only the photos in the current tab">Uncheck shown</button>
       <div style="flex:1"></div>
       <button class="btn btn-ghost btn-sm" onclick="closeSeedModal()">Cancel</button>
       <button class="btn btn-primary btn-sm" id="seedApplyBtn" onclick="applySeedSelection()">Apply</button>
@@ -763,6 +786,7 @@ let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
 let _aiModel='';
 let detailRotationDeg=0;   // pending rotation for the open photo — applied on Save, like every other field
+let _lastGridClick=null;   // index of the last card clicked — anchor for shift-click range select
 // Explicit flag rather than inferring "first scan" from allPhotos.length===0
 // — a scan that legitimately finds zero photos would otherwise look
 // identical to "never scanned yet" and keep forcing the grid view open on
@@ -1074,10 +1098,10 @@ function renderGrid() {
     card.className='photo-card'+(selected.has(p.id)?' selected':'');
     card.dataset.id=p.id;
     card.innerHTML=`
-      <div class="select-checkbox" onclick="toggleSelect(event,'${p.id.replace(/'/g,"\\'")}')">
-        ${selected.has(p.id)?'✓':''}
+      <div class="select-hit" onclick="toggleSelect(event,'${p.id.replace(/'/g,"\\'")}')">
+        <div class="select-checkbox">${selected.has(p.id)?'✓':''}</div>
       </div>
-      <img class="photo-thumb" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220${p._thumbCacheBust?'&t='+p._thumbCacheBust:''}"
+      <img class="photo-thumb" draggable="false" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220${p._thumbCacheBust?'&t='+p._thumbCacheBust:''}"
            loading="lazy" onerror="this.outerHTML='<div class=\\'photo-thumb-placeholder\\'>📷</div>'"/>
       <div class="status-badge ${bc}">${bl}</div>
       <div class="photo-info">
@@ -1086,7 +1110,20 @@ function renderGrid() {
         <div class="photo-location">${loc}</div>
       </div>`;
     card.addEventListener('click', e=>{
-      if (e.target.classList.contains('select-checkbox')||e.target.closest('.select-checkbox')) return;
+      if (_suppressNextCardClick){ _suppressNextCardClick=false; return; }  // ghost click after a drag-select
+      if (e.target.closest('.select-hit')) return;   // handled by toggleSelect itself
+      // Ctrl/Cmd-click toggles this card; Shift-click selects the range
+      // since the last-clicked card — same conventions as a file manager,
+      // so selecting several photos doesn't depend on landing on the tiny
+      // checkbox at all.
+      if (e.metaKey||e.ctrlKey){ toggleSelect(e,p.id); _lastGridClick=i; return; }
+      if (e.shiftKey && _lastGridClick!=null){
+        const arr=sortedFiltered(); const [a,b]=[_lastGridClick,i].sort((x,y)=>x-y);
+        for(let j=a;j<=b;j++) selected.add(arr[j].id);
+        updateBatchBar(); renderGrid();
+        return;
+      }
+      _lastGridClick=i;
       openDetail(i);
     });
     grid.appendChild(card);
@@ -1171,6 +1208,75 @@ function updateBatchBar(){
   else bar.style.display='none';
 }
 
+// ── Drag-to-select ───────────────────────────────────────────────────
+// Click-and-drag across the grid to select every card the rectangle
+// touches — the checkbox and single/ctrl/shift-click above still work
+// unchanged; this only engages once the mouse has actually moved, so a
+// plain click is never mistaken for the start of a drag.
+const MARQUEE_THRESHOLD_PX=6;
+let _marqueeDownAt=null, _marqueeActive=false, _marqueeAdditive=false, _marqueeBase=null, _marqueeBox=null;
+let _suppressNextCardClick=false;
+
+function initGridMarquee(){
+  const grid=document.getElementById('photoGrid');
+  grid.addEventListener('mousedown', e=>{
+    if(e.button!==0) return;                       // left button only
+    if(e.target.closest('.select-hit')) return;     // the checkbox handles its own click
+    _marqueeDownAt={x:e.clientX,y:e.clientY};
+    _marqueeAdditive=e.ctrlKey||e.metaKey;           // hold Ctrl/Cmd to extend, not replace
+    _marqueeActive=false;
+  });
+}
+document.addEventListener('mousemove', e=>{
+  if(!_marqueeDownAt) return;
+  if(!_marqueeActive){
+    const dx=e.clientX-_marqueeDownAt.x, dy=e.clientY-_marqueeDownAt.y;
+    if(Math.abs(dx)<MARQUEE_THRESHOLD_PX && Math.abs(dy)<MARQUEE_THRESHOLD_PX) return;
+    // Movement crossed the threshold — this is a drag, not a click.
+    _marqueeActive=true;
+    _marqueeBase=_marqueeAdditive ? new Set(selected) : new Set();
+    if(!_marqueeAdditive) selected.clear();
+    _marqueeBox=document.createElement('div');
+    _marqueeBox.className='marquee-box';
+    document.body.appendChild(_marqueeBox);
+    document.body.classList.add('marquee-dragging');
+  }
+  updateMarqueeRect(_marqueeDownAt.x,_marqueeDownAt.y,e.clientX,e.clientY);
+});
+document.addEventListener('mouseup', ()=>{
+  if(_marqueeActive){
+    // The mouseup ending the drag can also fire a trailing click — but
+    // only if mousedown/mouseup landed on the same card; if the drag
+    // spanned multiple cards, the browser fires that click on their
+    // common ancestor instead, which no per-card listener ever sees, so
+    // nothing would consume this flag. Clear it on the next tick as a
+    // fallback so it can never leak into a later, unrelated click.
+    _suppressNextCardClick=true;
+    setTimeout(()=>{_suppressNextCardClick=false;},0);
+    if(_marqueeBox){ _marqueeBox.remove(); _marqueeBox=null; }
+    document.body.classList.remove('marquee-dragging');
+    updateBatchBar(); renderGrid();
+  }
+  _marqueeDownAt=null; _marqueeActive=false;
+});
+
+function updateMarqueeRect(x0,y0,x1,y1){
+  const left=Math.min(x0,x1), top=Math.min(y0,y1);
+  const width=Math.abs(x1-x0), height=Math.abs(y1-y0);
+  Object.assign(_marqueeBox.style,{left:left+'px',top:top+'px',width:width+'px',height:height+'px'});
+  const right=left+width, bottom=top+height;
+  document.querySelectorAll('#photoGrid .photo-card').forEach(card=>{
+    const r=card.getBoundingClientRect();
+    const intersects = r.left<right && r.right>left && r.top<bottom && r.bottom>top;
+    const id=card.dataset.id;
+    const shouldSelect = intersects || _marqueeBase.has(id);
+    if(shouldSelect) selected.add(id); else selected.delete(id);
+    card.classList.toggle('selected',shouldSelect);
+    const cb=card.querySelector('.select-checkbox');
+    if(cb) cb.textContent=shouldSelect?'✓':'';
+  });
+}
+
 // ── Detail ─────────────────────────────────────────────────────────
 function openDetail(idx) {
   const arr=sortedFiltered();
@@ -1238,17 +1344,28 @@ function rotateDetail(delta){
   document.getElementById('detailImg').style.transform=`rotate(${detailRotationDeg}deg)`;
 }
 
-async function reverseGeocode(){
-  const lat=parseFloat(document.getElementById('detailLat').value);
-  const lon=parseFloat(document.getElementById('detailLon').value);
-  if(isNaN(lat)||isNaN(lon)){toast('Enter lat/lon first','error');return;}
-  const btn=document.getElementById('geocodeBtn');
-  btn.disabled=true; btn.textContent='…';
+// Shared by the detail panel's Geocode button, the batch prompt's Geocode
+// button, and the map picker's Confirm (for whichever of the two it's
+// currently pointed at) — one lookup instead of three near-duplicates.
+async function geocodeCoordsInto(latId,lonId,locationId,btn){
+  const lat=parseFloat(document.getElementById(latId).value);
+  const lon=parseFloat(document.getElementById(lonId).value);
+  if(isNaN(lat)||isNaN(lon)){toast('Enter lat/lon first','error');return false;}
+  const label=btn?btn.textContent:null;
+  if(btn){btn.disabled=true;btn.textContent='…';}
   const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat,lon})});
   const d=await r.json();
-  if(d.location_name){document.getElementById('detailLocation').value=d.location_name;toast('📍 '+d.location_name,'success');}
+  let ok=false;
+  if(d.location_name){document.getElementById(locationId).value=d.location_name;toast('📍 '+d.location_name,'success');ok=true;}
   else toast('Could not geocode','error');
-  btn.disabled=false; btn.textContent='🌍 Geocode';
+  if(btn){btn.disabled=false;btn.textContent=label;}
+  return ok;
+}
+async function reverseGeocode(){
+  await geocodeCoordsInto('detailLat','detailLon','detailLocation',document.getElementById('geocodeBtn'));
+}
+async function geocodeBatchPrompt(){
+  await geocodeCoordsInto('batchLat','batchLon','batchLocation',document.getElementById('batchGeocodeBtn'));
 }
 
 async function aiInfer(){
@@ -1698,6 +1815,7 @@ async function pollHistoryMatchOnce(){
 
 // ── Map picker ─────────────────────────────────────────────────────
 let _map=null,_mapMarker=null,_mapPin=null,_satLayer=null,_streetLayer=null;
+let _mapTarget='detail';   // which field set the picker reads/writes: 'detail' | 'batch'
 
 function setMapLayer(t){
   if(!_map) return;
@@ -1714,7 +1832,8 @@ function setMapLayer(t){
   }
 }
 
-function openMapPicker(){
+function openMapPicker(target='detail'){
+  _mapTarget=target;
   document.getElementById('mapModal').style.display='flex';
   if(!_map){
     _map=L.map('mapContainer',{zoomControl:true}).setView([20,0],2);
@@ -1732,8 +1851,8 @@ function openMapPicker(){
       document.getElementById('mapConfirmBtn').disabled=false;
     });
   }
-  const lat=parseFloat(document.getElementById('detailLat').value);
-  const lon=parseFloat(document.getElementById('detailLon').value);
+  const lat=parseFloat(document.getElementById(target+'Lat').value);
+  const lon=parseFloat(document.getElementById(target+'Lon').value);
   if(!isNaN(lat)&&!isNaN(lon)){
     _map.setView([lat,lon],14);
     if(_mapMarker) _map.removeLayer(_mapMarker);
@@ -1752,15 +1871,11 @@ function closeMapModal(e){if(e&&e.target!==document.getElementById('mapModal'))r
 
 async function confirmMapPin(){
   if(!_mapPin) return;
-  document.getElementById('detailLat').value=_mapPin.lat;
-  document.getElementById('detailLon').value=_mapPin.lon;
+  document.getElementById(_mapTarget+'Lat').value=_mapPin.lat;
+  document.getElementById(_mapTarget+'Lon').value=_mapPin.lon;
   document.getElementById('mapModal').style.display='none';
-  const btn=document.getElementById('geocodeBtn'); btn.disabled=true; btn.textContent='…';
-  const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:_mapPin.lat,lon:_mapPin.lon})});
-  const d=await r.json();
-  if(d.location_name){document.getElementById('detailLocation').value=d.location_name;toast('📍 '+d.location_name,'success');}
-  btn.disabled=false; btn.textContent='🌍 Geocode';
-  onCoordsChanged();
+  await geocodeCoordsInto(_mapTarget+'Lat',_mapTarget+'Lon',_mapTarget+'Location',null);
+  if(_mapTarget==='detail') onCoordsChanged();
 }
 
 // ── Folder seed ────────────────────────────────────────────────────
@@ -1778,6 +1893,10 @@ function onCoordsChanged(){
 }
 
 let _seedTargets=[],_seedLat=null,_seedLon=null,_seedLocation='';
+let _seedUnchecked=new Set();   // ids explicitly unchecked — default is "everything checked"
+let _seedFilter='all';          // status tab currently shown ('all' | 'unknown' | 'inferred' | 'history' | ...)
+
+const SEED_STATUS_LABELS={unknown:'Untagged',inferred:'Inferred',history:'History',named:'Named',gps:'GPS'};
 
 function seedFolder(){
   const lat=parseFloat(document.getElementById('detailLat').value);
@@ -1786,41 +1905,89 @@ function seedFolder(){
   const p=currentPhoto();
   if(!p||isNaN(lat)||isNaN(lon)) return;
   _seedLat=lat; _seedLon=lon; _seedLocation=loc;
-  _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id&&!x.has_gps&&x.status!=='named')
+  // Every other photo in the folder is a candidate now, not just untagged
+  // ones — a photo that already has GPS or a name is still listed (with
+  // its current status visible), just unchecked by default. Overwriting
+  // it is now a deliberate opt-in instead of something you can't do at
+  // all, or something that could happen by silent accident.
+  _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id)
     .sort((a,b)=>(a.date_taken||'').localeCompare(b.date_taken||''));
-  if(!_seedTargets.length){toast('No untagged photos in folder','error');return;}
+  if(!_seedTargets.length){toast('No other photos in this folder','error');return;}
+  _seedUnchecked=new Set(_seedTargets.filter(t=>t.has_gps||t.status==='named').map(t=>t.id));
+  _seedFilter='all';
   document.getElementById('seedModalHint').textContent=
-    `${_seedTargets.length} untagged in "${p.folder||'(root)'}" → "${loc}"`;
-  const list=document.getElementById('seedChecklist'); list.innerHTML='';
-  _seedTargets.forEach((t,i)=>{
-    const dt=t.date_taken?new Date(t.date_taken).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'No date';
-    const item=document.createElement('div'); item.className='seed-item checked'; item.dataset.idx=i;
-    item.innerHTML=`<div class="seed-checkbox">✓</div>
-      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
-      <div class="seed-item-info"><div class="seed-item-name">${t.filename}</div><div class="seed-item-date">${dt}</div></div>`;
-    item.onclick=()=>{item.classList.toggle('checked');item.querySelector('.seed-checkbox').textContent=item.classList.contains('checked')?'✓':'';updateSeedBtn();};
-    list.appendChild(item);
-  });
-  updateSeedBtn();
+    `${_seedTargets.length} photos in "${p.folder||'(root)'}" → "${loc}"`;
+  renderSeedTabs();
+  renderSeedGrid();
   document.getElementById('seedModal').style.display='flex';
 }
 
+function renderSeedTabs(){
+  const counts={};
+  _seedTargets.forEach(t=>counts[t.status]=(counts[t.status]||0)+1);
+  const tabs=[['all',`All`,_seedTargets.length]]
+    .concat(Object.keys(counts).sort().map(s=>[s, SEED_STATUS_LABELS[s]||s, counts[s]]));
+  const bar=document.getElementById('seedFilterTabs');
+  // Only one real category (plus "All") — a filter row with nothing to
+  // filter is just noise, so don't show it.
+  bar.style.display = tabs.length>2 ? 'flex' : 'none';
+  bar.innerHTML=tabs.map(([key,label,count])=>
+    `<button class="seed-tab${_seedFilter===key?' active':''}" onclick="setSeedFilter('${key}')">${label} <span class="count">${count}</span></button>`
+  ).join('');
+}
+
+function setSeedFilter(f){ _seedFilter=f; renderSeedTabs(); renderSeedGrid(); }
+
+function seedVisibleTargets(){
+  return _seedFilter==='all' ? _seedTargets : _seedTargets.filter(t=>t.status===_seedFilter);
+}
+
+function renderSeedGrid(){
+  const visible=seedVisibleTargets();
+  const list=document.getElementById('seedChecklist'); list.innerHTML='';
+  if(!visible.length){
+    list.innerHTML='<div style="color:var(--text-dim);padding:20px;grid-column:1/-1">No photos in this category.</div>';
+  }
+  const badgeClass={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',history:'badge-history',unknown:'badge-unknown'};
+  const badgeLabel={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'};
+  visible.forEach(t=>{
+    const dt=t.date_taken?new Date(t.date_taken).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'No date';
+    const checked=!_seedUnchecked.has(t.id);
+    const alreadyTagged=t.has_gps||t.status==='named';
+    const item=document.createElement('div'); item.className='seed-item'+(checked?' checked':''); item.dataset.id=t.id;
+    item.innerHTML=`<div class="seed-checkbox">${checked?'✓':''}</div>
+      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
+      <div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>
+      <div class="seed-item-info"><div class="seed-item-name">${t.filename}</div>
+        <div class="seed-item-date">${dt}${alreadyTagged?' · <span style="color:var(--gold)">will overwrite</span>':''}</div></div>`;
+    item.onclick=()=>{
+      if(_seedUnchecked.has(t.id)) _seedUnchecked.delete(t.id); else _seedUnchecked.add(t.id);
+      const nowChecked=!_seedUnchecked.has(t.id);
+      item.classList.toggle('checked',nowChecked);
+      item.querySelector('.seed-checkbox').textContent=nowChecked?'✓':'';
+      updateSeedBtn();
+    };
+    list.appendChild(item);
+  });
+  updateSeedBtn();
+}
+
 function updateSeedBtn(){
-  const n=document.querySelectorAll('#seedChecklist .seed-item.checked').length;
+  const n=_seedTargets.filter(t=>!_seedUnchecked.has(t.id)).length;
   const btn=document.getElementById('seedApplyBtn');
   btn.textContent=n>0?`Apply to ${n} photo${n!==1?'s':''}`:'Select photos';
   btn.disabled=n===0;
 }
 function seedCheckAll(v){
-  document.querySelectorAll('#seedChecklist .seed-item').forEach(el=>{
-    el.classList.toggle('checked',v); el.querySelector('.seed-checkbox').textContent=v?'✓':'';});
-  updateSeedBtn();
+  // Acts on whatever tab is currently visible, not the whole set — "None"
+  // on the Inferred tab shouldn't silently uncheck photos on other tabs.
+  seedVisibleTargets().forEach(t=>{ if(v) _seedUnchecked.delete(t.id); else _seedUnchecked.add(t.id); });
+  renderSeedGrid();
 }
 function closeSeedModal(e){if(e&&e.target!==document.getElementById('seedModal'))return;document.getElementById('seedModal').style.display='none';}
 
 async function applySeedSelection(){
-  const checked=[...document.querySelectorAll('#seedChecklist .seed-item.checked')];
-  const targets=checked.map(el=>_seedTargets[parseInt(el.dataset.idx)]);
+  const targets=_seedTargets.filter(t=>!_seedUnchecked.has(t.id));
   if(!targets.length) return;
   const btn=document.getElementById('seedApplyBtn'); btn.disabled=true;
   let applied=0;
@@ -1893,6 +2060,8 @@ document.addEventListener('keydown',e=>{
   }
   if(e.key==='Enter'&&document.activeElement.id==='folderInput') startScan();
 });
+
+initGridMarquee();
 
 // ── Init ───────────────────────────────────────────────────────────
 (async()=>{

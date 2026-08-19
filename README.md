@@ -224,6 +224,36 @@ honor anyway.
 
 ### Unreleased
 
+**Added: drag-to-select in the grid.** Click and drag to select every
+card the rectangle touches (Ctrl/Cmd-drag extends the existing selection
+instead of replacing it). Along the way, fixed a real gotcha: dragging
+over an `<img>` triggers the browser's native image-drag after the first
+pixel of movement, which silently stops further `mousemove` events from
+firing at all — thumbnails now have `draggable="false"`.
+
+**Improved: "Propagate to folder" can now (deliberately) overwrite an
+already-tagged photo.** It used to just exclude any photo with GPS or a
+name, with no way to override — confusing if that's exactly what you
+meant to do. Those photos are now included with a status badge and
+"will overwrite" note, but start unchecked, so overwriting one is always
+an explicit choice, never an accident.
+
+**Added: status filter tabs in "Propagate to folder."** The checklist can
+mix untagged, inferred, and history-matched siblings; tabs (dynamically
+generated from what's actually in the list) let you narrow to one status
+at a time. Checked state is tracked per-photo, not per-tab, so switching
+tabs never silently drops a selection made elsewhere.
+
+**Added: map picker and Geocode to the batch "Set location for selected"
+prompt.** Previously it only took typed-in coordinates; it now has the
+same 🌍 Geocode and 🗺️ Map buttons as the single-photo detail view.
+
+**Improved: the grid's selection checkbox was hard to hit.** Its actual
+click target is now a 44×44px corner zone — the visible box stays small,
+but a near-miss no longer opens the photo instead of selecting it.
+Ctrl/Cmd-click and Shift-click (range-select) on a card now also toggle
+selection from anywhere on it, no precision required.
+
 **Added: rotate controls.** ⟲/⟳ buttons in the detail view, previewed live
 with a CSS transform before saving, applied via the same dry-run-gated
 `/api/save` path as every other field (JPEG only — see "How metadata is
