@@ -258,20 +258,26 @@ scan reported "failed" even though most of the work had, in fact,
 completed. Both spots now query the database directly instead of
 depending on the extracted function's leftover local state.
 
-**Fixed: "Propagate to folder" thumbnails render as thin squished strips
-for some users, even though the CSS looks correct and renders fine
-elsewhere (a real Chromium session reproduces the bug-free layout every
-time — this was hard to pin down).** The image box now uses the classic
-padding-top percentage hack for its aspect ratio instead of the modern
-`aspect-ratio` CSS property `.photo-thumb` uses in the main grid. This
-modal's image sits in a deeper nested context than the main grid does
-(`.map-panel`'s column flex → the checklist's own scrolling flex item →
-its CSS grid) and that specific nesting is a known trouble spot for
-`aspect-ratio` support in some browsers/versions; the percentage-padding
-technique has no such caveats anywhere. Also added a hover-to-enlarge
-effect on each photo — the whole card scales up in place — since "which
-one of these nearly-identical sky photos is this" was the actual
-underlying ask.
+**Fixed (Firefox only): "Propagate to folder" squished every thumbnail
+into a ~19px sliver and never showed a scrollbar, once there were enough
+photos that the checklist actually needed to scroll.** Root cause,
+confirmed with an actual Firefox 153 session at real scale (a handful of
+test photos never triggered it, which is why it took this long to pin
+down): `#seedChecklist` is both the CSS grid holding the photo cards and
+a flex item of the modal's column layout, with `max-height` +
+`overflow-y:auto` capping it. Once the grid's natural content height
+exceeded that cap, Firefox's implicit `auto`-sized rows compressed
+uniformly to fit inside the container instead of sizing to content and
+letting the excess scroll — Chrome never does this. `grid-auto-rows` on
+`.seed-grid` is now the explicit `min-content` sizing function instead of
+the bare `auto` keyword, which asks for the same natural row size but
+doesn't take Firefox's "fit to container" path. (An earlier attempt in
+this same investigation replaced the image's `aspect-ratio` with the
+classic padding-top percentage-hack, on the theory that `aspect-ratio`
+was the weak link in this nesting — harmless, and kept, but it wasn't
+the actual bug.) Also added a hover-to-enlarge effect on each photo — the
+whole card scales up in place — since "which one of these nearly-identical
+sky photos is this" was the actual underlying ask.
 
 **Added: Google Photos-style ← / → arrows on the detail view image**,
 alongside (not instead of) the existing bottom Prev/Next buttons.

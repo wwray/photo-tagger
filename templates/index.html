@@ -336,7 +336,21 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    and that specific nesting is where `aspect-ratio` support has been
    flaky in the past. The percentage-padding technique has no such
    caveats on any browser, at the cost of being a bit more verbose. */
-.seed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
+.seed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));
+  /* Confirmed (not just suspected) via an actual Firefox 153 repro at real
+     scale: with enough photos that the grid's natural content height
+     exceeds max-height below, Firefox compresses every implicit row
+     equally to fit inside max-height instead of sizing rows to content
+     and letting overflow-y:auto below do its job — every row ends up
+     ~19px regardless of how many photos there are. Chrome never does
+     this. It only shows up once there's enough content to actually
+     need scrolling, which is exactly why a handful of test photos never
+     caught it. The bare `auto` keyword for implicit row sizing is what
+     triggers Firefox's "fit to container" path here; the explicit
+     `min-content` sizing function asks for the same natural size but
+     doesn't take that path in Firefox's implementation. */
+  grid-auto-rows:min-content;
+  gap:14px;flex-shrink:0}
 .seed-item{position:relative;border-radius:var(--radius-lg);border:2px solid var(--border);
   background:var(--surface2);cursor:pointer;user-select:none;overflow:hidden;
   transition:border-color .15s,opacity .15s,transform .15s,box-shadow .15s}
