@@ -235,6 +235,16 @@ honor anyway.
 
 ### Unreleased
 
+**Added: a version badge in the header (and the browser tab title) showing
+the exact commit currently running** — small muted text next to the
+PhotoTagger logo, e.g. `d437724`, also available at `/api/version`. Baked
+into the image at build time (`docker-publish.yml` passes `--build-arg
+GIT_SHA=<commit>` to the Docker build, which becomes an env var the app
+reads at startup — `"dev"` for a plain local build/run with no build-arg
+set). The whole point: "did my rebuild actually pick up the fix, or am I
+still looking at the old image" was previously unanswerable from the UI
+itself — you had to trust that Force Update did something.
+
 **Fixed: every scan crashed during the geocoding phase with `NameError:
 name 'all_db' is not defined`.** Introduced when `_infer_locations()` was
 pulled out of the scan pipeline into its own function (see below): the

@@ -90,6 +90,12 @@ DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
 AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
 AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5")
 DB_PATH            = os.environ.get("DB_PATH", "/app/data/phototagger.db")
+# Baked into the image at build time (docker-publish.yml passes --build-arg
+# GIT_SHA=<commit>, the Dockerfile turns that into this env var) so the
+# running app can show which build is actually live in its own UI — see
+# the version badge in the header. "dev" for a local `docker build`/`python
+# app.py` with no GIT_SHA set, so this never breaks outside CI.
+APP_VERSION        = os.environ.get("GIT_SHA", "dev")[:7]
 
 _geocode_lock = threading.Lock()
 _last_geocode = 0.0
@@ -1117,7 +1123,10 @@ def _run_scan(folder, rescan=False):
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index(): return render_template("index.html")
+def index(): return render_template("index.html", version=APP_VERSION)
+
+@app.route("/api/version")
+def api_version(): return jsonify({"version": APP_VERSION})
 
 @app.route("/api/config")
 def api_config():
