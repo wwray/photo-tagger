@@ -118,6 +118,20 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .session-root{font-size:10px;color:var(--text-dim);font-family:var(--mono);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
+/* ── Responsive ── */
+/* The only breakpoint anywhere used to be prefers-reduced-motion — a fixed
+   240px sidebar column meant a phone/tablet got a squeezed grid no matter
+   what. Below this width the sidebar becomes a capped-height strip above
+   the content instead of a side column, so both stay usable without a
+   full nav rework (the header's existing overflow-x:auto still handles
+   its own row of buttons at this width — scrollable, not wrapped). */
+@media (max-width: 720px){
+  .main{grid-template-columns:1fr;grid-template-rows:auto 1fr}
+  .sidebar{border-right:none;border-bottom:1px solid var(--border);max-height:180px}
+  .photo-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
+  .search-input{width:100%}
+}
+
 /* ── Content ── */
 .content{overflow-y:auto;padding:16px;position:relative}
 .empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;
@@ -138,6 +152,11 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .toolbar-spacer{flex:1}
 .sort-select{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
   border-radius:var(--radius);padding:5px 8px;font-size:12px;cursor:pointer;outline:none}
+.search-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);
+  border-radius:var(--radius);padding:5px 10px;font-size:12px;outline:none;width:200px;
+  transition:border-color .15s}
+.search-input:focus{border-color:var(--accent)}
+.search-input::placeholder{color:var(--text-dim)}
 
 /* ── Photo grid ── */
 .photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
@@ -244,9 +263,16 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .batch-bar strong{color:var(--text)}
 
 /* ── Toast ── */
-.toast{position:fixed;bottom:68px;right:20px;background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);padding:9px 14px;font-size:13px;color:var(--text);z-index:300;
-  opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none;max-width:280px}
+/* A single shared #toast element used to overwrite whatever was showing —
+   two async operations resolving close together (AI suggest finishing
+   while a geocode toast is still up) meant one message got silently
+   replaced before it was readable. Toasts now stack: each is its own
+   element appended to .toast-stack, with its own independent timer. */
+.toast-stack{position:fixed;bottom:68px;right:20px;z-index:300;
+  display:flex;flex-direction:column;gap:8px;max-width:280px;pointer-events:none}
+.toast{background:var(--surface);border:1px solid var(--border);
+  border-radius:var(--radius);padding:9px 14px;font-size:13px;color:var(--text);
+  opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.success{border-color:var(--green);color:var(--green)}
 .toast.error{border-color:var(--red);color:var(--red)}
@@ -455,6 +481,8 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   <div id="gridContainer" style="display:none">
     <div class="grid-toolbar">
       <h3 id="gridTitle"><strong>0</strong> photos</h3>
+      <input type="search" class="search-input" id="gridSearch" placeholder="🔍 Search filename or folder…"
+             oninput="setSearch(this.value)"/>
       <div class="toolbar-spacer"></div>
       <button class="btn btn-ghost btn-sm" onclick="selectAllVisible()">Select all</button>
       <button class="btn btn-ghost btn-sm" onclick="clearSelection()">Clear</button>
@@ -764,12 +792,21 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   </div>
 </div>
 
-<div class="toast" id="toast"></div>
+<div class="toast-stack" id="toastStack"></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
 <script>
 // ── State ──────────────────────────────────────────────────────────
 let allPhotos=[], filtered=[], selected=new Set();
 let currentFilter='all', currentSort='date', currentFolder=null, detailIndex=-1, detailId=null;
+
+// Filenames/folders come from the filesystem; location names and session
+// names are free text a user (or the AI) typed. All of it used to go
+// straight into innerHTML template literals unescaped — a name containing
+// <script> or similar would run for every viewer of the grid/sessions/
+// history list. Safe for both text content and inside a "-quoted attribute.
+function escapeHtml(str){
+  return String(str??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 // Resolve the photo currently open in the detail panel BY ID, not by position.
 // sortedFiltered() is recomputed on every call, so a stale positional index
@@ -883,8 +920,8 @@ async function openPendingModal() {
         </div>`).join('');
       item.innerHTML = `
         <div class="pending-item-header">
-          <span class="pending-filename">📷 ${p.filename}</span>
-          <span class="pending-folder">${p.folder||'root'}</span>
+          <span class="pending-filename">📷 ${escapeHtml(p.filename)}</span>
+          <span class="pending-folder">${escapeHtml(p.folder)||'root'}</span>
         </div>
         ${changes}`;
       list.appendChild(item);
@@ -907,7 +944,7 @@ async function commitPending() {
 }
 
 async function discardPending() {
-  if (!confirm('Discard all unsaved dry-run changes?')) return;
+  if (!await customConfirm('Discard all unsaved dry-run changes?',{danger:true})) return;
   document.getElementById('pendingModal').style.display='none';
   await fetch('/api/pending/discard', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
   toast('Pending changes discarded');
@@ -1052,9 +1089,16 @@ function setFilter(f) {
 // Recomputes `filtered` from currentFilter/currentFolder without touching
 // which view is on screen — safe to call from a background refresh (e.g.
 // after a rescan) whether or not the grid happens to be visible right now.
+let searchQuery='';
+function setSearch(v){ searchQuery=v; recomputeFiltered(); renderGrid(); }
+
 function recomputeFiltered() {
   filtered = currentFilter==='all' ? [...allPhotos] : allPhotos.filter(p=>p.status===currentFilter);
   if (currentFolder) filtered=filtered.filter(p=>p.folder===currentFolder);
+  if (searchQuery.trim()) {
+    const q=searchQuery.trim().toLowerCase();
+    filtered=filtered.filter(p=>p.filename.toLowerCase().includes(q)||p.folder.toLowerCase().includes(q));
+  }
 }
 function applyFilter(f) {
   currentFilter=f;
@@ -1091,8 +1135,9 @@ function renderGrid() {
     const card=document.createElement('div');
     const bc={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',history:'badge-history',unknown:'badge-unknown'}[p.status]||'badge-unknown';
     const bl={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'}[p.status];
+    const locName=escapeHtml(p.location_name);
     const loc = p.location_name
-      ? `<span style="color:var(--text)">${p.location_name}</span>`
+      ? `<span style="color:var(--text)">${locName}</span>`
       : p.status==='inferred'
         ? `<span style="color:var(--gold)">≈ inferred</span>`
         : p.status==='history'
@@ -1101,20 +1146,31 @@ function renderGrid() {
     const dt = p.date_taken
       ? new Date(p.date_taken).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'})
       : 'No date';
-    card.className='photo-card'+(selected.has(p.id)?' selected':'');
+    const isSel=selected.has(p.id);
+    const idAttr=p.id.replace(/'/g,"\\'");
+    const fileEsc=escapeHtml(p.filename);
+    card.className='photo-card'+(isSel?' selected':'');
     card.dataset.id=p.id;
     card.innerHTML=`
-      <div class="select-hit" onclick="toggleSelect(event,'${p.id.replace(/'/g,"\\'")}')">
-        <div class="select-checkbox">${selected.has(p.id)?'✓':''}</div>
+      <div class="select-hit" tabindex="0" role="checkbox" aria-checked="${isSel}" aria-label="Select ${fileEsc}"
+           onclick="toggleSelect(event,'${idAttr}')"
+           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSelect(event,'${idAttr}')}">
+        <div class="select-checkbox">${isSel?'✓':''}</div>
       </div>
       <img class="photo-thumb" draggable="false" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220${p._thumbCacheBust?'&t='+p._thumbCacheBust:''}"
            loading="lazy" onerror="this.outerHTML='<div class=\\'photo-thumb-placeholder\\'>📷</div>'"/>
       <div class="status-badge ${bc}">${bl}</div>
       <div class="photo-info">
-        <div class="photo-filename">${p.filename}</div>
+        <div class="photo-filename">${fileEsc}</div>
         <div class="photo-date">${dt}</div>
         <div class="photo-location">${loc}</div>
       </div>`;
+    // tabindex/role/aria + keydown make the card itself keyboard-operable —
+    // previously this whole grid was mouse-only, with no way to tab to a
+    // photo or open/select it without a pointer.
+    card.tabIndex=0;
+    card.setAttribute('role','button');
+    card.setAttribute('aria-label',`Open ${fileEsc}`);
     card.addEventListener('click', e=>{
       if (_suppressNextCardClick){ _suppressNextCardClick=false; return; }  // ghost click after a drag-select
       if (e.target.closest('.select-hit')) return;   // handled by toggleSelect itself
@@ -1126,13 +1182,35 @@ function renderGrid() {
       if (e.shiftKey && _lastGridClick!=null){
         const arr=sortedFiltered(); const [a,b]=[_lastGridClick,i].sort((x,y)=>x-y);
         for(let j=a;j<=b;j++) selected.add(arr[j].id);
-        updateBatchBar(); renderGrid();
+        // Only the selection changed — repainting all N cards' innerHTML on
+        // every checkbox/range click was the whole grid's worst jank source
+        // on a large library. updateSelectionUI() just toggles classes.
+        updateBatchBar(); updateSelectionUI();
         return;
       }
       _lastGridClick=i;
       openDetail(i);
     });
+    card.addEventListener('keydown', e=>{
+      if(e.target.closest('.select-hit')) return;   // its own onkeydown handles this
+      if(e.key==='Enter'||e.key===' '){ e.preventDefault(); _lastGridClick=i; openDetail(i); }
+    });
     grid.appendChild(card);
+  });
+}
+
+// Toggles only the DOM bits that reflect `selected` (card class + checkbox
+// mark) instead of rebuilding every card's innerHTML from scratch — used
+// everywhere a selection-only change happens (click, select all, clear,
+// marquee finish) so a single checkbox click doesn't repaint the whole grid.
+function updateSelectionUI(){
+  document.querySelectorAll('#photoGrid .photo-card').forEach(card=>{
+    const isSel=selected.has(card.dataset.id);
+    card.classList.toggle('selected',isSel);
+    const hit=card.querySelector('.select-hit');
+    if(hit) hit.setAttribute('aria-checked',String(isSel));
+    const cb=card.querySelector('.select-checkbox');
+    if(cb) cb.textContent=isSel?'✓':'';
   });
 }
 
@@ -1159,11 +1237,13 @@ function buildFolderList() {
   Object.entries(folders).sort().forEach(([f,cnt])=>{
     const btn=document.createElement('button');
     btn.className='folder-item'; btn.title=f||'(root)';
-    btn.innerHTML=`<span>📁 ${f||'(root)'}</span><span style="margin-left:auto;color:var(--text-dim);font-size:10px">${cnt}</span>`;
+    btn.innerHTML=`<span>📁 ${escapeHtml(f)||'(root)'}</span><span style="margin-left:auto;color:var(--text-dim);font-size:10px">${cnt}</span>`;
     btn.onclick=()=>{ currentFolder=f; currentFilter='all';
       document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
       btn.classList.add('active');
-      filtered=allPhotos.filter(p=>p.folder===f); renderGrid(); };
+      // Was `filtered=allPhotos.filter(...)` directly, which bypassed
+      // recomputeFiltered() and so ignored the search box entirely.
+      recomputeFiltered(); renderGrid(); };
     list.appendChild(btn);
   });
 }
@@ -1174,8 +1254,8 @@ async function loadSessions() {
   const list=document.getElementById('sessionList'); list.innerHTML='';
   d.sessions.forEach(s=>{
     const el=document.createElement('div'); el.className='session-item';
-    el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${s.name}</div>
-      <div class="session-root">${s.scan_root}</div></div>
+    el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${escapeHtml(s.name)}</div>
+      <div class="session-root">${escapeHtml(s.scan_root)}</div></div>
       <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px"
         onclick="event.stopPropagation();deleteSession(${s.id})">✕</button>`;
     el.onclick=()=>{ document.getElementById('folderInput').value=s.scan_root;
@@ -1217,7 +1297,7 @@ async function switchToSession(folder){
 async function newSession() {
   const root=document.getElementById('folderInput').value.trim();
   if (!root) { toast('Scan a folder first','error'); return; }
-  const name=prompt('Session name:', root.split('/').pop()||root);
+  const name=await customPrompt('Session name:', root.split('/').pop()||root);
   if (!name) return;
   await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name,scan_root:root})});
@@ -1233,10 +1313,10 @@ async function deleteSession(id) {
 function toggleSelect(e,id){
   e.stopPropagation();
   selected.has(id)?selected.delete(id):selected.add(id);
-  updateBatchBar(); renderGrid();
+  updateBatchBar(); updateSelectionUI();
 }
-function selectAllVisible(){sortedFiltered().forEach(p=>selected.add(p.id));updateBatchBar();renderGrid();}
-function clearSelection(){selected.clear();updateBatchBar();renderGrid();}
+function selectAllVisible(){sortedFiltered().forEach(p=>selected.add(p.id));updateBatchBar();updateSelectionUI();}
+function clearSelection(){selected.clear();updateBatchBar();updateSelectionUI();}
 function updateBatchBar(){
   const bar=document.getElementById('batchBar');
   if(selected.size>0){bar.style.display='flex';document.getElementById('batchCount').textContent=selected.size;}
@@ -1250,6 +1330,7 @@ function updateBatchBar(){
 // plain click is never mistaken for the start of a drag.
 const MARQUEE_THRESHOLD_PX=6;
 let _marqueeDownAt=null, _marqueeActive=false, _marqueeAdditive=false, _marqueeBase=null, _marqueeBox=null;
+let _marqueeCardRects=null; // [{id,card,rect}] captured once per drag — see _captureMarqueeCardRects
 let _suppressNextCardClick=false;
 
 function initGridMarquee(){
@@ -1275,6 +1356,12 @@ document.addEventListener('mousemove', e=>{
     _marqueeBox.className='marquee-box';
     document.body.appendChild(_marqueeBox);
     document.body.classList.add('marquee-dragging');
+    // getBoundingClientRect() forces layout — querying + recomputing it for
+    // every card on *every* mousemove event (tens/sec) is what made
+    // drag-select stutter on a large library. Captured once here instead;
+    // recaptured only if the page scrolls mid-drag (see the scroll listener
+    // below), since that's the only thing that can invalidate cached rects.
+    _captureMarqueeCardRects();
   }
   updateMarqueeRect(_marqueeDownAt.x,_marqueeDownAt.y,e.clientX,e.clientY);
 });
@@ -1290,23 +1377,32 @@ document.addEventListener('mouseup', ()=>{
     setTimeout(()=>{_suppressNextCardClick=false;},0);
     if(_marqueeBox){ _marqueeBox.remove(); _marqueeBox=null; }
     document.body.classList.remove('marquee-dragging');
-    updateBatchBar(); renderGrid();
+    // updateMarqueeRect already kept classes/selected in sync live during
+    // the drag — no need for renderGrid()'s full rebuild here too.
+    _marqueeCardRects=null;
+    updateBatchBar();
   }
   _marqueeDownAt=null; _marqueeActive=false;
 });
+window.addEventListener('scroll', ()=>{ if(_marqueeActive) _captureMarqueeCardRects(); }, true);
+
+function _captureMarqueeCardRects(){
+  _marqueeCardRects=[...document.querySelectorAll('#photoGrid .photo-card')].map(card=>
+    ({id:card.dataset.id, card, rect:card.getBoundingClientRect()}));
+}
 
 function updateMarqueeRect(x0,y0,x1,y1){
   const left=Math.min(x0,x1), top=Math.min(y0,y1);
   const width=Math.abs(x1-x0), height=Math.abs(y1-y0);
   Object.assign(_marqueeBox.style,{left:left+'px',top:top+'px',width:width+'px',height:height+'px'});
   const right=left+width, bottom=top+height;
-  document.querySelectorAll('#photoGrid .photo-card').forEach(card=>{
-    const r=card.getBoundingClientRect();
-    const intersects = r.left<right && r.right>left && r.top<bottom && r.bottom>top;
-    const id=card.dataset.id;
+  _marqueeCardRects.forEach(({id,card,rect})=>{
+    const intersects = rect.left<right && rect.right>left && rect.top<bottom && rect.bottom>top;
     const shouldSelect = intersects || _marqueeBase.has(id);
     if(shouldSelect) selected.add(id); else selected.delete(id);
     card.classList.toggle('selected',shouldSelect);
+    const hit=card.querySelector('.select-hit');
+    if(hit) hit.setAttribute('aria-checked',String(shouldSelect));
     const cb=card.querySelector('.select-checkbox');
     if(cb) cb.textContent=shouldSelect?'✓':'';
   });
@@ -1367,13 +1463,13 @@ function markDetailDirty(){ detailDirty=true; }
 // Nothing here auto-saves — Prev/Next/✕/Escape used to silently discard
 // whatever was typed into Location/Date/GPS with zero warning. This is the
 // one gate all of those paths go through before actually navigating away.
-function confirmDiscardIfDirty(){
+async function confirmDiscardIfDirty(){
   if(!detailDirty) return true;
-  return confirm('You have unsaved changes to this photo. Discard them?');
+  return await customConfirm('You have unsaved changes to this photo. Discard them?',{danger:true,okText:'Discard'});
 }
-function closeDetail(e){
+async function closeDetail(e){
   if(e&&e.target!==document.getElementById('detailOverlay')) return;
-  if(!confirmDiscardIfDirty()) return;
+  if(!await confirmDiscardIfDirty()) return;
   document.getElementById('detailOverlay').style.display='none';
 }
 function detailPos(){
@@ -1381,8 +1477,8 @@ function detailPos(){
   if(detailId){const i=a.findIndex(x=>x.id===detailId); if(i>=0) return i;}
   return detailIndex;
 }
-function prevPhoto(){const i=detailPos(); if(i>0&&confirmDiscardIfDirty()) openDetail(i-1);}
-function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1&&confirmDiscardIfDirty()) openDetail(i+1);}
+async function prevPhoto(){const i=detailPos(); if(i>0&&await confirmDiscardIfDirty()) openDetail(i-1);}
+async function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a.length-1&&await confirmDiscardIfDirty()) openDetail(i+1);}
 
 // Live preview only — a CSS transform, nothing is written until Save sends
 // rotate_degrees through the same dry-run-gated path as every other field.
@@ -1512,7 +1608,7 @@ async function batchGeocode(){
 }
 
 async function saveAll(){
-  if(!confirm(`Write location data to ${allPhotos.filter(p=>p.location_name||p.lat).length} files?`)) return;
+  if(!await customConfirm(`Write location data to ${allPhotos.filter(p=>p.location_name||p.lat).length} files?`)) return;
   const btn=document.getElementById('saveAllBtn'); btn.disabled=true;
   try{
     const toSave=allPhotos.filter(p=>p.location_name||p.lat);
@@ -1550,7 +1646,7 @@ async function batchSave(){
   const toSave=allPhotos.filter(p=>selected.has(p.id));
   // Same real-write risk as "Save All" (dry run off means this hits disk for
   // every selected photo), but this path skipped the confirmation.
-  if(!confirm(`Write location data to ${toSave.length} selected file(s)?`)) return;
+  if(!await customConfirm(`Write location data to ${toSave.length} selected file(s)?`)) return;
   const btn=document.getElementById('batchSaveBtn'); btn.disabled=true;
   try{
     const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
@@ -1636,13 +1732,13 @@ async function renderDupResult(){
         ${note?`<span style="color:var(--text-dim);font-size:11px">${note}</span>`:''}
       </div>
       <div class="dup-photos">${photos.map(p=>`
-        <div class="dup-card" title="${p.path}">
+        <div class="dup-card" title="${escapeHtml(p.path)}">
           <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
                onerror="this.style.display='none'"/>
           ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
           <div class="dup-card-info">
-            <div class="dup-card-name">${p.filename}</div>
-            <div class="dup-card-meta">${p.size_kb}KB · ${p.folder||'root'}</div>
+            <div class="dup-card-name">${escapeHtml(p.filename)}</div>
+            <div class="dup-card-meta">${p.size_kb}KB · ${escapeHtml(p.folder)||'root'}</div>
           </div>
         </div>`).join('')}
       </div>`;
@@ -1779,7 +1875,7 @@ async function loadHistoryImports(){
       : `${im.point_count.toLocaleString()} points`;
     row.innerHTML=`
       <span>${icon}</span>
-      <span class="hist-import-name" title="${im.source_name}">${im.source_name}</span>
+      <span class="hist-import-name" title="${escapeHtml(im.source_name)}">${escapeHtml(im.source_name)}</span>
       <span class="hist-import-meta">${statusText}</span>
       <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px" onclick="deleteHistoryImport(${im.id})">✕</button>`;
     list.appendChild(row);
@@ -1787,7 +1883,7 @@ async function loadHistoryImports(){
 }
 
 async function deleteHistoryImport(id){
-  if(!confirm('Remove this import? Any photo suggestions it produced will be cleared.')) return;
+  if(!await customConfirm('Remove this import? Any photo suggestions it produced will be cleared.',{danger:true})) return;
   await fetch('/api/history/imports/'+id,{method:'DELETE'});
   toast('Import removed');
   loadHistoryImports();
@@ -2031,7 +2127,7 @@ function renderSeedGrid(){
     item.innerHTML=`<div class="seed-checkbox">${checked?'✓':''}</div>
       <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
       <div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>
-      <div class="seed-item-info"><div class="seed-item-name">${t.filename}</div>
+      <div class="seed-item-info"><div class="seed-item-name">${escapeHtml(t.filename)}</div>
         <div class="seed-item-date">${dt}${alreadyTagged?' · <span style="color:var(--gold)">will overwrite</span>':''}</div></div>`;
     item.onclick=()=>{
       if(_seedUnchecked.has(t.id)) _seedUnchecked.delete(t.id); else _seedUnchecked.add(t.id);
@@ -2101,7 +2197,7 @@ async function loadBrowser(path){
   }
   d.dirs.forEach(name=>{
     const item=document.createElement('div'); item.className='browser-item';
-    item.innerHTML=`📁 ${name}`;
+    item.innerHTML=`📁 ${escapeHtml(name)}`;
     item.onclick=()=>loadBrowser(d.path+'/'+name);
     list.appendChild(item);
   });
@@ -2117,11 +2213,72 @@ function browserSelect(){
 function closeBrowser(e){if(e&&e.target!==document.getElementById('browserModal'))return;document.getElementById('browserModal').style.display='none';}
 
 // ── Toast ──────────────────────────────────────────────────────────
-let _tt;
 function toast(msg,type=''){
-  const el=document.getElementById('toast');
-  el.textContent=msg; el.className='toast show'+(type?' '+type:'');
-  clearTimeout(_tt); _tt=setTimeout(()=>el.classList.remove('show'),3200);
+  const stack=document.getElementById('toastStack');
+  const el=document.createElement('div');
+  el.className='toast'+(type?' '+type:'');
+  el.textContent=msg;
+  stack.appendChild(el);
+  requestAnimationFrame(()=>el.classList.add('show'));
+  setTimeout(()=>{
+    el.classList.remove('show');
+    setTimeout(()=>el.remove(),250); // let the fade-out transition finish before removing
+  },3200);
+}
+
+// ── Custom confirm/prompt ─────────────────────────────────────────
+// The app has its own overlay/panel system everywhere else — these two
+// call sites still fell back to native confirm()/prompt(), which look
+// jarring against the styled UI and can't be dismissed the way every
+// other dialog here can (click outside, Escape). Both return a Promise
+// so call sites just `await` them like the native versions.
+function customConfirm(message,{okText='OK',cancelText='Cancel',danger=false}={}){
+  return new Promise(resolve=>{
+    const overlay=document.createElement('div');
+    overlay.className='detail-overlay'; overlay.style.display='flex';
+    overlay.innerHTML=`
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+                  width:100%;max-width:380px;padding:22px">
+        <p style="margin-bottom:18px;line-height:1.5">${escapeHtml(message)}</p>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn-ghost" data-role="cancel">${escapeHtml(cancelText)}</button>
+          <button class="btn ${danger?'btn-red':'btn-primary'}" data-role="ok">${escapeHtml(okText)}</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const done=v=>{ document.removeEventListener('keydown',onKey); overlay.remove(); resolve(v); };
+    const onKey=e=>{ if(e.key==='Escape') done(false); };
+    overlay.addEventListener('click', e=>{ if(e.target===overlay) done(false); });
+    overlay.querySelector('[data-role="cancel"]').onclick=()=>done(false);
+    overlay.querySelector('[data-role="ok"]').onclick=()=>done(true);
+    document.addEventListener('keydown', onKey);
+  });
+}
+function customPrompt(message,defaultValue=''){
+  return new Promise(resolve=>{
+    const overlay=document.createElement('div');
+    overlay.className='detail-overlay'; overlay.style.display='flex';
+    overlay.innerHTML=`
+      <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+                  width:100%;max-width:380px;padding:22px">
+        <p style="margin-bottom:10px">${escapeHtml(message)}</p>
+        <input class="field-input" id="_customPromptInput" style="margin-bottom:16px;width:100%"/>
+        <div style="display:flex;gap:8px;justify-content:flex-end">
+          <button class="btn btn-ghost" data-role="cancel">Cancel</button>
+          <button class="btn btn-primary" data-role="ok">OK</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    const input=overlay.querySelector('#_customPromptInput');
+    input.value=defaultValue; // set as a property, not baked into the HTML — avoids re-escaping headaches
+    setTimeout(()=>{input.focus();input.select();},0);
+    const done=v=>{ document.removeEventListener('keydown',onKey); overlay.remove(); resolve(v); };
+    const onKey=e=>{ if(e.key==='Escape') done(null); };
+    overlay.addEventListener('click', e=>{ if(e.target===overlay) done(null); });
+    overlay.querySelector('[data-role="cancel"]').onclick=()=>done(null);
+    overlay.querySelector('[data-role="ok"]').onclick=()=>done(input.value);
+    input.addEventListener('keydown', e=>{ if(e.key==='Enter') done(input.value); });
+  });
 }
 
 // ── Keyboard ───────────────────────────────────────────────────────

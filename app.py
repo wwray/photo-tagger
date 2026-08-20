@@ -84,6 +84,7 @@ sys.stderr = _TeeStream(sys.stderr, "err")
 
 PHOTO_EXTENSIONS   = {".jpg", ".jpeg", ".cr2", ".nef", ".arw", ".orf", ".rw2", ".dng"}
 GEOCODE_DELAY      = 1.1
+_EPOCH = datetime(1970, 1, 1)  # fixed reference point for turning a naive date_taken into a sortable float
 DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
 AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
 AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5")
@@ -646,11 +647,20 @@ def rotate_image_file(filepath, degrees):
         _log(f"[exif] Refusing to rotate {filepath}: existing EXIF could not be "
              f"parsed ({e}) — rotating anyway would discard it")
         raise
-    img = ImageOps.exif_transpose(Image.open(filepath))
+    img = Image.open(filepath)
+    # Captured before convert()/rotate() — an embedded Adobe RGB/ProPhoto
+    # profile isn't guaranteed to survive those, and save() silently drops
+    # it if it's not passed back explicitly, causing a visible color shift
+    # in other viewers afterward.
+    icc_profile = img.info.get("icc_profile")
+    img = ImageOps.exif_transpose(img)
     # PIL's rotate() is counter-clockwise; the UI's ⟳ is clockwise, so negate.
     img = img.rotate(-degrees, expand=True)
     exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
-    img.convert("RGB").save(filepath, "jpeg", quality=92, exif=piexif.dump(exif_dict))
+    save_kwargs = {"quality": 92, "exif": piexif.dump(exif_dict)}
+    if icc_profile:
+        save_kwargs["icc_profile"] = icc_profile
+    img.convert("RGB").save(filepath, "jpeg", **save_kwargs)
 
 # ─── Scan (background thread) ─────────────────────────────────────────────────
 
@@ -743,24 +753,47 @@ def _run_scan(folder, rescan=False):
 
         all_db = rows_to_dicts(conn.execute(
             "SELECT * FROM photos WHERE scan_root=?", (folder,)).fetchall())
-        gps_photos = [p for p in all_db if p["has_gps"] and p["date_taken"]]
+
+        # Pre-parse + sort every GPS photo's timestamp once, then bisect per
+        # candidate. This used to re-parse every GPS photo's datetime string
+        # inside the inner loop for every non-GPS candidate — an O(N×M) scan
+        # with repeated parsing, the exact bug class already fixed once for
+        # duplicate detection (11 min → 3 sec there). On a library with a
+        # few thousand of each this was easily minutes; sorted + bisect
+        # finds the same true nearest-in-time match in a couple of seconds.
+        gps_ts, gps_sorted = [], []
+        for p in all_db:
+            if not (p["has_gps"] and p["date_taken"]):
+                continue
+            try:
+                gps_ts.append((datetime.fromisoformat(p["date_taken"]) - _EPOCH).total_seconds())
+                gps_sorted.append(p)
+            except ValueError:
+                continue
+        order = sorted(range(len(gps_ts)), key=lambda i: gps_ts[i])
+        gps_ts     = [gps_ts[i] for i in order]
+        gps_sorted = [gps_sorted[i] for i in order]
 
         inferred = 0
         for photo in all_db:
             # 'history' (matched against imported location history, if any)
             # is a stronger signal than a same-folder GPS-cluster guess —
             # don't let this pass clobber it back down to 'inferred'.
-            if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"]:
+            if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"] or not gps_ts:
                 continue
-            try: dt = datetime.fromisoformat(photo["date_taken"])
-            except ValueError: continue
-            best, best_delta = None, float("inf")
-            for gp in gps_photos:
-                try:
-                    delta = abs((dt-datetime.fromisoformat(gp["date_taken"])).total_seconds())
-                    if delta < best_delta: best_delta, best = delta, gp
-                except ValueError: continue
-            if best and best_delta <= 4*3600:
+            try:
+                epoch = (datetime.fromisoformat(photo["date_taken"]) - _EPOCH).total_seconds()
+            except ValueError:
+                continue
+            ins = bisect.bisect_left(gps_ts, epoch)
+            best_idx, best_delta = None, float("inf")
+            for j in (ins - 1, ins):
+                if 0 <= j < len(gps_ts):
+                    delta = abs(gps_ts[j] - epoch)
+                    if delta < best_delta:
+                        best_delta, best_idx = delta, j
+            if best_idx is not None and best_delta <= 4*3600:
+                best = gps_sorted[best_idx]
                 conn.execute("""UPDATE photos SET inferred_lat=?,inferred_lon=?,
                     inferred_from=?,inferred_delta_min=?,status='inferred'
                     WHERE id=?""",
@@ -771,7 +804,13 @@ def _run_scan(folder, rescan=False):
         _log(f"[scan] Inferred {inferred} locations")
 
         # ── Geocode ────────────────────────────────────────────────
-        needs_geo = [p for p in all_db if p["has_gps"] and not p["location_name"]][:200]
+        # No cap here anymore — a cap meant a library with 1,000+ ungeocoded
+        # GPS photos needed several full rescans just to advance it. The
+        # rate limit (GEOCODE_DELAY, ~1.1s/request per Nominatim's usage
+        # policy) is the real, already-documented pace ("Geocoding 500
+        # photos takes ~10 min" — README); this just lets a scan finish the
+        # whole backlog instead of stopping partway through it.
+        needs_geo = [p for p in all_db if p["has_gps"] and not p["location_name"]]
         _log(f"[scan] Geocoding {len(needs_geo)} GPS photos…")
         for i, photo in enumerate(needs_geo):
             with _scan_lock:
@@ -941,7 +980,16 @@ def api_scan_result():
     db = _get_db()
     rows = db.execute("SELECT * FROM photos WHERE scan_root=? ORDER BY date_taken",
                       (folder,)).fetchall()
-    return jsonify({"photos": rows_to_dicts(rows), "total": len(rows)})
+    photos = rows_to_dicts(rows)
+    # The grid UI never reads these — they're internal to duplicate
+    # detection, which queries them itself straight from the DB — but they
+    # were shipped to the browser anyway on every load/rescan of a library
+    # that can run to thousands of photos. True pagination would mean
+    # moving filter/sort/search server-side, a bigger rework than this
+    # pass; dropping the three unused, large fields is the safe win.
+    for p in photos:
+        p.pop("phash", None); p.pop("dhash", None); p.pop("file_hash", None)
+    return jsonify({"photos": photos, "total": len(photos)})
 
 # ── Pending changes (dry run persistence) ────────────────────────
 @app.route("/api/pending")
