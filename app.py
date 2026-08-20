@@ -4,6 +4,7 @@ import sys
 import time
 import json
 import bisect
+import shutil
 import calendar
 import hashlib
 import sqlite3
@@ -299,7 +300,9 @@ def init_db():
     existing = {r[1] for r in conn.execute("PRAGMA table_info(photos)")}
     for col, ddl in [("dhash", "TEXT"), ("date_source", "TEXT"),
                       ("history_lat", "REAL"), ("history_lon", "REAL"),
-                      ("history_delta_min", "INTEGER"), ("history_import_id", "INTEGER")]:
+                      ("history_delta_min", "INTEGER"), ("history_import_id", "INTEGER"),
+                      ("camera", "TEXT"), ("lens", "TEXT"), ("aperture", "TEXT"),
+                      ("shutter", "TEXT"), ("iso", "TEXT"), ("focal_length", "TEXT")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {ddl}")
             print(f"[db] Migrated: added photos.{col}", flush=True)
@@ -317,12 +320,14 @@ def db_upsert_photo(conn, photo: dict):
             id, path, filename, folder, size_kb, file_mtime,
             date_taken, lat, lon, location_name, has_gps, status,
             phash, dhash, file_hash, inferred_lat, inferred_lon,
-            inferred_from, inferred_delta_min, scan_root, last_scanned, date_source
+            inferred_from, inferred_delta_min, scan_root, last_scanned, date_source,
+            camera, lens, aperture, shutter, iso, focal_length
         ) VALUES (
             :id,:path,:filename,:folder,:size_kb,:file_mtime,
             :date_taken,:lat,:lon,:location_name,:has_gps,:status,
             :phash,:dhash,:file_hash,:inferred_lat,:inferred_lon,
-            :inferred_from,:inferred_delta_min,:scan_root,:last_scanned,:date_source
+            :inferred_from,:inferred_delta_min,:scan_root,:last_scanned,:date_source,
+            :camera,:lens,:aperture,:shutter,:iso,:focal_length
         )
         ON CONFLICT(id) DO UPDATE SET
             path=excluded.path, filename=excluded.filename,
@@ -352,7 +357,9 @@ def db_upsert_photo(conn, photo: dict):
             inferred_lat=excluded.inferred_lat, inferred_lon=excluded.inferred_lon,
             inferred_from=excluded.inferred_from,
             inferred_delta_min=excluded.inferred_delta_min,
-            scan_root=excluded.scan_root, last_scanned=excluded.last_scanned
+            scan_root=excluded.scan_root, last_scanned=excluded.last_scanned,
+            camera=excluded.camera, lens=excluded.lens, aperture=excluded.aperture,
+            shutter=excluded.shutter, iso=excluded.iso, focal_length=excluded.focal_length
     """, {**{
         "id":None,"path":None,"filename":None,"folder":None,"size_kb":None,
         "file_mtime":None,"date_taken":None,"lat":None,"lon":None,
@@ -360,7 +367,9 @@ def db_upsert_photo(conn, photo: dict):
         "phash":None,"dhash":None,"file_hash":None,"date_source":None,
         "inferred_lat":None,"inferred_lon":None,
         "inferred_from":None,"inferred_delta_min":None,
-        "scan_root":None,"last_scanned":None
+        "scan_root":None,"last_scanned":None,
+        "camera":None,"lens":None,"aperture":None,"shutter":None,
+        "iso":None,"focal_length":None
     }, **photo})
 
 def db_save_pending(conn, photo_id, field, old_value, new_value):
@@ -464,10 +473,24 @@ def _dms_to_decimal(dms, ref):
     except Exception:
         return None
 
+def _exif_ratio_float(tag):
+    """First value of an exifread numeric tag (FNumber, FocalLength, ...) as
+    a float, or None. exifread stores EXIF rationals as Ratio(num,den)
+    objects in `.values` — this is the shared unwrap for everything below
+    that isn't GPS, which has its own DMS-specific helper above."""
+    if tag is None:
+        return None
+    try:
+        v = tag.values[0]
+        return float(v.num) / float(v.den) if v.den else None
+    except Exception:
+        return None
+
 def read_exif(filepath):
     result = {"date_taken":None,"lat":None,"lon":None,
               "location_name":None,"has_gps":False,"error":None,
-              "date_source":None}
+              "date_source":None,"camera":None,"lens":None,
+              "aperture":None,"shutter":None,"iso":None,"focal_length":None}
     try:
         with open(filepath,"rb") as f:
             tags = exifread.process_file(f, details=False)
@@ -494,6 +517,38 @@ def read_exif(filepath):
             desc = str(tags["Image ImageDescription"]).strip()
             if not _is_junk_description(desc):
                 result["location_name"] = desc
+
+        # Camera/lens/exposure info — exifread already parsed all of this
+        # out of the same file read above; it just wasn't kept before now.
+        make  = str(tags.get("Image Make", "")).strip()
+        model = str(tags.get("Image Model", "")).strip()
+        # Some cameras write the make as a prefix of the model (e.g. make
+        # "Canon", model "Canon EOS R5") — joining both unconditionally
+        # would show "Canon Canon EOS R5".
+        if model and make and model.lower().startswith(make.lower()):
+            result["camera"] = model
+        elif make or model:
+            result["camera"] = f"{make} {model}".strip()
+        lens = tags.get("EXIF LensModel")
+        if lens:
+            result["lens"] = str(lens).strip()
+        fnumber = _exif_ratio_float(tags.get("EXIF FNumber"))
+        if fnumber:
+            result["aperture"] = f"f/{fnumber:g}"
+        exposure = tags.get("EXIF ExposureTime")
+        if exposure:
+            try:
+                r = exposure.values[0]
+                if r.num and r.den:
+                    result["shutter"] = f"{r.num}/{r.den}s" if r.num < r.den else f"{r.num/r.den:g}s"
+            except Exception:
+                pass
+        iso = tags.get("EXIF ISOSpeedRatings")
+        if iso:
+            result["iso"] = str(iso)
+        focal = _exif_ratio_float(tags.get("EXIF FocalLength"))
+        if focal:
+            result["focal_length"] = f"{focal:g}mm"
     except Exception as e:
         result["error"] = str(e)
 
@@ -662,6 +717,148 @@ def rotate_image_file(filepath, degrees):
         save_kwargs["icc_profile"] = icc_profile
     img.convert("RGB").save(filepath, "jpeg", **save_kwargs)
 
+# ─── Rename ────────────────────────────────────────────────────────────────────────────────────────
+# Batch rename by pattern (tokens: {date} {time} {location} {seq} {orig} {ext}).
+# rename_log and photos.original_filename already existed in the schema for
+# this before any of the code below did — added ahead of time, never wired
+# up until now. Goes through the same server-authoritative dry-run gate as
+# everything else: with dry run on this stages a 'rename' pending change
+# (shows up in the normal Review modal, reuses its commit/discard path);
+# with dry run off it renames immediately.
+
+_RENAME_SLUG_RE = re.compile(r"[^A-Za-z0-9._ -]+")
+
+def _slugify_for_filename(text):
+    """Strip characters that are awkward or unsafe in a filename (path
+    separators, colons, quotes, emoji...) and collapse whitespace to
+    underscores. Not a full transliteration — just enough that a location
+    like 'Rio de Janeiro, Brazil' becomes 'Rio_de_Janeiro_Brazil' instead of
+    failing, or worse, smuggling a path separator into a new filename."""
+    if not text:
+        return ""
+    return re.sub(r"\s+", "_", _RENAME_SLUG_RE.sub("", text).strip())
+
+def _build_rename_filename(pattern, photo, seq_counters):
+    """
+    Expand a rename pattern for one photo row. seq_counters is shared across
+    a whole batch and keyed by date, so numbering restarts each day (matching
+    how people actually number a folder of trip photos) instead of growing
+    unbounded across an entire multi-year library.
+    """
+    orig_path = Path(photo["filename"])
+    ext = orig_path.suffix
+    date_str, time_str = "", ""
+    if photo["date_taken"]:
+        try:
+            dt = datetime.fromisoformat(photo["date_taken"])
+            date_str, time_str = dt.strftime("%Y-%m-%d"), dt.strftime("%H%M%S")
+        except ValueError:
+            pass
+    key = date_str or "nodate"
+    seq_counters[key] = seq_counters.get(key, 0) + 1
+    replacements = {
+        "date": date_str or "nodate",
+        "time": time_str,
+        "location": _slugify_for_filename(photo["location_name"] or ""),
+        "seq": f"{seq_counters[key]:03d}",
+        "orig": orig_path.stem,
+        "ext": ext,
+    }
+    name = pattern
+    for token, value in replacements.items():
+        name = name.replace("{" + token + "}", value)
+    # A missing token (no location yet, no date yet) leaves a gap next to
+    # whatever separator the pattern put around it (e.g. "2024-06-12__001")
+    # rather than a broken filename — collapse repeated separators instead
+    # of trying to guess which literal characters in the pattern were meant
+    # as separators around which token.
+    name = re.sub(r"[_ -]{2,}", "_", name).strip("_ -")
+    if not name.lower().endswith(ext.lower()):
+        name += ext
+    return name or (orig_path.stem + ext)
+
+def _apply_rename(db, row, new_filename):
+    """
+    Physically rename a photo file — and its XMP sidecar, if any, since a
+    sidecar left behind under the old name becomes invisible to whatever
+    reads the renamed file — and update its DB row. id IS the relative
+    path, so a rename changes the primary key; rename_log keeps old/new
+    path for later tracing, and original_filename preserves the very first
+    name this photo ever had (COALESCE — a second rename must not overwrite
+    it with the first rename's *result*).
+    """
+    old_path = Path(row["path"])
+    if not old_path.is_file():
+        raise FileNotFoundError(f"{old_path} no longer exists")
+    new_filename = (new_filename or "").strip()
+    if not new_filename or "/" in new_filename or "\\" in new_filename:
+        raise ValueError(f"Invalid filename: {new_filename!r}")
+    new_path = old_path.parent / new_filename
+    if new_path.exists():
+        raise FileExistsError(f"{new_filename} already exists in {old_path.parent}")
+    os.rename(old_path, new_path)
+    old_sidecar = old_path.with_suffix(".xmp")
+    if old_sidecar.exists():
+        os.rename(old_sidecar, new_path.with_suffix(".xmp"))
+    new_id = str(new_path.relative_to(Path(row["scan_root"])))
+    db.execute("""UPDATE photos SET id=?, path=?, filename=?,
+                  original_filename=COALESCE(original_filename,?) WHERE id=?""",
+               (new_id, str(new_path), new_path.name, row["filename"], row["id"]))
+    db.execute("INSERT INTO rename_log (photo_id, old_path, new_path) VALUES (?,?,?)",
+               (new_id, str(old_path), str(new_path)))
+    return new_id
+
+@app.route("/api/rename_preview", methods=["POST"])
+def api_rename_preview():
+    data = request.json or {}
+    ids = data.get("ids", [])
+    pattern = (data.get("pattern") or "").strip() or "{date}_{location}_{seq}{ext}"
+    db = _get_db()
+    seq_counters = {}
+    preview = []
+    for pid in ids:
+        row = db.execute("SELECT * FROM photos WHERE id=?", (pid,)).fetchone()
+        if not row:
+            continue
+        new_name = _build_rename_filename(pattern, row, seq_counters)
+        preview.append({"id": pid, "old_filename": row["filename"], "new_filename": new_name,
+                         "unchanged": new_name == row["filename"]})
+    return jsonify({"preview": preview})
+
+@app.route("/api/rename_batch", methods=["POST"])
+def api_rename_batch():
+    """
+    Apply (or, with dry run on, stage) filename changes computed by
+    /api/rename_preview. A staged rename is saved as an ordinary
+    field='rename' pending change, so it shows up in the normal "Review
+    pending changes" modal for free — only /api/pending/commit needs to
+    know 'rename' isn't an EXIF field.
+    """
+    data = request.json or {}
+    items = data.get("items", [])
+    dry_run = effective_dry_run(data.get("dry_run", False))
+    db = _get_db()
+    results = []
+    for item in items:
+        pid = item.get("id")
+        new_filename = (item.get("new_filename") or "").strip()
+        row = db.execute("SELECT * FROM photos WHERE id=?", (pid,)).fetchone()
+        if not row:
+            results.append({"id": pid, "ok": False, "error": "not found"}); continue
+        if not new_filename or new_filename == row["filename"]:
+            results.append({"id": pid, "ok": True, "skipped": True}); continue
+        if dry_run:
+            db_save_pending(db, pid, "rename", row["filename"], new_filename)
+            results.append({"id": pid, "ok": True, "dry_run": True})
+            continue
+        try:
+            new_id = _apply_rename(db, row, new_filename)
+            results.append({"id": pid, "ok": True, "new_id": new_id})
+        except Exception as e:
+            results.append({"id": pid, "ok": False, "error": str(e)})
+    db.commit()
+    return jsonify({"results": results, "dry_run": dry_run})
+
 # ─── Scan (background thread) ─────────────────────────────────────────────────
 
 _scan_state = {"running":False,"phase":"","current":0,"total":0,
@@ -679,8 +876,13 @@ def _run_scan(folder, rescan=False):
         with _scan_lock:
             _scan_state.update(phase="counting",message="Counting photo files…",
                                current=0,total=0,scan_root=folder)
+        # _duplicates/ is where duplicate-resolution moves files (see
+        # _move_to_duplicates_folder) — it lives inside the scan root for
+        # simplicity, so it must be excluded here or a rescan would just
+        # re-import everything just moved out of the library as "new" photos.
         all_paths = sorted([p for p in base.rglob("*")
-                            if p.suffix.lower() in PHOTO_EXTENSIONS])
+                            if p.suffix.lower() in PHOTO_EXTENSIONS
+                            and "_duplicates" not in p.relative_to(base).parts])
         total = len(all_paths)
         _log(f"[scan] Found {total} photos in {folder}")
 
@@ -726,6 +928,12 @@ def _run_scan(folder, rescan=False):
                 "location_name":exif["location_name"],
                 "has_gps":      1 if exif["has_gps"] else 0,
                 "status":       "gps" if exif["has_gps"] else ("named" if exif["location_name"] else "unknown"),
+                "camera":       exif.get("camera"),
+                "lens":         exif.get("lens"),
+                "aperture":     exif.get("aperture"),
+                "shutter":      exif.get("shutter"),
+                "iso":          exif.get("iso"),
+                "focal_length": exif.get("focal_length"),
                 "phash":        phash_str,
                 "dhash":        dhash_str,
                 "file_hash":    file_hash,
@@ -1048,15 +1256,39 @@ def api_commit_pending():
     for photo_id, info in by_photo.items():
         try:
             fields = info["fields"]
-            write_location_to_exif(
-                info["path"],
-                fields.get("location_name"),
-                float(fields["lat"]) if fields.get("lat") else None,
-                float(fields["lon"]) if fields.get("lon") else None,
-                fields.get("date_taken"),
-            )
+            # A photo marked for duplicate cleanup is leaving the library —
+            # any other pending field for it (a location edit made before it
+            # was flagged as a dup, say) is moot, so skip straight to the
+            # move and mark everything for this photo committed together.
+            if fields.get("move_to_duplicates"):
+                row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+                if row:
+                    _move_to_duplicates_folder(db, row)
+                db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
+                           (photo_id,))
+                results.append({"photo_id":photo_id,"ok":True})
+                continue
+            # write_location_to_exif unconditionally reloads+resaves the EXIF
+            # segment even when nothing changed — fine for a real edit, but
+            # a rename-only or rotate-only pending change would otherwise
+            # re-encode the file for no reason.
+            if any(fields.get(k) for k in ("location_name","lat","lon","date_taken")):
+                write_location_to_exif(
+                    info["path"],
+                    fields.get("location_name"),
+                    float(fields["lat"]) if fields.get("lat") else None,
+                    float(fields["lon"]) if fields.get("lon") else None,
+                    fields.get("date_taken"),
+                )
             if fields.get("rotate_degrees"):
                 rotate_image_file(info["path"], int(fields["rotate_degrees"]))
+            # Renamed last: every write above already targeted the
+            # pre-rename path captured in info["path"], so doing this last
+            # means order here doesn't matter for any of them.
+            if fields.get("rename"):
+                row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+                if row:
+                    _apply_rename(db, row, fields["rename"])
             db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
                        (photo_id,))
             results.append({"photo_id":photo_id,"ok":True})
@@ -1349,6 +1581,66 @@ def api_duplicates_result():
         if not _dup_state["result"]:
             return jsonify({"error": "No duplicate scan result available"}), 409
         return jsonify(_dup_state["result"])
+
+def _move_to_duplicates_folder(db, row):
+    """
+    Move one photo's file (and its XMP sidecar, if any) into a
+    _duplicates/<original subfolder>/ tree under its scan root, then drop
+    its row from the library. This is a move, not a delete — nothing is
+    destroyed, so a bad call is recoverable by hand from _duplicates/.
+    Preserving the original subfolder avoids most collisions between
+    same-named duplicates from different folders (often exactly *why*
+    they're duplicates); a numeric suffix covers the rest, e.g. resolving
+    the same group twice.
+    """
+    src = Path(row["path"])
+    if not src.is_file():
+        raise FileNotFoundError(f"{src} no longer exists")
+    dest_dir = Path(row["scan_root"]) / "_duplicates" / (row["folder"] or "")
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / src.name
+    n = 1
+    while dest.exists():
+        dest = dest_dir / f"{src.stem} ({n}){src.suffix}"
+        n += 1
+    shutil.move(str(src), str(dest))
+    sidecar = src.with_suffix(".xmp")
+    if sidecar.exists():
+        shutil.move(str(sidecar), str(dest.with_suffix(".xmp")))
+    db.execute("DELETE FROM photos WHERE id=?", (row["id"],))
+    db.execute("DELETE FROM pending_changes WHERE photo_id=?", (row["id"],))
+
+@app.route("/api/duplicates/resolve", methods=["POST"])
+def api_duplicates_resolve():
+    """
+    Move every photo in move_ids to _duplicates/ (see
+    _move_to_duplicates_folder) — the "keep" copy of each group is simply
+    never included. Server-authoritative dry_run gate like every other
+    write: with dry run on, each id is staged as a field='move_to_duplicates'
+    pending change instead (reviewed and committed the normal way).
+    """
+    data = request.json or {}
+    move_ids = data.get("move_ids", [])
+    dry_run = effective_dry_run(data.get("dry_run", False))
+    if not move_ids:
+        return jsonify({"error": "move_ids required"}), 400
+    db = _get_db()
+    results = []
+    for pid in move_ids:
+        row = db.execute("SELECT * FROM photos WHERE id=?", (pid,)).fetchone()
+        if not row:
+            results.append({"id": pid, "ok": False, "error": "not found"}); continue
+        if dry_run:
+            db_save_pending(db, pid, "move_to_duplicates", None, "1")
+            results.append({"id": pid, "ok": True, "dry_run": True})
+            continue
+        try:
+            _move_to_duplicates_folder(db, row)
+            results.append({"id": pid, "ok": True})
+        except Exception as e:
+            results.append({"id": pid, "ok": False, "error": str(e)})
+    db.commit()
+    return jsonify({"results": results, "dry_run": dry_run})
 
 # ─── Location history import ───────────────────────────────────────────────
 # Fills GPS gaps using an imported location history (Google Takeout

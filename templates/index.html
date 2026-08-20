@@ -152,6 +152,11 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .toolbar-spacer{flex:1}
 .sort-select{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
   border-radius:var(--radius);padding:5px 8px;font-size:12px;cursor:pointer;outline:none}
+.density-group{display:flex;gap:2px}
+.density-btn.active-density{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
+.dup-card-mark{display:flex;align-items:center;gap:4px;margin-top:4px;font-size:10px;color:var(--text-dim);cursor:pointer}
+.dup-card-mark input{margin:0;cursor:pointer}
+.exif-info{font-size:12px;color:var(--text-muted);line-height:1.6}
 .search-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);
   border-radius:var(--radius);padding:5px 10px;font-size:12px;outline:none;width:200px;
   transition:border-color .15s}
@@ -159,7 +164,7 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .search-input::placeholder{color:var(--text-dim)}
 
 /* ── Photo grid ── */
-.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:10px}
+.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--card-min,190px),1fr));gap:10px}
 .photo-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
   overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s;position:relative}
 .photo-card:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 6px 20px rgba(0,0,0,.4)}
@@ -492,6 +497,11 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
         <option value="status">By status</option>
         <option value="folder">By folder</option>
       </select>
+      <div class="density-group" role="group" aria-label="Grid card size">
+        <button class="btn btn-ghost btn-sm density-btn" data-density="small" onclick="setGridDensity('small')" title="Smaller cards">S</button>
+        <button class="btn btn-ghost btn-sm density-btn" data-density="medium" onclick="setGridDensity('medium')" title="Default card size">M</button>
+        <button class="btn btn-ghost btn-sm density-btn" data-density="large" onclick="setGridDensity('large')" title="Larger cards">L</button>
+      </div>
     </div>
     <div class="photo-grid" id="photoGrid"></div>
   </div>
@@ -500,6 +510,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <h3>Duplicate groups</h3>
       <span id="dupSummary" style="font-size:12px;color:var(--text-dim)"></span>
       <div class="toolbar-spacer"></div>
+      <button class="btn btn-red btn-sm" onclick="autoResolveAllDuplicates()" title="Keep the best copy in every group, move the rest to _duplicates/">🪄 Auto-resolve all</button>
       <button class="btn btn-ghost btn-sm" onclick="showDuplicates(true)" title="Recompute from scratch">↻ Rescan</button>
       <button class="btn btn-ghost btn-sm" onclick="showGrid()">← Back to grid</button>
     </div>
@@ -565,6 +576,10 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
           <button class="btn btn-ghost btn-sm" onclick="openMapPicker()">🗺️ Map</button>
         </div>
       </div>
+      <div class="field-group" id="detailExifGroup" style="display:none">
+        <div class="field-label">Camera</div>
+        <div class="exif-info" id="detailExifInfo"></div>
+      </div>
       <div class="folder-seed-bar" id="folderSeedBar" style="display:none">
         <span>📁 Seed to untagged in <strong id="folderSeedName"></strong></span>
         <button class="btn btn-primary btn-sm" onclick="seedFolder()">Choose photos…</button>
@@ -584,6 +599,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <div class="batch-bar" id="batchBar" style="display:none">
   <span><strong id="batchCount">0</strong> selected</span>
   <button class="btn btn-primary btn-sm" onclick="batchSetLocation()">📍 Set location…</button>
+  <button class="btn btn-ghost btn-sm" onclick="openRenameModal()">✏️ Rename…</button>
   <button class="btn btn-green btn-sm" id="batchSaveBtn" onclick="batchSave()">💾 Save</button>
   <button class="btn btn-ghost btn-sm" onclick="clearSelection()">✕</button>
 </div>
@@ -610,6 +626,27 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div style="display:flex;gap:8px">
       <button class="btn btn-primary" onclick="applyBatchLocation()">Apply to <span id="batchCountPrompt">0</span></button>
       <button class="btn btn-ghost" onclick="closeBatchPrompt()">Cancel</button>
+    </div>
+  </div>
+</div>
+
+<!-- Batch rename -->
+<div class="detail-overlay" id="renameModal" style="display:none" onclick="closeRenameModal(event)">
+  <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+              width:100%;max-width:520px;padding:22px;max-height:80vh;display:flex;flex-direction:column"
+       onclick="event.stopPropagation()">
+    <h3 style="margin-bottom:10px">✏️ Rename <span id="renameCount">0</span> photos</h3>
+    <div class="field-group" style="margin-bottom:8px">
+      <div class="field-label">Pattern</div>
+      <input class="field-input" id="renamePattern" type="text" value="{date}_{location}_{seq}{ext}"
+             oninput="previewRename()"/>
+      <div class="field-hint">Tokens: {date} {time} {location} {seq} {orig} {ext}. Numbering restarts each day.</div>
+    </div>
+    <div id="renamePreviewList" style="overflow-y:auto;flex:1;min-height:80px;font-family:var(--mono);font-size:11px;
+         background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:8px;margin-bottom:12px"></div>
+    <div style="display:flex;gap:8px">
+      <button class="btn btn-primary" onclick="applyRename()">Rename</button>
+      <button class="btn btn-ghost" onclick="closeRenameModal()">Cancel</button>
     </div>
   </div>
 </div>
@@ -909,8 +946,13 @@ async function openPendingModal() {
     d.pending.forEach(p => {
       const item = document.createElement('div');
       item.className = 'pending-item';
-      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date', rotate_degrees:'Rotation'};
-      const fmtVal = (field,v) => field==='rotate_degrees' && v ? v+'°' : (v||'—');
+      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date',
+                            rotate_degrees:'Rotation', rename:'Filename', move_to_duplicates:'Duplicate cleanup'};
+      const fmtVal = (field,v) => {
+        if (field==='rotate_degrees') return v ? v+'°' : '—';
+        if (field==='move_to_duplicates') return v ? 'Move to _duplicates/' : '—';
+        return v || '—';
+      };
       const changes = p.changes.map(c => `
         <div class="pending-change">
           <span class="pending-field">${fieldLabels[c.field]||c.field}</span>
@@ -1040,7 +1082,7 @@ async function loadResult() {
   // A first scan has nowhere else to land, so jump to the grid. A
   // background rescan should only refresh the grid in place if that's
   // actually what's on screen — never yank the user back to it.
-  if (firstLoad) setFilter('all');
+  if (firstLoad) setFilter(_restoredFilter || 'all');
   else if (_activeView==='grid') renderGrid();
   document.getElementById('libraryActions').style.display='';
   ['statsPill','rescanBtn'].forEach(id=>document.getElementById(id).style.display='');
@@ -1085,12 +1127,41 @@ function setFilter(f) {
   document.getElementById('filter-'+f).classList.add('active');
   document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
   applyFilter(f);
+  saveViewPrefs();
 }
 // Recomputes `filtered` from currentFilter/currentFolder without touching
 // which view is on screen — safe to call from a background refresh (e.g.
 // after a rescan) whether or not the grid happens to be visible right now.
 let searchQuery='';
-function setSearch(v){ searchQuery=v; recomputeFiltered(); renderGrid(); }
+function setSearch(v){ searchQuery=v; recomputeFiltered(); renderGrid(); saveViewPrefs(); }
+
+// ── View preferences (persisted across reloads/session switches) ──
+// Filter/sort/search/density used to reset to defaults on every page load,
+// which meant re-opening the app on a big library always started back at
+// "All" with default sort/size. None of this is safety-sensitive (unlike
+// dry_run, which is deliberately server-owned and re-armed every load), so
+// plain localStorage is fine.
+let _restoredFilter = null;
+function saveViewPrefs(){
+  try{
+    localStorage.setItem('pt_view_prefs', JSON.stringify(
+      {filter:currentFilter, sort:currentSort, search:searchQuery, density:_gridDensity}));
+  }catch(e){ /* private mode / quota — view prefs just won't persist */ }
+}
+function loadViewPrefs(){
+  try{ return JSON.parse(localStorage.getItem('pt_view_prefs')) || {}; }
+  catch(e){ return {}; }
+}
+let _gridDensity='medium';
+const GRID_DENSITY_PX={small:140, medium:190, large:260};
+function setGridDensity(d, persist=true){
+  _gridDensity = GRID_DENSITY_PX[d] ? d : 'medium';
+  const grid=document.getElementById('photoGrid');
+  if(grid) grid.style.setProperty('--card-min', GRID_DENSITY_PX[_gridDensity]+'px');
+  document.querySelectorAll('.density-btn').forEach(b=>
+    b.classList.toggle('active-density', b.dataset.density===_gridDensity));
+  if(persist) saveViewPrefs();
+}
 
 function recomputeFiltered() {
   filtered = currentFilter==='all' ? [...allPhotos] : allPhotos.filter(p=>p.status===currentFilter);
@@ -1105,7 +1176,7 @@ function applyFilter(f) {
   recomputeFiltered();
   showGrid(); renderGrid();
 }
-function setSort(s) { currentSort=s; renderGrid(); }
+function setSort(s) { currentSort=s; renderGrid(); saveViewPrefs(); }
 function sortedFiltered() {
   const a=[...filtered];
   if (currentSort==='date') a.sort((x,y)=>(x.date_taken||'').localeCompare(y.date_taken||''));
@@ -1456,6 +1527,17 @@ function openDetail(idx) {
       dh.style.color='var(--green)';
     } else { dh.textContent=''; }
   }
+  const exifParts=[p.camera,p.lens].filter(Boolean);
+  const exifLine2=[p.aperture,p.shutter,p.iso?`ISO ${p.iso}`:'',p.focal_length].filter(Boolean).join(' · ');
+  const exifGroup=document.getElementById('detailExifGroup');
+  if(exifParts.length||exifLine2){
+    exifGroup.style.display='block';
+    document.getElementById('detailExifInfo').innerHTML =
+      (exifParts.length?`<div>${escapeHtml(exifParts.join(' — '))}</div>`:'')
+      + (exifLine2?`<div>${escapeHtml(exifLine2)}</div>`:'');
+  } else {
+    exifGroup.style.display='none';
+  }
   document.getElementById('detailOverlay').style.display='flex';
   onCoordsChanged();
 }
@@ -1661,6 +1743,44 @@ async function batchSave(){
 // ── Duplicates ─────────────────────────────────────────────────────
 let _dupPoll=null;
 
+// ── Rename (batch) ──────────────────────────────────────────────
+function openRenameModal(){
+  if(!selected.size){ toast('Select photos first'); return; }
+  document.getElementById('renameCount').textContent=selected.size;
+  document.getElementById('renamePattern').value='{date}_{location}_{seq}{ext}';
+  document.getElementById('renameModal').style.display='flex';
+  previewRename();
+}
+function closeRenameModal(e){
+  if(e&&e.target!==document.getElementById('renameModal'))return;
+  document.getElementById('renameModal').style.display='none';
+}
+let _renamePreview=[];
+async function previewRename(){
+  const pattern=document.getElementById('renamePattern').value.trim()||'{date}_{location}_{seq}{ext}';
+  const ids=[...selected];
+  const r=await fetch('/api/rename_preview',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({ids,pattern})});
+  const d=await r.json();
+  _renamePreview=d.preview||[];
+  const list=document.getElementById('renamePreviewList');
+  list.innerHTML = _renamePreview.map(p=>
+    `<div style="${p.unchanged?'color:var(--text-dim)':''}">${escapeHtml(p.old_filename)} → ${escapeHtml(p.new_filename)}</div>`
+  ).join('') || '<div style="color:var(--text-dim)">Nothing selected.</div>';
+}
+async function applyRename(){
+  const items=_renamePreview.filter(p=>!p.unchanged).map(p=>({id:p.id,new_filename:p.new_filename}));
+  if(!items.length){ toast('No filenames would change'); return; }
+  const r=await fetch('/api/rename_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({items,dry_run:dryRun})});
+  const d=await r.json();
+  const ok=(d.results||[]).filter(x=>x.ok&&!x.skipped).length;
+  toast(dryRun?`Staged ${ok} rename(s) — review in pending changes`:`Renamed ${ok} photo(s)`,'success');
+  document.getElementById('renameModal').style.display='none';
+  refreshPendingBar();
+  if(!dryRun && currentScanRoot) await loadResult();
+}
+
 async function showDuplicates(force){
   document.getElementById('emptyState').style.display='none';
   document.getElementById('gridContainer').style.display='none';
@@ -1713,40 +1833,121 @@ async function showDuplicates(force){
   },500);
 }
 
+let _dupMarks = new Set();
+let _dupGroups = {};
+let _dupPhotoById = {};
+
 async function renderDupResult(){
   const list=document.getElementById('dupList');
   const d=await (await fetch('/api/duplicates/result')).json();
   if(d.error){ list.innerHTML=`<div style="color:var(--red);padding:20px">${d.error}</div>`; return; }
   document.getElementById('dupSummary').textContent =
     `${d.total_groups} group${d.total_groups!==1?'s':''} across ${d.scanned} photos`;
+  _dupMarks.clear(); _dupGroups={}; _dupPhotoById={};
   if(!d.total_groups){
     list.innerHTML='<div style="color:var(--green);padding:20px">✓ No duplicates found.</div>';
     return;
   }
   list.innerHTML='';
+  let _dupGroupSeq=0;
   const renderGroup=(photos,label,color,note)=>{
+    const groupKey='g'+(_dupGroupSeq++);
+    _dupGroups[groupKey]=photos.map(p=>p.id);
+    photos.forEach(p=>_dupPhotoById[p.id]=p);
     const g=document.createElement('div'); g.className='dup-group';
     g.innerHTML=`<div class="dup-group-header">
         <span style="color:${color};font-weight:700">${label}</span>
         <span style="color:var(--text-muted)">${photos.length} photos</span>
         ${note?`<span style="color:var(--text-dim);font-size:11px">${note}</span>`:''}
+        <div class="toolbar-spacer"></div>
+        <button class="btn btn-ghost btn-sm" onclick="autoPickGroup('${groupKey}')">🪄 Auto-pick best</button>
+        <button class="btn btn-red btn-sm" onclick="resolveGroup('${groupKey}')">🗑️ Move marked</button>
       </div>
-      <div class="dup-photos">${photos.map(p=>`
-        <div class="dup-card" title="${escapeHtml(p.path)}">
-          <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
-               onerror="this.style.display='none'"/>
-          ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
-          <div class="dup-card-info">
-            <div class="dup-card-name">${escapeHtml(p.filename)}</div>
-            <div class="dup-card-meta">${p.size_kb}KB · ${escapeHtml(p.folder)||'root'}</div>
-          </div>
-        </div>`).join('')}
-      </div>`;
+      <div class="dup-photos">${photos.map(renderDupCard).join('')}</div>`;
     list.appendChild(g);
   };
   (d.exact_groups||[]).forEach(g=>renderGroup(g,'⧉ Identical files','var(--red)','byte-for-byte match'));
   (d.phash_groups||[]).forEach(g=>renderGroup(g,'🔍 Visually similar','var(--purple)','resized / re-exported / edited'));
   (d.fname_groups||[]).forEach(g=>renderGroup(g,'📄 Filename pattern','var(--gold)','e.g. name (1).jpg'));
+}
+
+function renderDupCard(p){
+  const idAttr=p.id.replace(/'/g,"\\'");
+  return `<div class="dup-card" title="${escapeHtml(p.path)}" data-id="${escapeHtml(p.id)}">
+      <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
+           onerror="this.style.display='none'"/>
+      ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
+      <div class="dup-card-info">
+        <div class="dup-card-name">${escapeHtml(p.filename)}</div>
+        <div class="dup-card-meta">${p.size_kb}KB · ${escapeHtml(p.folder)||'root'}</div>
+        <label class="dup-card-mark">
+          <input type="checkbox" onchange="toggleDupMark(this,'${idAttr}')"/> Move to _duplicates
+        </label>
+      </div>
+    </div>`;
+}
+
+function toggleDupMark(cb,id){
+  if(cb.checked) _dupMarks.add(id); else _dupMarks.delete(id);
+  cb.closest('.dup-card').classList.toggle('remove', cb.checked);
+}
+
+// Picks the highest-priority, then largest, photo in a group to keep and
+// marks every other photo in it for removal — a fast starting point the
+// user can still hand-adjust before resolving.
+function autoPickGroup(groupKey){
+  const ids=_dupGroups[groupKey]||[];
+  if(ids.length<2) return;
+  const rank={gps:5,history:4,inferred:3,named:2,unknown:1};
+  const photos=ids.map(id=>_dupPhotoById[id]).filter(Boolean);
+  const best=photos.slice().sort((a,b)=>
+    (rank[b.status]||0)-(rank[a.status]||0) || (b.size_kb||0)-(a.size_kb||0))[0];
+  photos.forEach(p=>{
+    const card=document.querySelector(`.dup-card[data-id="${CSS.escape(p.id)}"]`);
+    if(!card) return;
+    const cb=card.querySelector('input[type=checkbox]');
+    const remove=p.id!==best.id;
+    cb.checked=remove;
+    card.classList.toggle('remove',remove);
+    card.classList.toggle('keep',!remove);
+    if(remove) _dupMarks.add(p.id); else _dupMarks.delete(p.id);
+  });
+}
+
+async function resolveGroup(groupKey){
+  const ids=(_dupGroups[groupKey]||[]).filter(id=>_dupMarks.has(id));
+  if(!ids.length){ toast('Check at least one photo to move first'); return; }
+  await _resolveDuplicateIds(ids);
+}
+
+async function autoResolveAllDuplicates(){
+  Object.keys(_dupGroups).forEach(autoPickGroup);
+  const ids=[..._dupMarks];
+  if(!ids.length){ toast('No duplicates to resolve'); return; }
+  await _resolveDuplicateIds(ids);
+}
+
+// Shared by resolveGroup() and autoResolveAllDuplicates() — moves files to
+// _duplicates/ (or, with dry run on, stages the move as a pending change
+// reviewed the same way as every other write) and refreshes both the
+// duplicate scan and the main grid once files actually move, since their
+// rows are gone from the library at that point.
+async function _resolveDuplicateIds(ids){
+  const msg = dryRun
+    ? `Stage moving ${ids.length} photo${ids.length!==1?'s':''} to _duplicates/? Review it like any other pending change before it actually moves.`
+    : `Move ${ids.length} photo${ids.length!==1?'s':''} to _duplicates/ now? This physically moves the files and removes them from the library.`;
+  if(!await customConfirm(msg,{danger:!dryRun})) return;
+  const r=await fetch('/api/duplicates/resolve',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({move_ids:ids,dry_run:dryRun})});
+  const d=await r.json();
+  const ok=(d.results||[]).filter(x=>x.ok).length;
+  const failed=(d.results||[]).length-ok;
+  toast(dryRun ? `Staged ${ok} move${ok!==1?'s':''} — review in pending changes`
+               : `Moved ${ok} photo${ok!==1?'s':''} to _duplicates/${failed?`, ${failed} failed`:''}`,
+        (failed&&!dryRun)?'error':'success');
+  ids.forEach(id=>_dupMarks.delete(id));
+  refreshPendingBar();
+  if(!dryRun){ await showDuplicates(true); if(currentScanRoot) await loadResult(); }
 }
 
 // ── Logs ───────────────────────────────────────────────────────────
@@ -2302,6 +2503,11 @@ initGridMarquee();
   try{
     const r=await fetch('/api/config'); const cfg=await r.json();
     _aiModel = cfg.ai_model||'';
+    const _vp=loadViewPrefs();
+    if(_vp.sort){ currentSort=_vp.sort; const sel=document.querySelector('.sort-select'); if(sel) sel.value=_vp.sort; }
+    if(_vp.search){ searchQuery=_vp.search; const si=document.getElementById('gridSearch'); if(si) si.value=_vp.search; }
+    setGridDensity(_vp.density||'medium', false);
+    _restoredFilter=_vp.filter||null;
     const inp=document.getElementById('folderInput');
     if(cfg.default_photo_root&&!inp.value) inp.value=inp.placeholder=cfg.default_photo_root;
     // Server re-arms dry run on every page load — reflect that, silently.

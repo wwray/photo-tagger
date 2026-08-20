@@ -63,7 +63,9 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Batch operations**: geocode all, tag a selection, save all at once
 - **Dry run by default**: every write is staged as a pending change and reviewed before anything touches disk (see below)
 - **Sessions**: save named scan roots so you can jump back into a library without re-typing the path
-- **Duplicate detection**: exact-byte, filename-pattern, and perceptual (pHash + dHash) matches, run as a background job with progress
+- **Duplicate detection**: exact-byte, filename-pattern, and perceptual (pHash + dHash) matches, run as a background job with progress, with a resolve workflow (auto-pick or hand-pick which copy to keep, move the rest to `_duplicates/`)
+- **Batch rename**: pattern-based (`{date} {time} {location} {seq} {orig} {ext}`), previewed before applying, through the same dry-run flow as everything else
+- **Camera metadata**: make/model, lens, aperture, shutter speed, ISO, and focal length shown in the detail view when present
 
 ---
 
@@ -230,6 +232,43 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Added: duplicate resolution — move straight to `_duplicates/` from the
+Duplicates view.** Duplicate detection used to be display-only: it found
+exact, visually-similar, and filename-pattern groups but gave you no way to
+act on them. Each group now has a checkbox per photo ("move to
+_duplicates"), a per-group "Auto-pick best" (keeps the highest-status,
+largest copy, marks the rest) and "Move marked" action, plus a top-level
+"Auto-resolve all" for the whole scan. This physically moves files, not a
+delete — nothing is destroyed, so a bad call is recoverable by hand from
+`_duplicates/` — and goes through the same server-side dry-run gate as
+every other write: with dry run on, a move is staged as an ordinary pending
+change and shows up in the existing "Review pending changes" modal. The
+scan walk now excludes `_duplicates/` itself, so a moved file can't get
+silently re-imported as "new" on the next scan.
+
+**Added: batch rename by pattern.** Select photos and Rename… in the batch
+bar to preview and apply a filename pattern (`{date} {time} {location}
+{seq} {orig} {ext}` tokens; numbering restarts each day). `rename_log` and
+`photos.original_filename` already existed in the schema for exactly this
+— added ahead of time, never wired up until now. Renames go through the
+same dry-run gate as everything else (staged as a pending change, reviewed
+before anything touches disk), physically rename the file's XMP sidecar
+alongside it if one exists, and keep the very first filename a photo ever
+had in `original_filename` even across repeated renames.
+
+**Added: camera/lens/exposure info in the detail view.** `exifread` was
+already parsing this out of every photo during a scan; it just wasn't kept.
+Camera make/model, lens, aperture, shutter speed, ISO, and focal length
+(where present in the file) now show under the GPS fields.
+
+**Added: grid density control, and the grid now remembers your filter, sort,
+search, and card size across reloads and session switches.** Previously
+every page load reset to "All", default sort, and default card size no
+matter what you'd last used — mildly annoying on every single visit to a
+large library. Stored in `localStorage`, not server-side (unlike `dry_run`,
+which is deliberately re-armed every load for safety — view preferences
+aren't safety-sensitive).
 
 **Fixed: switching sessions re-scanned the whole folder from disk every
 time, and could silently break the scan you switched away from.**
