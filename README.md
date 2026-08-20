@@ -55,11 +55,13 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Scans** any folder recursively for JPEG and RAW photos (CR2, NEF, ARW, ORF, RW2, DNG)
 - **Reads EXIF**: date taken, GPS coordinates, existing location tags
 - **Reverse geocodes** GPS coordinates to human-readable city/country names (OpenStreetMap, free, no API key)
-- **Infers locations** for un-GPS-tagged photos based on nearby timestamped photos (±4 hour window)
+- **Infers locations** for un-GPS-tagged photos based on nearby timestamped photos (±4 hour window), automatically on every scan and on demand via **📍 Infer Nearby** right after tagging a photo by hand — no rescan needed to propagate it to siblings; the matched place name is filled in too, not just coordinates
 - **Location history import**: match un-GPS-tagged photos against an imported Google Takeout `Records.json` or GPX track by timestamp — offline, no API key, and more reliable than inferring from other photos since it's where *you* actually were (see below)
 - **AI suggestions** via Claude API for photos that can't be auto-inferred (optional)
 - **Writes metadata back** directly into JPEG EXIF, or XMP sidecar files for RAW formats
 - **Rotate**: 90°/180°/270° rotation from the detail view, previewed live before saving, applied through the same dry-run flow as everything else (JPEG only — see below)
+- **Zoom and pan** the detail view photo with the mouse wheel and drag, to check a detail before confirming a location
+- **Map picker with place/address search**: type a place name to jump the map there instead of panning/scrolling by hand
 - **Batch operations**: geocode all, tag a selection, save all at once
 - **Dry run by default**: every write is staged as a pending change and reviewed before anything touches disk (see below)
 - **Sessions**: save named scan roots so you can jump back into a library without re-typing the path
@@ -232,6 +234,53 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Added: scroll-to-zoom and drag-to-pan on the detail view photo.** Mouse
+wheel over the image zooms in/out (1×–6×, clamped); once zoomed, drag to
+pan around, and double-click to reset back to fit. A CSS-only preview
+like rotation — nothing written to the file — and combines correctly
+with an in-progress rotation instead of the two stomping on each other's
+`transform`. Resets whenever a different photo opens or a save reloads
+the image.
+
+**Added: search by place name or address in the map picker.** The 🗺️ Map
+modal (single-photo detail view, batch "Set location", and the Propagate
+workflow) had no way to *get* anywhere except panning/scrolling by hand.
+A search box now queries Nominatim's forward-geocoding endpoint and lists
+up to 5 candidates — pick one to fly the map there and drop a pin,
+same as clicking the map directly. Shares the existing reverse-geocode's
+rate limiter (`_geocode_throttle()`, factored out of `reverse_geocode()`
+so both endpoints go through the same ~1 req/sec gate Nominatim's usage
+policy requires).
+
+**Added: on-demand "📍 Infer Nearby."** The nearest-in-time GPS-cluster
+match that previously only ran as part of a full scan now also runs
+on demand — tag one photo by hand, click **📍 Infer Nearby**, and every
+other untagged photo in that scan root within 4 hours of a GPS-tagged
+photo gets that photo's coordinates copied in as an 'inferred' guess,
+immediately, without waiting for the next scan. The scan-triggered pass
+and the button now share one `_infer_locations()` implementation.
+Inferring also fills in a location *name*, not just coordinates: it
+reuses the matched neighbor's name if it already has one, otherwise
+reverse-geocodes the matched point once per distinct neighbor (cached
+across the pass, since many targets typically share the same nearest
+neighbor) — so an inferred photo already reads as a place, not bare
+lat/lon, the moment you open it. Still just a guess until you hit
+**💾 Save to file** on that photo.
+
+**Fixed: the Unraid Community Applications template pulled from nowhere.**
+`docker-publish.yml` builds and pushes to `ghcr.io/wwray/photo-tagger`,
+but `phototagger-unraid.xml` pointed at a bare `phototagger:latest` with
+no registry — Unraid had nothing to check for updates against, so a fix
+merged to `main` never reached a container using this template no matter
+how many times "Force Update" was clicked; only a fully manual local
+rebuild picked it up. Repository now points at the actual published
+image. **If you're on the old template**, edit the container in Unraid
+(or re-add it from this XML) and point Repository at
+`ghcr.io/wwray/photo-tagger:latest` — Community Applications will then
+detect and offer real updates going forward. (The GHCR package also
+needs to be public, or set to inherit the repo's visibility, for an
+anonymous `docker pull` to succeed.)
 
 **Added: duplicate resolution — move straight to `_duplicates/` from the
 Duplicates view.** Duplicate detection used to be display-only: it found

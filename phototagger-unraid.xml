@@ -3,8 +3,14 @@
 
   <!-- ── Basic info ─────────────────────────────────────────────── -->
   <Name>PhotoTagger</Name>
-  <Repository>phototagger:latest</Repository>
-  <Registry></Registry>
+  <!-- Must match what .github/workflows/docker-publish.yml actually pushes
+       (ghcr.io/<owner>/<repo>, lowercased) — a bare "phototagger:latest"
+       here means Unraid has no registry to check against, so it can never
+       see or pull a new build; you're stuck rebuilding by hand forever,
+       which is how fixes already in git go quietly missing from what's
+       actually running. -->
+  <Repository>ghcr.io/wwray/photo-tagger:latest</Repository>
+  <Registry>https://ghcr.io/wwray/photo-tagger</Registry>
   <Network>bridge</Network>
   <Shell>bash</Shell>
   <Privileged>false</Privileged>

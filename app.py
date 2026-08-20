@@ -586,12 +586,18 @@ def compute_hashes(filepath):
     except Exception: pass
     return file_hash, phash_str, dhash_str
 
-def reverse_geocode(lat, lon):
+def _geocode_throttle():
+    """Nominatim's usage policy caps anonymous use at ~1 req/sec — every
+    call that hits it (reverse or forward) goes through this one gate
+    so the limit holds regardless of which endpoint is calling."""
     global _last_geocode
     with _geocode_lock:
         wait = GEOCODE_DELAY - (time.time() - _last_geocode)
         if wait > 0: time.sleep(wait)
         _last_geocode = time.time()
+
+def reverse_geocode(lat, lon):
+    _geocode_throttle()
     try:
         r = requests.get("https://nominatim.openstreetmap.org/reverse",
             params={"lat":lat,"lon":lon,"format":"json","zoom":14},
@@ -603,6 +609,21 @@ def reverse_geocode(lat, lon):
         if "country" in addr: parts.append(addr["country"])
         return ", ".join(parts) if parts else r.json().get("display_name","")
     except Exception: return None
+
+def forward_geocode_search(query, limit=5):
+    """Address/place-name -> candidate list of {name,lat,lon}, for the map
+    picker's search box. Nominatim's free-text /search endpoint, not the
+    /reverse one reverse_geocode() uses."""
+    _geocode_throttle()
+    try:
+        r = requests.get("https://nominatim.openstreetmap.org/search",
+            params={"q":query,"format":"json","limit":limit},
+            headers={"User-Agent":"PhotoTagger/1.0"}, timeout=10)
+        return [{"name":x.get("display_name",""),
+                  "lat":float(x["lat"]),"lon":float(x["lon"])}
+                for x in r.json()]
+    except Exception:
+        return None
 
 def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str=None):
     ext = Path(filepath).suffix.lower()
@@ -867,6 +888,83 @@ _scan_lock  = threading.Lock()
 
 def _log(msg): print(msg, flush=True)
 
+def _infer_locations(conn, folder):
+    """Nearest-in-time GPS match: for every photo in `folder` that isn't
+    already GPS/named/inferred/history-tagged, find the closest-in-time
+    GPS-tagged photo in the same scan root and — if it's within 4 hours —
+    copy its coordinates in as an 'inferred' guess. Pulled out of the scan
+    pipeline so it can also run on demand (see /api/infer_nearby) without
+    the EXIF re-read and hashing a full scan does, so a photo tagged by
+    hand a moment ago can propagate to its siblings immediately instead of
+    waiting for the next scan. Returns the number of photos updated.
+
+    Also fills in a location *name*, not just coordinates, so an inferred
+    photo already reads as a place when you open it rather than bare
+    lat/lon: reuses the matched neighbor's name if it has one, otherwise
+    reverse-geocodes the matched coordinates once per distinct neighbor
+    (cached across the whole pass — many targets typically share the same
+    nearest neighbor) and reuses that. reverse_geocode() already
+    self-rate-limits, so this is safe to call inline here.
+    """
+    _name_cache = {}
+    def _name_for(neighbor):
+        if neighbor.get("location_name"):
+            return neighbor["location_name"]
+        if neighbor["id"] not in _name_cache:
+            _name_cache[neighbor["id"]] = reverse_geocode(neighbor["lat"], neighbor["lon"])
+        return _name_cache[neighbor["id"]]
+    all_db = rows_to_dicts(conn.execute(
+        "SELECT * FROM photos WHERE scan_root=?", (folder,)).fetchall())
+
+    # Pre-parse + sort every GPS photo's timestamp once, then bisect per
+    # candidate. This used to re-parse every GPS photo's datetime string
+    # inside the inner loop for every non-GPS candidate — an O(N×M) scan
+    # with repeated parsing, the exact bug class already fixed once for
+    # duplicate detection (11 min → 3 sec there). On a library with a
+    # few thousand of each this was easily minutes; sorted + bisect
+    # finds the same true nearest-in-time match in a couple of seconds.
+    gps_ts, gps_sorted = [], []
+    for p in all_db:
+        if not (p["has_gps"] and p["date_taken"]):
+            continue
+        try:
+            gps_ts.append((datetime.fromisoformat(p["date_taken"]) - _EPOCH).total_seconds())
+            gps_sorted.append(p)
+        except ValueError:
+            continue
+    order = sorted(range(len(gps_ts)), key=lambda i: gps_ts[i])
+    gps_ts     = [gps_ts[i] for i in order]
+    gps_sorted = [gps_sorted[i] for i in order]
+
+    inferred = 0
+    for photo in all_db:
+        # 'history' (matched against imported location history, if any)
+        # is a stronger signal than a same-folder GPS-cluster guess —
+        # don't let this pass clobber it back down to 'inferred'.
+        if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"] or not gps_ts:
+            continue
+        try:
+            epoch = (datetime.fromisoformat(photo["date_taken"]) - _EPOCH).total_seconds()
+        except ValueError:
+            continue
+        ins = bisect.bisect_left(gps_ts, epoch)
+        best_idx, best_delta = None, float("inf")
+        for j in (ins - 1, ins):
+            if 0 <= j < len(gps_ts):
+                delta = abs(gps_ts[j] - epoch)
+                if delta < best_delta:
+                    best_delta, best_idx = delta, j
+        if best_idx is not None and best_delta <= 4*3600:
+            best = gps_sorted[best_idx]
+            conn.execute("""UPDATE photos SET inferred_lat=?,inferred_lon=?,
+                inferred_from=?,inferred_delta_min=?,status='inferred',
+                location_name=COALESCE(?,location_name)
+                WHERE id=?""",
+                (best["lat"],best["lon"],best["filename"],
+                 round(best_delta/60),_name_for(best),photo["id"]))
+            inferred += 1
+    return inferred
+
 def _run_scan(folder, rescan=False):
     base = Path(folder)
     now_iso = datetime.now().isoformat()
@@ -959,55 +1057,7 @@ def _run_scan(folder, rescan=False):
                                message="Inferring locations from GPS clusters…")
         _log("[scan] Inferring locations…")
 
-        all_db = rows_to_dicts(conn.execute(
-            "SELECT * FROM photos WHERE scan_root=?", (folder,)).fetchall())
-
-        # Pre-parse + sort every GPS photo's timestamp once, then bisect per
-        # candidate. This used to re-parse every GPS photo's datetime string
-        # inside the inner loop for every non-GPS candidate — an O(N×M) scan
-        # with repeated parsing, the exact bug class already fixed once for
-        # duplicate detection (11 min → 3 sec there). On a library with a
-        # few thousand of each this was easily minutes; sorted + bisect
-        # finds the same true nearest-in-time match in a couple of seconds.
-        gps_ts, gps_sorted = [], []
-        for p in all_db:
-            if not (p["has_gps"] and p["date_taken"]):
-                continue
-            try:
-                gps_ts.append((datetime.fromisoformat(p["date_taken"]) - _EPOCH).total_seconds())
-                gps_sorted.append(p)
-            except ValueError:
-                continue
-        order = sorted(range(len(gps_ts)), key=lambda i: gps_ts[i])
-        gps_ts     = [gps_ts[i] for i in order]
-        gps_sorted = [gps_sorted[i] for i in order]
-
-        inferred = 0
-        for photo in all_db:
-            # 'history' (matched against imported location history, if any)
-            # is a stronger signal than a same-folder GPS-cluster guess —
-            # don't let this pass clobber it back down to 'inferred'.
-            if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"] or not gps_ts:
-                continue
-            try:
-                epoch = (datetime.fromisoformat(photo["date_taken"]) - _EPOCH).total_seconds()
-            except ValueError:
-                continue
-            ins = bisect.bisect_left(gps_ts, epoch)
-            best_idx, best_delta = None, float("inf")
-            for j in (ins - 1, ins):
-                if 0 <= j < len(gps_ts):
-                    delta = abs(gps_ts[j] - epoch)
-                    if delta < best_delta:
-                        best_delta, best_idx = delta, j
-            if best_idx is not None and best_delta <= 4*3600:
-                best = gps_sorted[best_idx]
-                conn.execute("""UPDATE photos SET inferred_lat=?,inferred_lon=?,
-                    inferred_from=?,inferred_delta_min=?,status='inferred'
-                    WHERE id=?""",
-                    (best["lat"],best["lon"],best["filename"],
-                     round(best_delta/60),photo["id"]))
-                inferred += 1
+        inferred = _infer_locations(conn, folder)
         conn.commit()
         _log(f"[scan] Inferred {inferred} locations")
 
@@ -1317,6 +1367,16 @@ def api_geocode():
     if lat is None or lon is None:
         return jsonify({"error":"lat/lon required"}), 400
     return jsonify({"location_name": reverse_geocode(lat,lon)})
+
+@app.route("/api/geocode_search")
+def api_geocode_search():
+    q = (request.args.get("q") or "").strip()
+    if not q:
+        return jsonify({"results":[]})
+    results = forward_geocode_search(q)
+    if results is None:
+        return jsonify({"error":"Search failed","results":[]}), 502
+    return jsonify({"results":results})
 
 # ── Save ──────────────────────────────────────────────────────────
 @app.route("/api/save", methods=["POST"])
@@ -1968,6 +2028,27 @@ def api_history_match():
 def api_history_match_progress():
     with _hist_match_lock:
         return jsonify(dict(_hist_match_state))
+
+# ── On-demand nearest-in-time infer ────────────────────────────────
+@app.route("/api/infer_nearby", methods=["POST"])
+def api_infer_nearby():
+    data   = request.json or {}
+    folder = data.get("scan_root")
+    if not folder:
+        return jsonify({"error":"scan_root required"}), 400
+    db = _get_db()
+    # Snapshot statuses before the pass so the response can report only
+    # photos that just flipped to 'inferred' just now — not every
+    # already-inferred photo from a previous scan or a previous click.
+    before = {r["id"]: r["status"] for r in db.execute(
+        "SELECT id,status FROM photos WHERE scan_root=?", (folder,))}
+    _infer_locations(db, folder)
+    db.commit()
+    rows = rows_to_dicts(db.execute(
+        """SELECT id,inferred_lat,inferred_lon,inferred_from,inferred_delta_min,status,location_name
+           FROM photos WHERE scan_root=? AND status='inferred'""", (folder,)).fetchall())
+    changed = [r for r in rows if before.get(r["id"]) != "inferred"]
+    return jsonify({"ok":True, "count":len(changed), "photos":changed})
 
 # ── AI infer ──────────────────────────────────────────────────────
 @app.route("/api/ai_infer", methods=["POST"])

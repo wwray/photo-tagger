@@ -229,8 +229,14 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .detail-panel{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius-lg);width:100%;max-width:min(94vw,1400px);max-height:92vh;
   overflow:hidden;display:grid;grid-template-columns:1fr 360px}
-.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px;position:relative}
+.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px;
+  position:relative;overflow:hidden}
 .detail-img-wrap img{max-width:100%;max-height:82vh;object-fit:contain;display:block;transition:transform .2s}
+.detail-img-wrap.zoomed img{transition:none} /* dragging shouldn't lag behind the cursor */
+.zoom-hint{position:absolute;top:10px;right:10px;background:rgba(15,17,23,.65);color:#fff;
+  font-size:11px;padding:3px 8px;border-radius:10px;backdrop-filter:blur(4px);pointer-events:none;
+  opacity:0;transition:opacity .2s}
+.detail-img-wrap.zoomed .zoom-hint{opacity:1}
 .rotate-controls{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);display:flex;gap:6px;
   background:rgba(15,17,23,.65);border-radius:20px;padding:5px;backdrop-filter:blur(4px)}
 .rotate-controls .btn{background:transparent;color:#fff;border:none;font-size:17px;line-height:1;
@@ -296,6 +302,14 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   display:flex;align-items:center;gap:8px}
 .map-coords{font-family:var(--mono);font-size:12px;color:var(--text-muted);flex:1}
 .map-coords strong{color:var(--accent)}
+.map-search{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--border);position:relative}
+.map-search .field-input{flex:1}
+.map-search-results{position:absolute;left:16px;right:16px;top:100%;margin-top:2px;z-index:10;
+  background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.map-search-result{padding:8px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid var(--border)}
+.map-search-result:last-child{border-bottom:none}
+.map-search-result:hover{background:var(--surface)}
 
 /* ── Folder seed bar ── */
 .folder-seed-bar{background:var(--accent-dim);border:1px solid var(--accent);border-radius:var(--radius);
@@ -426,6 +440,8 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div class="header-divider"></div>
     <div class="header-group" id="libraryActions" style="display:none">
       <button class="btn btn-ghost btn-sm" id="dupBtn" onclick="showDuplicates()">🔍 Duplicates</button>
+      <button class="btn btn-ghost btn-sm" id="inferNearbyBtn" onclick="inferNearby()"
+              title="For every untagged photo, copy in the location of the closest-in-time GPS-tagged photo (same folder tree, within 4 hours) — no rescan needed">📍 Infer Nearby</button>
       <button class="btn btn-gold btn-sm" id="geoBtn" onclick="batchGeocode()">🌍 Geocode</button>
       <button class="btn btn-green btn-sm" id="saveAllBtn" onclick="saveAll()">💾 Save All</button>
     </div>
@@ -536,8 +552,9 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <!-- Detail overlay -->
 <div class="detail-overlay" id="detailOverlay" style="display:none" onclick="closeDetail(event)">
   <div class="detail-panel" onclick="event.stopPropagation()">
-    <div class="detail-img-wrap">
+    <div class="detail-img-wrap" id="detailImgWrap" title="Scroll to zoom, drag to pan">
       <img id="detailImg" src="" alt=""/>
+      <span class="zoom-hint" id="zoomHint"></span>
       <div class="rotate-controls" id="rotateControls">
         <button class="btn btn-ghost btn-sm" id="rotateLeftBtn" onclick="rotateDetail(-90)" title="Rotate left 90°">⟲</button>
         <button class="btn btn-ghost btn-sm" id="rotateRightBtn" onclick="rotateDetail(90)" title="Rotate right 90°">⟳</button>
@@ -662,6 +679,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
         <button class="btn btn-ghost btn-sm" id="layerStreetBtn" onclick="setMapLayer('street')">🗺 Street</button>
       </div>
       <button class="close-btn" onclick="closeMapModal()">✕</button>
+    </div>
+    <div class="map-search">
+      <input class="field-input" id="mapSearchInput" type="text" placeholder="Search for a place or address…"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();mapSearch();}"/>
+      <button class="btn btn-ghost btn-sm" onclick="mapSearch()" id="mapSearchBtn">🔍 Search</button>
+      <div class="map-search-results" id="mapSearchResults" style="display:none"></div>
     </div>
     <div id="mapContainer"></div>
     <div class="map-footer">
@@ -1490,8 +1513,7 @@ function openDetail(idx) {
   // size=600 fetch was the real ceiling on how big the image could look,
   // no matter how much room the enlarged panel/CSS max-height gave it.
   document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400';
-  detailRotationDeg=0;
-  document.getElementById('detailImg').style.transform='';
+  detailRotationDeg=0; resetDetailZoom();
   const canRotate=/\.(jpe?g)$/i.test(p.filename);
   document.getElementById('rotateLeftBtn').disabled=!canRotate;
   document.getElementById('rotateRightBtn').disabled=!canRotate;
@@ -1567,8 +1589,54 @@ async function nextPhoto(){const a=sortedFiltered(); const i=detailPos(); if(i<a
 function rotateDetail(delta){
   if(document.getElementById('rotateLeftBtn').disabled) return;
   detailRotationDeg=(detailRotationDeg+delta+360)%360;
-  document.getElementById('detailImg').style.transform=`rotate(${detailRotationDeg}deg)`;
+  applyDetailTransform();
 }
+
+// ── Zoom / pan on the detail image ──────────────────────────────────
+// Both are CSS-only preview transforms, like rotation — nothing is written
+// to the file, and they reset whenever a different photo opens or a save
+// reloads the image (a stale pan offset on a freshly-loaded photo would be
+// disorienting, not a feature).
+let detailZoom=1, detailPanX=0, detailPanY=0;
+let _detailDragging=false, _dragStartX=0, _dragStartY=0, _panStartX=0, _panStartY=0;
+
+function applyDetailTransform(){
+  document.getElementById('detailImg').style.transform=
+    `translate(${detailPanX}px,${detailPanY}px) scale(${detailZoom}) rotate(${detailRotationDeg}deg)`;
+  const wrap=document.getElementById('detailImgWrap');
+  wrap.classList.toggle('zoomed', detailZoom>1);
+  document.getElementById('zoomHint').textContent = detailZoom>1 ? Math.round(detailZoom*100)+'%' : '';
+  wrap.style.cursor = detailZoom>1 ? (_detailDragging?'grabbing':'grab') : '';
+}
+function resetDetailZoom(){ detailZoom=1; detailPanX=0; detailPanY=0; applyDetailTransform(); }
+
+(function(){
+  const wrap=document.getElementById('detailImgWrap');
+  wrap.addEventListener('wheel', e=>{
+    if(document.getElementById('detailOverlay').style.display==='none') return;
+    e.preventDefault();
+    detailZoom=Math.min(6, Math.max(1, detailZoom*(e.deltaY<0?1.15:1/1.15)));
+    if(detailZoom===1){ detailPanX=0; detailPanY=0; }
+    applyDetailTransform();
+  }, {passive:false});
+  wrap.addEventListener('mousedown', e=>{
+    if(detailZoom<=1) return;
+    _detailDragging=true; _dragStartX=e.clientX; _dragStartY=e.clientY;
+    _panStartX=detailPanX; _panStartY=detailPanY;
+    applyDetailTransform(); // just to flip the cursor to 'grabbing'
+    e.preventDefault();
+  });
+  window.addEventListener('mousemove', e=>{
+    if(!_detailDragging) return;
+    detailPanX=_panStartX+(e.clientX-_dragStartX);
+    detailPanY=_panStartY+(e.clientY-_dragStartY);
+    applyDetailTransform();
+  });
+  window.addEventListener('mouseup', ()=>{
+    if(_detailDragging){ _detailDragging=false; applyDetailTransform(); }
+  });
+  wrap.addEventListener('dblclick', ()=>resetDetailZoom());
+})();
 
 // Shared by the detail panel's Geocode button, the batch prompt's Geocode
 // button, and the map picker's Confirm (for whichever of the two it's
@@ -1667,6 +1735,33 @@ async function saveDetail(){
     } else toast('Save failed: '+d.error,'error');
   }finally{
     btn.disabled=false; btn.textContent='💾 Save to file';
+  }
+}
+
+// On-demand nearest-in-time infer: the same GPS-cluster match the scan
+// pipeline runs automatically, but triggerable right after tagging a
+// photo by hand instead of waiting for the next scan to propagate it
+// to siblings.
+async function inferNearby(){
+  if(!currentScanRoot){toast('Scan a folder first','error');return;}
+  const btn=document.getElementById('inferNearbyBtn');
+  btn.disabled=true; const origText=btn.textContent; btn.textContent='📍 Inferring…';
+  try{
+    const r=await fetch('/api/infer_nearby',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({scan_root:currentScanRoot})});
+    const d=await r.json();
+    if(d.error){toast('Error: '+d.error,'error');return;}
+    d.photos.forEach(c=>{const p=allPhotos.find(x=>x.id===c.id); if(p) Object.assign(p,c);});
+    updateStats();
+    if(_activeView==='grid') renderGrid();
+    toast(d.count
+      ? `Inferred locations for ${d.count} photo${d.count!==1?'s':''} — review before saving`
+      : 'No new matches — nothing untagged within 4 hours of a GPS photo', d.count?'success':'');
+  }catch(err){
+    console.error('inferNearby failed:',err);
+    toast('Infer failed: '+(err.message||err),'error');
+  }finally{
+    btn.disabled=false; btn.textContent=origText;
   }
 }
 
@@ -2205,6 +2300,8 @@ function setMapLayer(t){
 function openMapPicker(target='detail'){
   _mapTarget=target;
   document.getElementById('mapModal').style.display='flex';
+  document.getElementById('mapSearchInput').value='';
+  document.getElementById('mapSearchResults').style.display='none';
   if(!_map){
     _map=L.map('mapContainer',{zoomControl:true}).setView([20,0],2);
     _satLayer=L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
@@ -2237,7 +2334,51 @@ function openMapPicker(target='detail'){
   }
   setTimeout(()=>_map.invalidateSize(),50);
 }
-function closeMapModal(e){if(e&&e.target!==document.getElementById('mapModal'))return;document.getElementById('mapModal').style.display='none';}
+function closeMapModal(e){
+  if(e&&e.target!==document.getElementById('mapModal'))return;
+  document.getElementById('mapModal').style.display='none';
+  document.getElementById('mapSearchResults').style.display='none';
+}
+
+// ── Map picker: search by place name / address ──────────────────────
+let _mapSearchResults=[];
+async function mapSearch(){
+  const q=document.getElementById('mapSearchInput').value.trim();
+  const resultsEl=document.getElementById('mapSearchResults');
+  if(!q){ resultsEl.style.display='none'; return; }
+  const btn=document.getElementById('mapSearchBtn');
+  btn.disabled=true; const orig=btn.textContent; btn.textContent='🔍 Searching…';
+  try{
+    const r=await fetch('/api/geocode_search?q='+encodeURIComponent(q));
+    const d=await r.json();
+    if(d.error){toast('Search failed: '+d.error,'error'); resultsEl.style.display='none'; return;}
+    _mapSearchResults=d.results||[];
+    if(!_mapSearchResults.length){
+      resultsEl.innerHTML='<div class="map-search-result" style="cursor:default;color:var(--text-dim)">No matches</div>';
+    } else {
+      resultsEl.innerHTML=_mapSearchResults.map((res,i)=>
+        `<div class="map-search-result" onclick="selectMapSearchResult(${i})">${escapeHtml(res.name)}</div>`).join('');
+    }
+    resultsEl.style.display='block';
+  }catch(err){
+    console.error('mapSearch failed:',err);
+    toast('Search failed: '+(err.message||err),'error');
+  }finally{
+    btn.disabled=false; btn.textContent=orig;
+  }
+}
+function selectMapSearchResult(i){
+  const res=_mapSearchResults[i];
+  if(!res) return;
+  document.getElementById('mapSearchResults').style.display='none';
+  _map.setView([res.lat,res.lon],14);
+  if(_mapMarker) _map.removeLayer(_mapMarker);
+  _mapMarker=L.marker([res.lat,res.lon]).addTo(_map);
+  _mapPin={lat:res.lat,lon:res.lon};
+  document.getElementById('mapCoords').innerHTML=
+    `Pin: <strong>${res.lat}, ${res.lon}</strong> — ${escapeHtml(res.name)}`;
+  document.getElementById('mapConfirmBtn').disabled=false;
+}
 
 async function confirmMapPin(){
   if(!_mapPin) return;
