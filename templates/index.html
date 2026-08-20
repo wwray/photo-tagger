@@ -239,6 +239,13 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .detail-img-wrap.zoomed .zoom-hint{opacity:1}
 .rotate-controls{position:absolute;bottom:14px;left:50%;transform:translateX(-50%);display:flex;gap:6px;
   background:rgba(15,17,23,.65);border-radius:20px;padding:5px;backdrop-filter:blur(4px)}
+.detail-nav-btn{position:absolute;top:50%;transform:translateY(-50%);width:44px;height:44px;
+  border-radius:50%;background:rgba(15,17,23,.55);border:none;color:#fff;font-size:22px;line-height:1;
+  display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .15s;z-index:2}
+.detail-nav-btn:hover:not(:disabled){background:rgba(15,17,23,.85)}
+.detail-nav-btn:disabled{opacity:.2;cursor:default}
+.detail-nav-prev{left:12px}
+.detail-nav-next{right:12px}
 .rotate-controls .btn{background:transparent;color:#fff;border:none;font-size:17px;line-height:1;
   padding:6px 12px;border-radius:16px}
 .rotate-controls .btn:hover:not(:disabled){background:rgba(255,255,255,.15)}
@@ -319,15 +326,24 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 /* ── Seed checklist ──
    Large thumbnails on purpose: this is a "does this photo actually belong
    at that location?" visual check, and a 44x33 thumbnail (the original
-   size) isn't enough to tell a hallway from a trailhead. */
+   size) isn't enough to tell a hallway from a trailhead.
+   The image box uses the old padding-top percentage-hack for its aspect
+   ratio, not the `aspect-ratio` property `.photo-thumb` uses elsewhere —
+   this box sits inside a deeper flex(column)-in-flex-in-grid-in-overflow
+   nest (.map-panel > #seedChecklist > .seed-grid) than the main grid does,
+   and that specific nesting is where `aspect-ratio` support has been
+   flaky in the past. The percentage-padding technique has no such
+   caveats on any browser, at the cost of being a bit more verbose. */
 .seed-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(210px,1fr));gap:14px}
 .seed-item{position:relative;border-radius:var(--radius-lg);border:2px solid var(--border);
   background:var(--surface2);cursor:pointer;user-select:none;overflow:hidden;
-  transition:border-color .15s,opacity .15s}
-.seed-item:hover{border-color:var(--accent)}
+  transition:border-color .15s,opacity .15s,transform .15s,box-shadow .15s}
+.seed-item:hover{border-color:var(--accent);transform:scale(1.45);z-index:5;
+  box-shadow:0 16px 40px rgba(0,0,0,.65)}
 .seed-item.checked{border-color:var(--accent)}
 .seed-item:not(.checked){opacity:.4}
-.seed-item img{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface)}
+.seed-thumb{position:relative;width:100%;padding-top:75%;overflow:hidden;background:var(--surface)}
+.seed-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .seed-item-info{padding:8px 10px}
 .seed-item-name{font-family:var(--mono);font-size:11px;color:var(--text-muted);
   white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
@@ -553,8 +569,10 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <div class="detail-overlay" id="detailOverlay" style="display:none" onclick="closeDetail(event)">
   <div class="detail-panel" onclick="event.stopPropagation()">
     <div class="detail-img-wrap" id="detailImgWrap" title="Scroll to zoom, drag to pan">
+      <button class="detail-nav-btn detail-nav-prev" id="detailPrevBtn" onclick="prevPhoto()" title="Previous (←)">←</button>
       <img id="detailImg" src="" alt=""/>
       <span class="zoom-hint" id="zoomHint"></span>
+      <button class="detail-nav-btn detail-nav-next" id="detailNextBtn" onclick="nextPhoto()" title="Next (→)">→</button>
       <div class="rotate-controls" id="rotateControls">
         <button class="btn btn-ghost btn-sm" id="rotateLeftBtn" onclick="rotateDetail(-90)" title="Rotate left 90°">⟲</button>
         <button class="btn btn-ghost btn-sm" id="rotateRightBtn" onclick="rotateDetail(90)" title="Rotate right 90°">⟳</button>
@@ -1508,6 +1526,8 @@ function openDetail(idx) {
   if(idx<0||idx>=arr.length) return;
   detailIndex=idx; const p=arr[idx]; detailId=p?p.id:null;
   detailDirty=false; // fields below are about to be overwritten with p's own values
+  document.getElementById('detailPrevBtn').disabled=idx<=0;
+  document.getElementById('detailNextBtn').disabled=idx>=arr.length-1;
   document.getElementById('detailFilename').textContent=p.path;
   // 1400 matches .detail-panel's new max-width — below that, the old
   // size=600 fetch was the real ceiling on how big the image could look,
@@ -2467,7 +2487,9 @@ function renderSeedGrid(){
     const alreadyTagged=t.has_gps||t.status==='named';
     const item=document.createElement('div'); item.className='seed-item'+(checked?' checked':''); item.dataset.id=t.id;
     item.innerHTML=`<div class="seed-checkbox">${checked?'✓':''}</div>
-      <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
+      <div class="seed-thumb">
+        <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
+      </div>
       <div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>
       <div class="seed-item-info"><div class="seed-item-name">${escapeHtml(t.filename)}</div>
         <div class="seed-item-date">${dt}${alreadyTagged?' · <span style="color:var(--gold)">will overwrite</span>':''}</div></div>`;

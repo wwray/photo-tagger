@@ -235,6 +235,38 @@ honor anyway.
 
 ### Unreleased
 
+**Fixed: every scan crashed during the geocoding phase with `NameError:
+name 'all_db' is not defined`.** Introduced when `_infer_locations()` was
+pulled out of the scan pipeline into its own function (see below): the
+geocode phase a few lines later, and the final per-status count in the
+"scan done" log line, were both still reading `all_db`, a variable that
+used to be computed inline in this scope and now only exists inside the
+new helper. EXIF reading and location inference (which run *before* this
+point and already commit to the database) were unaffected, but every
+scan silently died right after — no new geocoding happened, and the
+scan reported "failed" even though most of the work had, in fact,
+completed. Both spots now query the database directly instead of
+depending on the extracted function's leftover local state.
+
+**Fixed: "Propagate to folder" thumbnails render as thin squished strips
+for some users, even though the CSS looks correct and renders fine
+elsewhere (a real Chromium session reproduces the bug-free layout every
+time — this was hard to pin down).** The image box now uses the classic
+padding-top percentage hack for its aspect ratio instead of the modern
+`aspect-ratio` CSS property `.photo-thumb` uses in the main grid. This
+modal's image sits in a deeper nested context than the main grid does
+(`.map-panel`'s column flex → the checklist's own scrolling flex item →
+its CSS grid) and that specific nesting is a known trouble spot for
+`aspect-ratio` support in some browsers/versions; the percentage-padding
+technique has no such caveats anywhere. Also added a hover-to-enlarge
+effect on each photo — the whole card scales up in place — since "which
+one of these nearly-identical sky photos is this" was the actual
+underlying ask.
+
+**Added: Google Photos-style ← / → arrows on the detail view image**,
+alongside (not instead of) the existing bottom Prev/Next buttons.
+Disabled/dimmed at the start and end of the current filtered list.
+
 **Added: scroll-to-zoom and drag-to-pan on the detail view photo.** Mouse
 wheel over the image zooms in/out (1×–6×, clamped); once zoomed, drag to
 pan around, and double-click to reset back to fit. A CSS-only preview

@@ -1068,7 +1068,17 @@ def _run_scan(folder, rescan=False):
         # policy) is the real, already-documented pace ("Geocoding 500
         # photos takes ~10 min" — README); this just lets a scan finish the
         # whole backlog instead of stopping partway through it.
-        needs_geo = [p for p in all_db if p["has_gps"] and not p["location_name"]]
+        # Queried fresh rather than reusing a stale in-memory snapshot from
+        # before _infer_locations() ran — _infer_locations() used to leave
+        # its `all_db` list lying around in this same scope for exactly this
+        # filter to reuse, but now that it's a separate function that
+        # variable no longer exists here at all (a NameError on every scan
+        # that reached this phase, until this was caught: extracting a
+        # helper and missing a call site that depended on its leftover
+        # local state).
+        needs_geo = rows_to_dicts(conn.execute(
+            """SELECT * FROM photos WHERE scan_root=? AND has_gps=1
+               AND (location_name IS NULL OR location_name='')""", (folder,)).fetchall())
         _log(f"[scan] Geocoding {len(needs_geo)} GPS photos…")
         for i, photo in enumerate(needs_geo):
             with _scan_lock:
@@ -1081,10 +1091,16 @@ def _run_scan(folder, rescan=False):
                 if (i+1)%20==0: conn.commit()
             _log(f"[scan] Geocode {i+1}/{len(needs_geo)}: {photo['filename']} → {name}")
         conn.commit()
-        conn.close()
 
+        # Queried fresh for the same reason needs_geo is above — the old
+        # in-memory `all_db` this used to read was current as of before
+        # inferring/geocoding even ran, and no longer exists in this scope
+        # at all now that population is _infer_locations()'s job.
         counts = {}
-        for p in all_db: counts[p["status"]] = counts.get(p["status"],0)+1
+        for row in conn.execute(
+                "SELECT status, COUNT(*) c FROM photos WHERE scan_root=? GROUP BY status", (folder,)):
+            counts[row["status"]] = row["c"]
+        conn.close()
         _log(f"[scan] Done. {counts}")
         with _scan_lock:
             _scan_state.update(running=False, phase="done",
