@@ -258,6 +258,17 @@ scan reported "failed" even though most of the work had, in fact,
 completed. Both spots now query the database directly instead of
 depending on the extracted function's leftover local state.
 
+**Fixed: the map picker's place/address search silently did nothing.**
+The search itself worked the whole time — request sent, Nominatim hit,
+results came back, the results list was built and set to `display:block`
+with the right content — but it was invisible, painted underneath the
+Leaflet map. Leaflet assigns its own internal panes z-index values up to
+700 (tiles, markers, popups) and its controls around 1000, and nothing
+between the results dropdown and the map established its own stacking
+context, so those panes competed directly against the dropdown's z-index
+of 10 in the shared context rooted at `.map-modal` — and won. Bumped to
+2000.
+
 **Fixed (Firefox only): "Propagate to folder" squished every thumbnail
 into a ~19px sliver and never showed a scrollbar, once there were enough
 photos that the checklist actually needed to scroll.** Root cause,

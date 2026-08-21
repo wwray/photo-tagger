@@ -313,7 +313,14 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .map-coords strong{color:var(--accent)}
 .map-search{display:flex;gap:6px;padding:10px 16px;border-bottom:1px solid var(--border);position:relative}
 .map-search .field-input{flex:1}
-.map-search-results{position:absolute;left:16px;right:16px;top:100%;margin-top:2px;z-index:10;
+.map-search-results{position:absolute;left:16px;right:16px;top:100%;margin-top:2px;
+  /* Leaflet assigns its own panes z-index up to 700 (markers/popups) and
+     controls around 1000, and since nothing between this element and the
+     map establishes its own stacking context, those compete directly with
+     this z-index in the same context rooted at .map-modal — a "10" here
+     was invisibly painted UNDER the map tiles every time, not merely
+     positioned wrong. Comfortably above anything Leaflet uses. */
+  z-index:2000;
   background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
   max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .map-search-result{padding:8px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid var(--border)}
