@@ -361,10 +361,17 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .seed-item{position:relative;border-radius:var(--radius-lg);border:2px solid var(--border);
   background:var(--surface2);cursor:pointer;user-select:none;overflow:hidden;
   transition:border-color .15s,opacity .15s,transform .15s,box-shadow .15s}
-.seed-item:hover{border-color:var(--accent);transform:scale(1.45);z-index:5;
-  box-shadow:0 16px 40px rgba(0,0,0,.65)}
+.seed-item:hover{border-color:var(--accent);transform:scale(2);z-index:5;
+  box-shadow:0 24px 60px rgba(0,0,0,.75)}
 .seed-item.checked{border-color:var(--accent)}
-.seed-item:not(.checked){opacity:.4}
+/* Dim enough to read at a glance which are checked, but not so dim you
+   can't actually see the photo well enough to tell if it's the right
+   one — .4 made exactly the "is this really the boat deck or the sky"
+   call this whole checklist exists for harder, not easier. Hovering
+   goes fully opaque regardless of checked state, on top of the zoom
+   below, for the moments you need a clean, unobstructed look. */
+.seed-item:not(.checked){opacity:.75}
+.seed-item:not(.checked):hover{opacity:1}
 .seed-thumb{position:relative;width:100%;padding-top:75%;overflow:hidden;background:var(--surface)}
 .seed-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .seed-item-info{padding:8px 10px}

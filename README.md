@@ -258,6 +258,14 @@ scan reported "failed" even though most of the work had, in fact,
 completed. Both spots now query the database directly instead of
 depending on the extracted function's leftover local state.
 
+**Improved: "Propagate to folder" thumbnails were too dim to actually
+compare against each other.** Unchecked photos dimmed to 40% opacity —
+reasonable for showing checked state at a glance, bad for the checklist's
+actual job of "is this really the right photo." Dimming is now 75%, and
+hovering goes fully opaque (regardless of checked state) on top of the
+existing zoom-in-place, which also got bigger (1.45× → 2×) for an
+actually useful close look.
+
 **Fixed: the map picker's place/address search silently did nothing.**
 The search itself worked the whole time — request sent, Nominatim hit,
 results came back, the results list was built and set to `display:block`
