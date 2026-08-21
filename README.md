@@ -236,6 +236,43 @@ honor anyway.
 
 ### Unreleased
 
+**Added: drag-and-drop custom ordering for the Sessions list**, alongside
+the existing sort dropdown — pick "Custom (drag to reorder)" and it seeds
+from whatever's currently displayed (so sorting alphabetically first,
+then switching to Custom to fine-tune a couple of positions, doesn't
+reset to some arbitrary baseline order), then drag any session onto
+another to reorder. Persisted client-side the same way the other sort
+modes are. Also fixed a real (if narrow) race: switching sort modes
+fast enough could let an older, slower `/api/sessions` fetch resolve
+*after* a newer one and silently overwrite its render with stale data —
+a generation counter now makes a superseded call a no-op instead.
+
+**Improved: 🤖 AI Suggest and Propagate-to-folder's AI check name the
+actual landmark, not just the city — and now geocode to it.** The prompt
+previously said "reply in city, country format," which threw away
+landmark-level precision even when the model could clearly identify one
+— a Lincoln Memorial photo came back "Washington, DC" and geocoded to
+the city center, not the memorial. The prompt now asks for the most
+specific identifiable name (landmark/building/venue), and 🤖 AI Suggest
+automatically forward-geocodes whatever it returns, so a specific enough
+answer actually pins the real spot instead of just filling in the text
+field. Verified against the real Nominatim geocoder with a mocked AI
+response: "Lincoln Memorial, Washington, DC, USA" resolves to
+38.8893, -77.0502 — the actual memorial, not Washington's city center.
+
+**Fixed: 📍 Infer Nearby didn't treat a location you'd just tagged by
+hand as a source for its siblings until you'd already committed it to
+disk.** With dry run on (the default), tagging a photo only stages a
+pending change — `photos.has_gps`/`lat`/`lon` in the database aren't
+touched until you hit "Write to files." `_infer_locations()` only ever
+looked at those columns, so a manually-tagged-but-uncommitted photo
+didn't count as a source the way a real-EXIF-GPS photo does the moment
+it's scanned — exactly backwards from what "tag one, infer the rest"
+should feel like. It now also checks for an uncommitted pending lat/lon
+change and treats that as the effective position for this pass (nothing
+about the pending-change/commit flow itself changes — this only affects
+which photos count as usable sources for inference).
+
 **Added: 🤖 AI Suggest and the Propagate-to-folder AI check now actually
 look at the photo.** Both were, until now, pure text: the prompt
 literally said "you have NO access to any image files or photos," and

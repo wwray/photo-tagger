@@ -938,6 +938,34 @@ def _infer_locations(conn, folder):
     all_db = rows_to_dicts(conn.execute(
         "SELECT * FROM photos WHERE scan_root=?", (folder,)).fetchall())
 
+    # A photo tagged by hand (map pin, Save to file, etc.) with dry run on
+    # — the default — doesn't touch photos.has_gps/lat/lon at all until
+    # that pending change is actually committed; db_save_pending() only
+    # stages a pending_changes row. Without this, a manually-tagged photo
+    # wouldn't count as a source here until you'd already written it to
+    # disk, unlike a photo with real EXIF GPS, which is a source the
+    # moment it's scanned — exactly backwards from what "tag one, infer
+    # the rest" should feel like. Treated as if already committed for the
+    # purposes of this pass; nothing here writes to pending_changes or
+    # touches the real lat/lon columns, so it's still just a suggestion
+    # cache either way.
+    pending_coords = {}
+    for row in conn.execute("""
+            SELECT photo_id, field, new_value FROM pending_changes
+            WHERE committed=0 AND field IN ('lat','lon')
+              AND photo_id IN (SELECT id FROM photos WHERE scan_root=?)
+        """, (folder,)):
+        pending_coords.setdefault(row["photo_id"], {})[row["field"]] = row["new_value"]
+
+    def _effective_gps(p):
+        pc = pending_coords.get(p["id"])
+        if pc and "lat" in pc and "lon" in pc:
+            try:
+                return float(pc["lat"]), float(pc["lon"]), True
+            except (TypeError, ValueError):
+                pass
+        return p["lat"], p["lon"], bool(p["has_gps"])
+
     # Pre-parse + sort every GPS photo's timestamp once, then bisect per
     # candidate. This used to re-parse every GPS photo's datetime string
     # inside the inner loop for every non-GPS candidate — an O(N×M) scan
@@ -947,11 +975,12 @@ def _infer_locations(conn, folder):
     # finds the same true nearest-in-time match in a couple of seconds.
     gps_ts, gps_sorted = [], []
     for p in all_db:
-        if not (p["has_gps"] and p["date_taken"]):
+        lat, lon, has_gps = _effective_gps(p)
+        if not (has_gps and lat is not None and lon is not None and p["date_taken"]):
             continue
         try:
             gps_ts.append((datetime.fromisoformat(p["date_taken"]) - _EPOCH).total_seconds())
-            gps_sorted.append(p)
+            gps_sorted.append({**p, "lat":lat, "lon":lon})
         except ValueError:
             continue
     order = sorted(range(len(gps_ts)), key=lambda i: gps_ts[i])
@@ -962,8 +991,13 @@ def _infer_locations(conn, folder):
     for photo in all_db:
         # 'history' (matched against imported location history, if any)
         # is a stronger signal than a same-folder GPS-cluster guess —
-        # don't let this pass clobber it back down to 'inferred'.
-        if photo["has_gps"] or photo["status"] in ("named","inferred","history") or not photo["date_taken"] or not gps_ts:
+        # don't let this pass clobber it back down to 'inferred'. A photo
+        # with its own pending lat/lon is also skipped as a *target* here
+        # (it's the other half of the source-side check above) — it
+        # already has an intended location, it doesn't need a guess.
+        if (photo["has_gps"] or photo["id"] in pending_coords
+                or photo["status"] in ("named","inferred","history")
+                or not photo["date_taken"] or not gps_ts):
             continue
         try:
             epoch = (datetime.fromisoformat(photo["date_taken"]) - _EPOCH).total_seconds()
@@ -2218,7 +2252,12 @@ def api_ai_infer():
             "signs, license plates, flags — together with the filename/folder/date/nearby-photo "
             "metadata below, which may add useful context (or may just be an uninformative "
             "camera-assigned name — don't let it override strong visual evidence). "
-            "Reply with ONLY the location name (city, country format), or 'Unknown' if you "
+            "Be as SPECIFIC as you can confidently be: if you recognize a landmark, monument, "
+            "building, or named venue, name it (e.g. 'Lincoln Memorial, Washington, DC, USA'), "
+            "not just the city — a specific, correctly-geocodable name is what lets this get "
+            "pinned at the actual place instead of just the city center. Fall back to city, "
+            "country only when nothing more specific is identifiable. "
+            "Reply with ONLY the location name, or 'Unknown' if you "
             "genuinely can't tell even from the image. No explanation, no hedging, no mention "
             "of photos or images.\n\n" + "\n".join(lines)
         )
@@ -2229,7 +2268,8 @@ def api_ai_infer():
             "access to any image content — work only from the text metadata below.\n\n"
             "Based only on the filename, folder name, date, and nearby photos listed, "
             "suggest the most likely location. Reply with ONLY the location name "
-            "(city, country format), or 'Unknown' if you genuinely cannot guess. "
+            "(city, country format — there's no landmark-level signal available from text "
+            "metadata alone), or 'Unknown' if you genuinely cannot guess. "
             "No explanation, no hedging, no mention of photos or images.\n\n"
             + "\n".join(lines)
         )
@@ -2273,8 +2313,10 @@ def api_ai_infer_with_coords():
             "cityscape, climate/vegetation, any visible landmarks or signage) suggest otherwise? "
             "Combine that with the filename/folder/date metadata below. If the seed location "
             "looks right, return it as-is; if the photo clearly doesn't match it (and you can "
-            "tell where it actually is instead), return your own answer instead. "
-            "Reply with ONLY the location name (e.g. 'Paris, France'). "
+            "tell where it actually is instead), return your own answer instead — as specific "
+            "as you can confidently be (a landmark/building/venue name, e.g. 'Eiffel Tower, "
+            "Paris, France', not just the city, when one is recognizable). "
+            "Reply with ONLY the location name. "
             "No explanation, no hedging, no mention of photos or images.\n\n"
             + "\n".join(lines)
         )

@@ -116,6 +116,9 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
   border:1px solid var(--border);background:var(--surface2);margin-bottom:4px;cursor:pointer}
 .session-item:hover{border-color:var(--accent)}
 .session-item.active{border-color:var(--accent);background:var(--accent-dim)}
+.session-item[draggable="true"]{cursor:grab}
+.session-item.dragging{opacity:.35}
+.session-item.drag-over{border-color:var(--accent);border-style:dashed;background:var(--accent-dim)}
 .session-name{font-size:12px;font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1}
 .session-root{font-size:10px;color:var(--text-dim);font-family:var(--mono);
   overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -591,6 +594,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
           <option value="name_desc">Name Z–A</option>
           <option value="date_desc">Newest first</option>
           <option value="date_asc">Oldest first</option>
+          <option value="custom">Custom (drag to reorder)</option>
         </select>
         <button class="btn btn-ghost btn-sm" onclick="newSession()" style="font-size:10px;padding:2px 6px">+ New</button>
       </div>
@@ -1485,8 +1489,13 @@ function buildFolderList() {
 // "recently clicked" and "chronological" are two different, both
 // useful, orderings) there was no way to reorder the list at all,
 // let alone alphabetically. Sorted client-side since the full list is
-// already fetched in one shot regardless.
+// already fetched in one shot regardless. "Custom" is a fully manual
+// drag-to-reorder order on top of the algorithmic sorts — persisted
+// client-side (an ordering of dynamic IDs isn't really "data" the way
+// the sessions themselves are, so localStorage rather than a schema
+// migration for a sort_order column).
 let sessionSort='recent';
+let _sessionCustomOrder=null; // array of session ids (as strings), or null if never set
 const SESSION_SORTERS={
   recent:      null, // server's own last_used-DESC order — leave as-is
   name_asc:    (a,b)=>a.name.localeCompare(b.name),
@@ -1494,18 +1503,58 @@ const SESSION_SORTERS={
   date_desc:   (a,b)=>(b.created_at||'').localeCompare(a.created_at||''),
   date_asc:    (a,b)=>(a.created_at||'').localeCompare(b.created_at||''),
 };
+function loadSessionCustomOrder(){
+  try{ return JSON.parse(localStorage.getItem('pt_session_order')) || null; }
+  catch(e){ return null; }
+}
+function saveSessionCustomOrder(){
+  try{ localStorage.setItem('pt_session_order', JSON.stringify(_sessionCustomOrder)); }
+  catch(e){ /* private mode / quota — the custom order just won't persist */ }
+}
 function setSessionSort(v){
-  sessionSort = SESSION_SORTERS[v] ? v : 'recent';
+  const known = v==='custom' || SESSION_SORTERS[v]!==undefined;
+  if(v==='custom' && !_sessionCustomOrder){
+    // First time switching to Custom: seed it from whatever's currently
+    // displayed rather than some arbitrary baseline — sort alphabetically,
+    // then switch to Custom to fine-tune a couple of positions from there.
+    _sessionCustomOrder=[...document.querySelectorAll('#sessionList .session-item')].map(el=>el.dataset.id);
+    saveSessionCustomOrder();
+  }
+  sessionSort = known ? v : 'recent';
   saveViewPrefs();
   loadSessions();
 }
+function applySessionCustomOrder(sessions){
+  const byId=new Map(sessions.map(s=>[String(s.id),s]));
+  const ordered=[];
+  (_sessionCustomOrder||[]).forEach(id=>{
+    const s=byId.get(String(id));
+    if(s){ ordered.push(s); byId.delete(String(id)); }
+  });
+  ordered.push(...byId.values()); // new sessions created since, or a stale id — appended, never dropped
+  return ordered;
+}
+// Switching sort mode twice in quick succession (e.g. testing Custom, back
+// to Name, back to Custom) fires two overlapping fetches, and nothing
+// guarantees the first one's response arrives first — an out-of-order
+// resolution silently overwrote a newer render with a stale one. A
+// generation counter makes a superseded call a no-op instead of a race.
+let _sessionsLoadGen=0;
 async function loadSessions() {
+  const myGen=++_sessionsLoadGen;
   const r=await fetch('/api/sessions'); const d=await r.json();
-  const sorter=SESSION_SORTERS[sessionSort];
-  const sessions=sorter ? [...d.sessions].sort(sorter) : d.sessions;
+  if(myGen!==_sessionsLoadGen) return; // a newer loadSessions() call has already started — don't clobber its render
+  let sessions;
+  if(sessionSort==='custom'){
+    sessions=applySessionCustomOrder(d.sessions);
+  } else {
+    const sorter=SESSION_SORTERS[sessionSort];
+    sessions=sorter ? [...d.sessions].sort(sorter) : d.sessions;
+  }
+  const dragEnabled=sessionSort==='custom';
   const list=document.getElementById('sessionList'); list.innerHTML='';
   sessions.forEach(s=>{
-    const el=document.createElement('div'); el.className='session-item';
+    const el=document.createElement('div'); el.className='session-item'; el.dataset.id=s.id;
     el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${escapeHtml(s.name)}</div>
       <div class="session-root">${escapeHtml(s.scan_root)}</div></div>
       <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px"
@@ -1513,8 +1562,34 @@ async function loadSessions() {
     el.onclick=()=>{ document.getElementById('folderInput').value=s.scan_root;
       fetch('/api/sessions/'+s.id+'/use',{method:'POST'});
       switchToSession(s.scan_root); };
+    // Native drag-and-drop distinguishes a real drag from a click on its
+    // own (a plain click with no movement never fires dragstart), so this
+    // coexists with el.onclick above with no extra bookkeeping.
+    if(dragEnabled){
+      el.draggable=true;
+      el.ondragstart=e=>{ e.dataTransfer.effectAllowed='move'; e.dataTransfer.setData('text/plain',String(s.id));
+        el.classList.add('dragging'); };
+      el.ondragend=()=>el.classList.remove('dragging');
+      el.ondragover=e=>{ e.preventDefault(); e.dataTransfer.dropEffect='move'; el.classList.add('drag-over'); };
+      el.ondragleave=()=>el.classList.remove('drag-over');
+      el.ondrop=e=>{
+        e.preventDefault(); e.stopPropagation(); el.classList.remove('drag-over');
+        const draggedId=e.dataTransfer.getData('text/plain');
+        if(draggedId && draggedId!==String(s.id)) reorderSession(draggedId, String(s.id));
+      };
+    }
     list.appendChild(el);
   });
+}
+function reorderSession(draggedId, targetId){
+  const cur=[...document.querySelectorAll('#sessionList .session-item')].map(el=>el.dataset.id);
+  const from=cur.indexOf(draggedId);
+  if(from===-1) return;
+  cur.splice(from,1);
+  cur.splice(cur.indexOf(targetId), 0, draggedId);
+  _sessionCustomOrder=cur;
+  saveSessionCustomOrder();
+  loadSessions();
 }
 
 // Switching sessions used to just call startScan() unconditionally — every
@@ -1839,7 +1914,32 @@ async function aiInfer(){
   const d=await r.json();
   if(d.limit_reached){toast('Daily AI limit reached','error');btn.textContent='🤖 Limit reached';return;}
   if(d.error){toast('AI error: '+d.error,'error');return;}
-  if(d.suggestion&&d.suggestion!=='Unknown'){document.getElementById('detailLocation').value=d.suggestion;toast('AI: '+d.suggestion,'success');}
+  if(d.suggestion&&d.suggestion!=='Unknown'){
+    document.getElementById('detailLocation').value=d.suggestion;
+    markDetailDirty();
+    // The AI is now asked for the most specific place it can name (a
+    // landmark/building, not just the city) precisely so this lookup can
+    // pin the actual coordinates there — "Lincoln Memorial, Washington,
+    // DC" geocodes to the memorial itself, not the city center, where a
+    // bare "Washington, DC" necessarily would. Best-effort: if the name
+    // doesn't resolve to anything, the location text is still filled in
+    // fine, just without coordinates yet.
+    try{
+      const gr=await fetch('/api/geocode_search?q='+encodeURIComponent(d.suggestion));
+      const gd=await gr.json();
+      if(gd.results&&gd.results.length){
+        document.getElementById('detailLat').value=gd.results[0].lat;
+        document.getElementById('detailLon').value=gd.results[0].lon;
+        onCoordsChanged();
+        toast('AI: '+d.suggestion+' — pinned','success');
+      } else {
+        toast('AI: '+d.suggestion+' (no coordinates found for that name)','success');
+      }
+    }catch(e){
+      console.error('geocode_search after aiInfer failed:',e);
+      toast('AI: '+d.suggestion,'success');
+    }
+  }
   else toast('AI could not suggest a location','error');
   if(d.ai_usage){const el=document.getElementById('aiUsed');if(el)el.textContent=d.ai_usage.used;}
   }catch(err){
@@ -3070,8 +3170,12 @@ initGridMarquee();
     // sort) — querySelector('.sort-select') alone would just grab whichever
     // comes first in the DOM, silently restoring the wrong one.
     if(_vp.sort){ currentSort=_vp.sort; const sel=document.getElementById('gridSortSelect'); if(sel) sel.value=_vp.sort; }
-    if(_vp.sessionSort){ sessionSort=SESSION_SORTERS[_vp.sessionSort]!==undefined?_vp.sessionSort:'recent';
-      const ssel=document.getElementById('sessionSortSelect'); if(ssel) ssel.value=sessionSort; }
+    _sessionCustomOrder=loadSessionCustomOrder();
+    if(_vp.sessionSort){
+      const validSort=_vp.sessionSort==='custom' || SESSION_SORTERS[_vp.sessionSort]!==undefined;
+      sessionSort=validSort?_vp.sessionSort:'recent';
+      const ssel=document.getElementById('sessionSortSelect'); if(ssel) ssel.value=sessionSort;
+    }
     if(_vp.search){ searchQuery=_vp.search; const si=document.getElementById('gridSearch'); if(si) si.value=_vp.search; }
     setGridDensity(_vp.density||'medium', false);
     _restoredFilter=_vp.filter||null;
