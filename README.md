@@ -259,12 +259,19 @@ completed. Both spots now query the database directly instead of
 depending on the extracted function's leftover local state.
 
 **Improved: "Propagate to folder" thumbnails were too dim to actually
-compare against each other.** Unchecked photos dimmed to 40% opacity —
-reasonable for showing checked state at a glance, bad for the checklist's
-actual job of "is this really the right photo." Dimming is now 75%, and
-hovering goes fully opaque (regardless of checked state) on top of the
-existing zoom-in-place, which also got bigger (1.45× → 2×) for an
-actually useful close look.
+compare against each other, and the hover-to-enlarge effect could expand
+the checklist's own scrollable area or run off the window near an edge.**
+Unchecked photos dimmed to 40% opacity — reasonable for showing checked
+state at a glance, bad for the checklist's actual job of "is this really
+the right photo." Dimming is now 75%, and hovering goes fully opaque
+(regardless of checked state). The enlarge-on-hover preview is no longer
+a CSS transform scaling the card itself in place — that card is a
+normal-flow child of the scrolling grid, so enlarging it near an edge
+changed the grid's own scrollable area, and it could still run off the
+grid or the window despite clipping. It's now a fixed-position preview
+panel, independent of the grid entirely, whose position is computed and
+clamped to the viewport on every hover — guaranteed fully visible, not
+just usually.
 
 **Fixed: the map picker's place/address search silently did nothing.**
 The search itself worked the whole time — request sent, Nominatim hit,
