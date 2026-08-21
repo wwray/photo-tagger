@@ -643,8 +643,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       </div>
       <div class="field-group">
         <div class="field-label">Date Taken</div>
-        <input class="field-input" id="detailDate" type="datetime-local" oninput="markDetailDirty()"/>
+        <input class="field-input" id="detailDate" type="datetime-local" oninput="markDetailDirty();onDateChanged()"/>
         <div class="field-hint" id="detailDateHint"></div>
+      </div>
+      <div class="folder-seed-bar" id="folderDateBar" style="display:none">
+        <span>📅 Push date to undated in <strong id="folderDateName"></strong></span>
+        <button class="btn btn-primary btn-sm" onclick="dateSeedFolder()">Choose photos…</button>
       </div>
       <div class="field-group">
         <div class="field-label">GPS Coordinates</div>
@@ -763,12 +767,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <div class="map-modal" id="seedModal" style="display:none" onclick="closeSeedModal(event)">
   <div class="map-panel" style="max-width:min(96vw,1180px)" onclick="event.stopPropagation()">
     <div class="map-header">
-      <h3>📁 Propagate to folder</h3>
+      <h3 id="seedModalTitle">📁 Propagate to folder</h3>
       <span class="map-hint" id="seedModalHint"></span>
       <button class="close-btn" onclick="closeSeedModal()">✕</button>
     </div>
     <div id="seedFilterTabs" class="seed-tabs" style="display:none"></div>
-    <div style="padding:10px 16px 0;font-size:11px;color:var(--text-dim)">Photos already tagged with GPS or a name start unchecked — check one to deliberately overwrite it.</div>
+    <div style="padding:10px 16px 0;font-size:11px;color:var(--text-dim)" id="seedModalInstructions">Photos already tagged with GPS or a name start unchecked — check one to deliberately overwrite it.</div>
     <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;max-height:min(72vh,720px);padding:16px"></div>
     <div class="seed-preview" id="seedPreview"><img id="seedPreviewImg" alt=""/></div>
     <div class="map-footer" style="gap:8px">
@@ -1614,6 +1618,9 @@ function openDetail(idx) {
     } else if(p.date_source==='exif'){
       dh.textContent='✓ From EXIF';
       dh.style.color='var(--green)';
+    } else if(p.date_source==='seeded'){
+      dh.textContent='📅 Pushed from another photo in this folder — not yet saved';
+      dh.style.color='var(--gold)';
     } else { dh.textContent=''; }
   }
   const exifParts=[p.camera,p.lens].filter(Boolean);
@@ -1629,6 +1636,7 @@ function openDetail(idx) {
   }
   document.getElementById('detailOverlay').style.display='flex';
   onCoordsChanged();
+  onDateChanged();
 }
 function markDetailDirty(){ detailDirty=true; }
 // Nothing here auto-saves — Prev/Next/✕/Escape used to silently discard
@@ -2470,9 +2478,30 @@ function onCoordsChanged(){
   } else bar.style.display='none';
 }
 
+// Mirrors onCoordsChanged() above — shows "push this date to the rest of
+// the folder" once the Date field holds a value and at least one sibling
+// photo doesn't already have a real EXIF date of its own.
+function onDateChanged(){
+  const dateVal=document.getElementById('detailDate').value;
+  const p=currentPhoto();
+  if(!p) return;
+  const bar=document.getElementById('folderDateBar');
+  if(dateVal){
+    const n=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id&&x.date_source!=='exif').length;
+    if(n>0){document.getElementById('folderDateName').textContent=p.folder||'(root)';bar.style.display='flex';}
+    else bar.style.display='none';
+  } else bar.style.display='none';
+}
+
 let _seedTargets=[],_seedLat=null,_seedLon=null,_seedLocation='';
 let _seedUnchecked=new Set();   // ids explicitly unchecked — default is "everything checked"
 let _seedFilter='all';          // status tab currently shown ('all' | 'unknown' | 'inferred' | 'history' | ...)
+// 'location' (the original propagate-a-pin workflow) or 'date' (push a
+// timestamp instead) — same checklist modal, same hover-preview, same
+// dry-run-free "suggestion, review before saving" behavior either way;
+// only what counts as "already tagged" and what gets applied differs.
+let _seedMode='location';
+let _seedDate=null;             // the date_taken value being pushed, when _seedMode==='date'
 
 const SEED_STATUS_LABELS={unknown:'Untagged',inferred:'Inferred',history:'History',named:'Named',gps:'GPS'};
 
@@ -2482,17 +2511,28 @@ function seedFolder(){
   const loc=document.getElementById('detailLocation').value;
   const p=currentPhoto();
   if(!p||isNaN(lat)||isNaN(lon)) return;
+  _seedMode='location';
   _seedLat=lat; _seedLon=lon; _seedLocation=loc;
   // Every other photo in the folder is a candidate now, not just untagged
   // ones — a photo that already has GPS or a name is still listed (with
   // its current status visible), just unchecked by default. Overwriting
   // it is now a deliberate opt-in instead of something you can't do at
-  // all, or something that could happen by silent accident.
+  // all, or something that could happen by silent accident. Anything
+  // other than plain 'unknown' counts as "already has a signal to
+  // protect" here — 'inferred'/'history' included, not just a confirmed
+  // 'gps'/'named' — a photo already sitting on a suggestion (from a prior
+  // propagate, or a scan-time inference) shouldn't get silently
+  // re-suggested over by an unrelated propagate run; that's the whole
+  // point of it being unreviewed rather than saved yet, not an invitation
+  // to overwrite it again without looking.
   _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id)
     .sort((a,b)=>(a.date_taken||'').localeCompare(b.date_taken||''));
   if(!_seedTargets.length){toast('No other photos in this folder','error');return;}
-  _seedUnchecked=new Set(_seedTargets.filter(t=>t.has_gps||t.status==='named').map(t=>t.id));
+  _seedUnchecked=new Set(_seedTargets.filter(t=>t.status!=='unknown').map(t=>t.id));
   _seedFilter='all';
+  document.getElementById('seedModalTitle').textContent='📁 Propagate to folder';
+  document.getElementById('seedModalInstructions').textContent=
+    'Photos already tagged, inferred, or history-matched start unchecked — check one to deliberately overwrite it.';
   document.getElementById('seedModalHint').textContent=
     `${_seedTargets.length} photos in "${p.folder||'(root)'}" → "${loc}"`;
   renderSeedTabs();
@@ -2500,12 +2540,45 @@ function seedFolder(){
   document.getElementById('seedModal').style.display='flex';
 }
 
+// Mirrors seedFolder() above but pushes a date instead of a location —
+// see onDateChanged() for when the folder-date-bar that triggers this
+// actually shows up.
+function dateSeedFolder(){
+  const dateVal=document.getElementById('detailDate').value;
+  const p=currentPhoto();
+  if(!p||!dateVal) return;
+  _seedMode='date';
+  _seedDate=dateVal; // datetime-local's own "YYYY-MM-DDTHH:mm" format — same shape date_taken is stored/read in elsewhere
+  _seedTargets=allPhotos.filter(x=>x.folder===p.folder&&x.id!==p.id)
+    .sort((a,b)=>(a.date_taken||'').localeCompare(b.date_taken||''));
+  if(!_seedTargets.length){toast('No other photos in this folder','error');return;}
+  // "Already tagged" here means a real EXIF date OR a date already
+  // pushed-but-unsaved from an earlier run of this same feature — a photo
+  // running on the filesystem-date guess is exactly the kind this is
+  // for, so it starts checked; one already sitting on a suggestion from
+  // last time shouldn't get silently re-suggested over.
+  _seedUnchecked=new Set(_seedTargets.filter(t=>t.date_source==='exif'||t.date_source==='seeded').map(t=>t.id));
+  _seedFilter='all';
+  document.getElementById('seedModalTitle').textContent='📅 Push date to folder';
+  document.getElementById('seedModalInstructions').textContent=
+    'Photos that already have a real (or previously-pushed) date start unchecked — check one to deliberately overwrite it.';
+  document.getElementById('seedModalHint').textContent=
+    `${_seedTargets.length} photos in "${p.folder||'(root)'}" → ${new Date(dateVal).toLocaleString('en-US',
+      {month:'short',day:'numeric',year:'numeric',hour:'2-digit',minute:'2-digit'})}`;
+  renderSeedTabs();
+  renderSeedGrid();
+  document.getElementById('seedModal').style.display='flex';
+}
+
 function renderSeedTabs(){
+  const bar=document.getElementById('seedFilterTabs');
+  // Status tabs (GPS/Inferred/History/...) are a location-mode concept —
+  // nothing to filter by in date mode, so the row is just noise there.
+  if(_seedMode==='date'){ bar.style.display='none'; return; }
   const counts={};
   _seedTargets.forEach(t=>counts[t.status]=(counts[t.status]||0)+1);
   const tabs=[['all',`All`,_seedTargets.length]]
     .concat(Object.keys(counts).sort().map(s=>[s, SEED_STATUS_LABELS[s]||s, counts[s]]));
-  const bar=document.getElementById('seedFilterTabs');
   // Only one real category (plus "All") — a filter row with nothing to
   // filter is just noise, so don't show it.
   bar.style.display = tabs.length>2 ? 'flex' : 'none';
@@ -2532,13 +2605,22 @@ function renderSeedGrid(){
   visible.forEach(t=>{
     const dt=t.date_taken?new Date(t.date_taken).toLocaleDateString('en-US',{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'}):'No date';
     const checked=!_seedUnchecked.has(t.id);
-    const alreadyTagged=t.has_gps||t.status==='named';
+    // Kept in sync with the initial _seedUnchecked set built in seedFolder()/
+    // dateSeedFolder() above — this only drives the "will overwrite" hint
+    // text, but a mismatch there would make it lie about what's about to
+    // happen for an item the user re-checks or unchecks by hand.
+    const alreadyTagged=_seedMode==='date'
+      ? (t.date_source==='exif'||t.date_source==='seeded')
+      : t.status!=='unknown';
+    const badgeHTML=_seedMode==='date'
+      ? `<div class="status-badge ${t.date_source==='exif'?'badge-gps':(t.date_source==='seeded'?'badge-inferred':'badge-unknown')}">${t.date_source==='exif'?'DATE':(t.date_source==='seeded'?'Sugg':'?')}</div>`
+      : `<div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>`;
     const item=document.createElement('div'); item.className='seed-item'+(checked?' checked':''); item.dataset.id=t.id;
     item.innerHTML=`<div class="seed-checkbox">${checked?'✓':''}</div>
       <div class="seed-thumb">
         <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
       </div>
-      <div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>
+      ${badgeHTML}
       <div class="seed-item-info"><div class="seed-item-name">${escapeHtml(t.filename)}</div>
         <div class="seed-item-date">${dt}${alreadyTagged?' · <span style="color:var(--gold)">will overwrite</span>':''}</div></div>`;
     item.onclick=()=>{
@@ -2599,6 +2681,19 @@ async function applySeedSelection(){
   if(!targets.length) return;
   const btn=document.getElementById('seedApplyBtn'); btn.disabled=true;
   let applied=0;
+  if(_seedMode==='date'){
+    // No AI round-trip needed here — a timestamp is just copied verbatim,
+    // there's nothing to "refine" the way a location name benefits from.
+    // Same as the location path, this only marks a suggestion client-side;
+    // nothing is written to a file until each photo is opened and saved.
+    for(const t of targets){ t.date_taken=_seedDate; t.date_source='seeded'; applied++; }
+    document.getElementById('seedModal').style.display='none';
+    hideSeedPreview();
+    document.getElementById('folderDateBar').style.display='none';
+    updateStats(); renderGrid();
+    toast(`Suggested a date for ${applied} photo${applied!==1?'s':''} — review and Save each to confirm`,'success');
+    return;
+  }
   for(const t of targets){
     const r=await fetch('/api/ai_infer_with_coords',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({photo:t,seed_lat:_seedLat,seed_lon:_seedLon,seed_location:_seedLocation})});

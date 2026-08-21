@@ -62,7 +62,7 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Rotate**: 90°/180°/270° rotation from the detail view, previewed live before saving, applied through the same dry-run flow as everything else (JPEG only — see below)
 - **Zoom and pan** the detail view photo with the mouse wheel and drag, to check a detail before confirming a location
 - **Map picker with place/address search**: type a place name to jump the map there instead of panning/scrolling by hand
-- **Batch operations**: geocode all, tag a selection, save all at once
+- **Batch operations**: geocode all, tag a selection, save all at once, propagate a location or push a date across a whole folder
 - **Dry run by default**: every write is staged as a pending change and reviewed before anything touches disk (see below)
 - **Sessions**: save named scan roots so you can jump back into a library without re-typing the path
 - **Duplicate detection**: exact-byte, filename-pattern, and perceptual (pHash + dHash) matches, run as a background job with progress, with a resolve workflow (auto-pick or hand-pick which copy to keep, move the rest to `_duplicates/`)
@@ -257,6 +257,27 @@ scan silently died right after — no new geocoding happened, and the
 scan reported "failed" even though most of the work had, in fact,
 completed. Both spots now query the database directly instead of
 depending on the extracted function's leftover local state.
+
+**Added: "Push date to folder"** — a Date Taken field mirror of Propagate
+to folder. Set a date on one photo and a **📅 Push date to undated in
+`<folder>`** bar appears if any sibling in the folder is running on the
+filesystem-date estimate rather than a real EXIF date; choose photos from
+the same checklist UI (now shared between both features via a `_seedMode`
+flag) to suggest that date onto them. Like the location version, this
+only stages a client-side suggestion — nothing is written to a file until
+each photo is individually opened and saved — and the detail view shows
+"📅 Pushed from another photo in this folder — not yet saved" as the date
+hint until then.
+
+**Fixed: propagating a location (or now, a date) to a folder would
+happily re-suggest over a photo that already had an unreviewed suggestion
+sitting on it** — from a prior propagate run, or a scan-time inference.
+Only a confirmed `gps`/`named` status (or a real EXIF date) protected a
+photo from being pre-checked; `inferred`/`history` status was not,
+despite already carrying a signal nobody had reviewed yet. Now anything
+other than plain `unknown` status (or, for dates, an already-real or
+already-pushed date) starts unchecked in both checklists — overwriting
+still just a checkbox away, never automatic.
 
 **Improved: "Propagate to folder" thumbnails were too dim to actually
 compare against each other, and the hover-to-enlarge effect could expand
