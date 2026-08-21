@@ -368,8 +368,9 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    one — .4 made exactly the "is this really the boat deck or the sky"
    call this whole checklist exists for harder, not easier. Hovering
    goes fully opaque regardless of checked state, for the moments you
-   want a clean, unobstructed look at the small card itself; #seedPreview
-   below is where the actual close-up look happens. */
+   want a clean, unobstructed look at the small card itself; #photoHoverPreview
+   (shared with the pending-changes list — see there) is where the actual
+   close-up look happens. */
 .seed-item:not(.checked){opacity:.75}
 .seed-item:not(.checked):hover{opacity:1}
 /* A first attempt at "let me see this one bigger" scaled the .seed-item
@@ -379,15 +380,17 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    the edge expands the window" — and near the grid's own edges it could
    still run off both the window and the modal despite clipping, so
    "visible without scrolling" was never guaranteed anywhere but the
-   middle of the grid. This is a separate, viewport-fixed element that
-   never participates in the grid's layout or scroll metrics at all, and
-   its position is computed in JS (positionSeedPreview) and clamped to
-   the viewport on every hover, which an in-place transform fundamentally
-   can't promise near an edge. */
-.seed-preview{position:fixed;display:none;z-index:3000;pointer-events:none;
+   middle of the grid. #photoHoverPreview (defined once, top-level in the
+   body — not nested in any one modal, since a display:none ancestor
+   would hide it regardless of its own display value, and it's used from
+   more than one modal) never participates in any grid's layout or scroll
+   metrics at all, and its position is computed in JS (showPhotoPreview)
+   and clamped to the viewport on every hover, which an in-place
+   transform fundamentally can't promise near an edge. */
+.photo-hover-preview{position:fixed;display:none;z-index:3000;pointer-events:none;
   width:380px;aspect-ratio:4/3;background:var(--surface2);border:2px solid var(--accent);
   border-radius:var(--radius-lg);box-shadow:0 24px 60px rgba(0,0,0,.75);overflow:hidden}
-.seed-preview img{width:100%;height:100%;object-fit:cover;display:block}
+.photo-hover-preview img{width:100%;height:100%;object-fit:cover;display:block}
 .seed-thumb{position:relative;width:100%;padding-top:75%;overflow:hidden;background:var(--surface)}
 .seed-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .seed-item-info{padding:8px 10px}
@@ -457,7 +460,8 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .pending-item{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);padding:10px 12px}
 .pending-item-header{display:flex;align-items:center;gap:8px;margin-bottom:4px}
 .pending-filename{font-family:var(--mono);font-size:12px;font-weight:600;color:var(--text);
-  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:pointer}
+.pending-filename:hover{color:var(--accent);text-decoration:underline}
 .pending-folder{font-size:10px;color:var(--text-dim);font-family:var(--mono)}
 .pending-change{display:flex;align-items:center;gap:8px;font-size:11px;
   padding:3px 0;border-top:1px solid var(--border);margin-top:4px}
@@ -774,7 +778,6 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div id="seedFilterTabs" class="seed-tabs" style="display:none"></div>
     <div style="padding:10px 16px 0;font-size:11px;color:var(--text-dim)" id="seedModalInstructions">Photos already tagged with GPS or a name start unchecked — check one to deliberately overwrite it.</div>
     <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;max-height:min(72vh,720px);padding:16px"></div>
-    <div class="seed-preview" id="seedPreview"><img id="seedPreviewImg" alt=""/></div>
     <div class="map-footer" style="gap:8px">
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)" title="Checks only the photos in the current tab">Check shown</button>
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)" title="Unchecks only the photos in the current tab">Uncheck shown</button>
@@ -784,6 +787,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     </div>
   </div>
 </div>
+
+<!-- Shared hover preview — a fixed-position, viewport-clamped close-up of
+     whatever photo is currently hovered. Top-level (not nested in any one
+     modal) since it's used from more than one: the Propagate/Push-date
+     checklist and the pending-changes review list. See showPhotoPreview(). -->
+<div class="photo-hover-preview" id="photoHoverPreview"><img id="photoHoverPreviewImg" alt=""/></div>
 
 <!-- Folder browser -->
 <div class="map-modal" id="browserModal" style="display:none" onclick="closeBrowser(event)">
@@ -1054,10 +1063,13 @@ async function openPendingModal() {
         </div>`).join('');
       item.innerHTML = `
         <div class="pending-item-header">
-          <span class="pending-filename">📷 ${escapeHtml(p.filename)}</span>
+          <span class="pending-filename" title="Hover to preview the photo">📷 ${escapeHtml(p.filename)}</span>
           <span class="pending-folder">${escapeHtml(p.folder)||'root'}</span>
         </div>
         ${changes}`;
+      const filenameEl = item.querySelector('.pending-filename');
+      filenameEl.onmouseenter = () => showPhotoPreview(filenameEl, p.path);
+      filenameEl.onmouseleave = hidePhotoPreview;
       list.appendChild(item);
     });
   }
@@ -1067,10 +1079,12 @@ async function openPendingModal() {
 function closePendingModal(e) {
   if (e && e.target !== document.getElementById('pendingModal')) return;
   document.getElementById('pendingModal').style.display='none';
+  hidePhotoPreview();
 }
 
 async function commitPending() {
   document.getElementById('pendingModal').style.display='none';
+  hidePhotoPreview();
   const r = await fetch('/api/pending/commit', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
   const d = await r.json();
   toast(`Written ${d.committed} changes to files`, 'success');
@@ -1080,6 +1094,7 @@ async function commitPending() {
 async function discardPending() {
   if (!await customConfirm('Discard all unsaved dry-run changes?',{danger:true})) return;
   document.getElementById('pendingModal').style.display='none';
+  hidePhotoPreview();
   await fetch('/api/pending/discard', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
   toast('Pending changes discarded');
   refreshPendingBar();
@@ -2596,7 +2611,7 @@ function seedVisibleTargets(){
 function renderSeedGrid(){
   const visible=seedVisibleTargets();
   const list=document.getElementById('seedChecklist'); list.innerHTML='';
-  hideSeedPreview(); // a rebuild (tab switch) can remove the hovered node without a mouseleave ever firing on it
+  hidePhotoPreview(); // a rebuild (tab switch) can remove the hovered node without a mouseleave ever firing on it
   if(!visible.length){
     list.innerHTML='<div style="color:var(--text-dim);padding:20px;grid-column:1/-1">No photos in this category.</div>';
   }
@@ -2630,25 +2645,28 @@ function renderSeedGrid(){
       item.querySelector('.seed-checkbox').textContent=nowChecked?'✓':'';
       updateSeedBtn();
     };
-    item.onmouseenter=()=>showSeedPreview(item,t.path);
-    item.onmouseleave=hideSeedPreview;
+    item.onmouseenter=()=>showPhotoPreview(item,t.path);
+    item.onmouseleave=hidePhotoPreview;
     list.appendChild(item);
   });
   updateSeedBtn();
 }
 
 // A fixed-position preview, not an in-place transform on the hovered
-// .seed-item: that first attempt scaled the item itself up, but since
-// it's a normal-flow child of the scrolling grid, growing it near an
-// edge changed #seedChecklist's own scrollable area ("hovering near the
-// edge expands the window") and could still run off the grid or the
-// window despite clipping. This element never participates in the
-// grid's layout at all, and its position is clamped to the viewport on
-// every hover — guaranteed fully visible, not just usually.
-function showSeedPreview(item,path){
-  const preview=document.getElementById('seedPreview');
-  document.getElementById('seedPreviewImg').src='/api/thumbnail?path='+encodeURIComponent(path)+'&size=800';
-  const pw=380, ph=285; // matches .seed-preview's fixed width + 4:3 aspect ratio
+// element: an earlier version of this (seed-checklist-only, at the time)
+// scaled the item itself up in place, but since it's a normal-flow child
+// of a scrolling grid, growing it near an edge changed the grid's own
+// scrollable area ("hovering near the edge expands the window") and
+// could still run off the grid or the window despite clipping. This
+// element never participates in any grid's layout at all, and its
+// position is clamped to the viewport on every hover — guaranteed fully
+// visible, not just usually. Shared by the Propagate/Push-date checklist
+// and the pending-changes review list — pass whatever element the mouse
+// is over (for positioning) and the photo's own path (for the image).
+function showPhotoPreview(item,path){
+  const preview=document.getElementById('photoHoverPreview');
+  document.getElementById('photoHoverPreviewImg').src='/api/thumbnail?path='+encodeURIComponent(path)+'&size=800';
+  const pw=380, ph=285; // matches .photo-hover-preview's fixed width + 4:3 aspect ratio
   const r=item.getBoundingClientRect();
   const left=Math.max(8,Math.min(r.left+r.width/2-pw/2, window.innerWidth-pw-8));
   const top=Math.max(8,Math.min(r.top+r.height/2-ph/2, window.innerHeight-ph-8));
@@ -2656,7 +2674,7 @@ function showSeedPreview(item,path){
   preview.style.top=top+'px';
   preview.style.display='block';
 }
-function hideSeedPreview(){ document.getElementById('seedPreview').style.display='none'; }
+function hidePhotoPreview(){ document.getElementById('photoHoverPreview').style.display='none'; }
 
 function updateSeedBtn(){
   const n=_seedTargets.filter(t=>!_seedUnchecked.has(t.id)).length;
@@ -2673,7 +2691,7 @@ function seedCheckAll(v){
 function closeSeedModal(e){
   if(e&&e.target!==document.getElementById('seedModal'))return;
   document.getElementById('seedModal').style.display='none';
-  hideSeedPreview();
+  hidePhotoPreview();
 }
 
 async function applySeedSelection(){
@@ -2688,7 +2706,7 @@ async function applySeedSelection(){
     // nothing is written to a file until each photo is opened and saved.
     for(const t of targets){ t.date_taken=_seedDate; t.date_source='seeded'; applied++; }
     document.getElementById('seedModal').style.display='none';
-    hideSeedPreview();
+    hidePhotoPreview();
     document.getElementById('folderDateBar').style.display='none';
     updateStats(); renderGrid();
     toast(`Suggested a date for ${applied} photo${applied!==1?'s':''} — review and Save each to confirm`,'success');
@@ -2705,7 +2723,7 @@ async function applySeedSelection(){
     btn.textContent=`Applying… ${applied}/${targets.length}`;
   }
   document.getElementById('seedModal').style.display='none';
-  hideSeedPreview();
+  hidePhotoPreview();
   document.getElementById('folderSeedBar').style.display='none';
   updateStats(); renderGrid();
   toast(`Tagged ${applied} photos with "${_seedLocation}"`,'success');

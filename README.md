@@ -235,6 +235,27 @@ honor anyway.
 
 ### Unreleased
 
+**Added: hover a filename in "Review pending changes" to see the photo.**
+The list only ever showed field names and old/new values — no way to
+actually look at the photo a change belonged to without closing the
+modal and finding it in the grid. Shares the same fixed-position,
+viewport-clamped preview panel introduced for the Propagate/Push-date
+checklist (generalized to `showPhotoPreview()`/`#photoHoverPreview`,
+usable from any list, not just that one modal).
+
+**Fixed: a photo edited or re-staged more than once while dry run was on
+could pile up duplicate pending changes for the same field** — e.g. "2
+photos, 28 field changes" for two photos that had really only had 3-4
+fields touched, each staged five or more times over. `db_save_pending()`
+used to be a plain insert with nothing superseding an existing
+uncommitted row for the same photo+field, so nudging a map pin and
+re-saving five times before committing left five near-identical rows
+behind instead of one. It now clears any existing uncommitted row for
+that photo+field before inserting the new one, and `/api/pending`
+self-heals any duplicates already sitting in the database from before
+this fix (keeps the most recent, drops the rest) — no need to discard
+and redo anything already staged.
+
 **Added: a version badge in the header (and the browser tab title) showing
 the exact commit currently running** — small muted text next to the
 PhotoTagger logo, e.g. `d437724`, also available at `/api/version`. Baked

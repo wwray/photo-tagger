@@ -379,6 +379,21 @@ def db_upsert_photo(conn, photo: dict):
     }, **photo})
 
 def db_save_pending(conn, photo_id, field, old_value, new_value):
+    # A dry-run stage for the same photo+field used to just accumulate: every
+    # re-save while still adjusting a value before committing (reopen the
+    # photo, nudge the pin, save again — or the same photo picked as a
+    # Propagate/Push-date target more than once) inserted another row
+    # instead of replacing the last one, so a couple of heavily-edited
+    # photos could show dozens of "field changes" that were really the same
+    # handful of fields staged repeatedly. old_value is always freshly read
+    # from the untouched photos table by every caller (dry-run never writes
+    # there), so it's safe to drop the superseded uncommitted row first —
+    # only the latest queued value for a given field should ever be
+    # pending at once. Committed rows are left alone; they're history, not
+    # a duplicate to clean up.
+    conn.execute("""
+        DELETE FROM pending_changes WHERE photo_id=? AND field=? AND committed=0
+    """, (photo_id, field))
     conn.execute("""
         INSERT INTO pending_changes (photo_id, field, old_value, new_value)
         VALUES (?,?,?,?)
@@ -1279,6 +1294,21 @@ def api_scan_result():
 def api_pending():
     folder = request.args.get("folder","")
     db = _get_db()
+    # Self-heal: db_save_pending() now supersedes an existing uncommitted
+    # row for the same photo+field instead of stacking another one, but
+    # this cleans up anything left over from before that fix — a photo
+    # edited/re-staged repeatedly (while testing a feature, adjusting a
+    # pin, etc.) could otherwise show the same field pending several times
+    # over. Keeps only the most recent uncommitted row per (photo_id,
+    # field); committed rows (history) are untouched.
+    db.execute("""
+        DELETE FROM pending_changes
+        WHERE committed=0 AND id NOT IN (
+            SELECT MAX(id) FROM pending_changes WHERE committed=0
+            GROUP BY photo_id, field
+        )
+    """)
+    db.commit()
     rows = db.execute("""
         SELECT pc.id, pc.photo_id, pc.field, pc.old_value, pc.new_value,
                pc.created_at, p.filename, p.folder, p.path
