@@ -581,9 +581,19 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div class="folder-list" id="folderList"></div>
   </div>
   <div class="sidebar-section">
-    <div class="sidebar-label" style="display:flex;justify-content:space-between;align-items:center">
+    <div class="sidebar-label" style="display:flex;justify-content:space-between;align-items:center;gap:4px">
       Sessions
-      <button class="btn btn-ghost btn-sm" onclick="newSession()" style="font-size:10px;padding:2px 6px">+ New</button>
+      <div style="display:flex;gap:4px;align-items:center;text-transform:none;letter-spacing:0">
+        <select class="sort-select" id="sessionSortSelect" onchange="setSessionSort(this.value)"
+                style="font-size:10px;padding:2px 4px" title="Sort sessions">
+          <option value="recent">Recent</option>
+          <option value="name_asc">Name A–Z</option>
+          <option value="name_desc">Name Z–A</option>
+          <option value="date_desc">Newest first</option>
+          <option value="date_asc">Oldest first</option>
+        </select>
+        <button class="btn btn-ghost btn-sm" onclick="newSession()" style="font-size:10px;padding:2px 6px">+ New</button>
+      </div>
     </div>
     <div id="sessionList"></div>
   </div>
@@ -603,7 +613,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <div class="toolbar-spacer"></div>
       <button class="btn btn-ghost btn-sm" onclick="selectAllVisible()">Select all</button>
       <button class="btn btn-ghost btn-sm" onclick="clearSelection()">Clear</button>
-      <select class="sort-select" onchange="setSort(this.value)">
+      <select class="sort-select" id="gridSortSelect" onchange="setSort(this.value)">
         <option value="date">By date</option>
         <option value="name">By name</option>
         <option value="status">By status</option>
@@ -722,7 +732,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <!-- Batch bar -->
 <div class="batch-bar" id="batchBar" style="display:none">
   <span><strong id="batchCount">0</strong> selected</span>
-  <button class="btn btn-primary btn-sm" onclick="batchSetLocation()">📍 Set location…</button>
+  <button class="btn btn-primary btn-sm" onclick="batchSetLocation()">📍 Set location/date…</button>
   <button class="btn btn-ghost btn-sm" onclick="openRenameModal()">✏️ Rename…</button>
   <button class="btn btn-green btn-sm" id="batchSaveBtn" onclick="batchSave()">💾 Save</button>
   <button class="btn btn-ghost btn-sm" onclick="clearSelection()">✕</button>
@@ -732,7 +742,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <div class="detail-overlay" id="batchPrompt" style="display:none" onclick="closeBatchPrompt(event)">
   <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
               width:100%;max-width:420px;padding:22px" onclick="event.stopPropagation()">
-    <h3 style="margin-bottom:14px">Set location for selected</h3>
+    <h3 style="margin-bottom:14px">Set location / date for selected</h3>
     <div class="field-group" style="margin-bottom:10px">
       <div class="field-label">Location Name</div>
       <input class="field-input" id="batchLocation" type="text" placeholder="e.g. Tokyo, Japan"/>
@@ -746,6 +756,11 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:14px">
       <button class="btn btn-ghost btn-sm" onclick="geocodeBatchPrompt()" id="batchGeocodeBtn">🌍 Geocode</button>
       <button class="btn btn-ghost btn-sm" onclick="openMapPicker('batch')">🗺️ Map</button>
+    </div>
+    <div class="field-group" style="margin-bottom:14px">
+      <div class="field-label">Date Taken</div>
+      <input class="field-input" id="batchDate" type="datetime-local"/>
+      <div class="field-hint">Sets the same date on every selected photo — leave blank to leave dates untouched.</div>
     </div>
     <div style="display:flex;gap:8px">
       <button class="btn btn-primary" onclick="applyBatchLocation()">Apply to <span id="batchCountPrompt">0</span></button>
@@ -1290,7 +1305,7 @@ let _restoredFilter = null;
 function saveViewPrefs(){
   try{
     localStorage.setItem('pt_view_prefs', JSON.stringify(
-      {filter:currentFilter, sort:currentSort, search:searchQuery, density:_gridDensity}));
+      {filter:currentFilter, sort:currentSort, search:searchQuery, density:_gridDensity, sessionSort}));
   }catch(e){ /* private mode / quota — view prefs just won't persist */ }
 }
 function loadViewPrefs(){
@@ -1465,10 +1480,31 @@ function buildFolderList() {
 }
 
 // ── Sessions ───────────────────────────────────────────────────────
+// The server always returns sessions ordered by last_used — fine as a
+// default, but with enough of them (especially named by date, where
+// "recently clicked" and "chronological" are two different, both
+// useful, orderings) there was no way to reorder the list at all,
+// let alone alphabetically. Sorted client-side since the full list is
+// already fetched in one shot regardless.
+let sessionSort='recent';
+const SESSION_SORTERS={
+  recent:      null, // server's own last_used-DESC order — leave as-is
+  name_asc:    (a,b)=>a.name.localeCompare(b.name),
+  name_desc:   (a,b)=>b.name.localeCompare(a.name),
+  date_desc:   (a,b)=>(b.created_at||'').localeCompare(a.created_at||''),
+  date_asc:    (a,b)=>(a.created_at||'').localeCompare(b.created_at||''),
+};
+function setSessionSort(v){
+  sessionSort = SESSION_SORTERS[v] ? v : 'recent';
+  saveViewPrefs();
+  loadSessions();
+}
 async function loadSessions() {
   const r=await fetch('/api/sessions'); const d=await r.json();
+  const sorter=SESSION_SORTERS[sessionSort];
+  const sessions=sorter ? [...d.sessions].sort(sorter) : d.sessions;
   const list=document.getElementById('sessionList'); list.innerHTML='';
-  d.sessions.forEach(s=>{
+  sessions.forEach(s=>{
     const el=document.createElement('div'); el.className='session-item';
     el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${escapeHtml(s.name)}</div>
       <div class="session-root">${escapeHtml(s.scan_root)}</div></div>
@@ -2016,6 +2052,7 @@ function batchSetLocation(){
   document.getElementById('batchLocation').value='';
   document.getElementById('batchLat').value='';
   document.getElementById('batchLon').value='';
+  document.getElementById('batchDate').value='';
   document.getElementById('batchPrompt').style.display='flex';
 }
 function closeBatchPrompt(e){
@@ -2026,8 +2063,11 @@ function applyBatchLocation(){
   const loc=document.getElementById('batchLocation').value;
   const lat=numOrNull(document.getElementById('batchLat').value);
   const lon=numOrNull(document.getElementById('batchLon').value);
+  const dateVal=document.getElementById('batchDate').value;
+  const date=dateVal?dateVal+':00':null; // matches the "YYYY-MM-DD HH:MM:SS" shape date_taken is stored in elsewhere
   selected.forEach(id=>{const p=allPhotos.find(x=>x.id===id);if(!p)return;
     if(loc)p.location_name=loc;if(lat!==null)p.lat=lat;if(lon!==null)p.lon=lon;
+    if(date)p.date_taken=date;
     p.status=lat!==null&&lon!==null?'gps':(loc?'named':p.status);});
   updateStats();renderGrid();document.getElementById('batchPrompt').style.display='none';
   toast(`Applied to ${selected.size} photos`,'success');
@@ -3026,7 +3066,12 @@ initGridMarquee();
     const r=await fetch('/api/config'); const cfg=await r.json();
     _aiModel = cfg.ai_model||'';
     const _vp=loadViewPrefs();
-    if(_vp.sort){ currentSort=_vp.sort; const sel=document.querySelector('.sort-select'); if(sel) sel.value=_vp.sort; }
+    // Two different <select class="sort-select"> exist now (grid sort, session
+    // sort) — querySelector('.sort-select') alone would just grab whichever
+    // comes first in the DOM, silently restoring the wrong one.
+    if(_vp.sort){ currentSort=_vp.sort; const sel=document.getElementById('gridSortSelect'); if(sel) sel.value=_vp.sort; }
+    if(_vp.sessionSort){ sessionSort=SESSION_SORTERS[_vp.sessionSort]!==undefined?_vp.sessionSort:'recent';
+      const ssel=document.getElementById('sessionSortSelect'); if(ssel) ssel.value=sessionSort; }
     if(_vp.search){ searchQuery=_vp.search; const si=document.getElementById('gridSearch'); if(si) si.value=_vp.search; }
     setGridDensity(_vp.density||'medium', false);
     _restoredFilter=_vp.filter||null;
@@ -3039,7 +3084,7 @@ initGridMarquee();
       const u=cfg.ai_usage;
       const pill=document.createElement('div');
       pill.id='aiUsagePill'; pill.className='stats-pill';
-      pill.title=`Model: ${cfg.ai_model}. Resets midnight.`;
+      pill.title=`AI Suggest usage: ${u.used} of ${u.limit} daily calls used (model: ${cfg.ai_model}). Resets at midnight.`;
       pill.innerHTML=`<span>🤖 <span id="aiUsed">${u.used}</span>/${u.limit}</span>`;
       document.querySelector('.header-actions').prepend(pill);
     }

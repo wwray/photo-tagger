@@ -3,6 +3,7 @@ import re
 import sys
 import time
 import json
+import base64
 import bisect
 import shutil
 import calendar
@@ -2165,6 +2166,33 @@ def api_infer_nearby():
     return jsonify({"ok":True, "count":len(changed), "photos":changed})
 
 # ── AI infer ──────────────────────────────────────────────────────
+# Both AI-suggest endpoints below used to be pure text: "You have NO access
+# to any image files or photos" was the literal prompt, and the whole guess
+# came from filename/folder/date/neighbor patterns. That's a real
+# limitation — a folder full of "IMG_1234.jpg" files with no naming
+# convention gave it nothing to work with no matter how it reasoned. Both
+# now actually attach the photo, downscaled the same way the app's own
+# thumbnails are (no reason to ship a full-resolution original for a
+# question the model answers just as well from ~1024px), and fall back to
+# the original text-only behavior if the file can't be decoded (RAW
+# formats aren't Pillow-native — same limitation /api/thumbnail already
+# has) rather than failing the request outright.
+def _encode_photo_for_ai(path, max_dim=1024):
+    from io import BytesIO
+    try:
+        img = Image.open(path)
+        img = ImageOps.exif_transpose(img)  # a sideways-looking photo is a bad look-at-the-image clue
+        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+        buf = BytesIO()
+        img.convert("RGB").save(buf, "JPEG", quality=85)
+        return base64.standard_b64encode(buf.getvalue()).decode("ascii")
+    except Exception as e:
+        _log(f"[ai] Could not decode {path} for vision, falling back to text-only: {e}")
+        return None
+
+def _ai_image_block(b64):
+    return {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}}
+
 @app.route("/api/ai_infer", methods=["POST"])
 def api_ai_infer():
     import anthropic
@@ -2182,19 +2210,34 @@ def api_ai_infer():
         lines.append("\nNearby photos with known locations:")
         for n in neighbors[:6]:
             lines.append(f"  - {n.get('filename')}: {n.get('location_name')} ({n.get('date_taken')})")
-    prompt = (
-        "You are a metadata assistant. You have NO access to any image files or photos. "
-        "Work only from the text metadata provided below.\n\n"
-        "Based only on the filename, folder name, date, and nearby photos listed, "
-        "suggest the most likely location. Reply with ONLY the location name "
-        "(city, country format), or 'Unknown' if you genuinely cannot guess. "
-        "No explanation, no hedging, no mention of photos or images.\n\n"
-        + "\n".join(lines)
-    )
+    b64 = _encode_photo_for_ai(photo.get("path")) if photo.get("path") else None
+    if b64:
+        prompt = (
+            "Look at this photo and suggest where it was most likely taken. Use whatever's "
+            "visible — landmarks, architecture, signage or text, vegetation, terrain, road "
+            "signs, license plates, flags — together with the filename/folder/date/nearby-photo "
+            "metadata below, which may add useful context (or may just be an uninformative "
+            "camera-assigned name — don't let it override strong visual evidence). "
+            "Reply with ONLY the location name (city, country format), or 'Unknown' if you "
+            "genuinely can't tell even from the image. No explanation, no hedging, no mention "
+            "of photos or images.\n\n" + "\n".join(lines)
+        )
+        content = [_ai_image_block(b64), {"type":"text","text":prompt}]
+    else:
+        prompt = (
+            "You are a metadata assistant. The photo file couldn't be read, so you have NO "
+            "access to any image content — work only from the text metadata below.\n\n"
+            "Based only on the filename, folder name, date, and nearby photos listed, "
+            "suggest the most likely location. Reply with ONLY the location name "
+            "(city, country format), or 'Unknown' if you genuinely cannot guess. "
+            "No explanation, no hedging, no mention of photos or images.\n\n"
+            + "\n".join(lines)
+        )
+        content = prompt
     try:
         msg = anthropic.Anthropic().messages.create(
             model=get_ai_model(), max_tokens=30,
-            messages=[{"role":"user","content":prompt}])
+            messages=[{"role":"user","content":content}])
         _ai_increment()
         suggestion = msg.content[0].text.strip()
         usage = _ai_usage_info()
@@ -2221,21 +2264,38 @@ def api_ai_infer_with_coords():
     ]
     if photo.get("date_taken"):
         lines.append(f"Date taken: {photo['date_taken']}")
-    prompt = (
-        "You are a metadata assistant. You have NO access to any image files or photos. "
-        "Work only from the text metadata provided below.\n\n"
-        "A user manually pinned a location on a map for one photo in a folder. "
-        "Based only on the seed location and the filename/folder/date metadata below, "
-        "return the most likely location name for this photo. "
-        "If the seed location is reasonable, just return it as-is. "
-        "Reply with ONLY the location name (e.g. 'Paris, France'). "
-        "No explanation, no hedging, no mention of photos or images.\n\n"
-        + "\n".join(lines)
-    )
+    b64 = _encode_photo_for_ai(photo.get("path")) if photo.get("path") else None
+    if b64:
+        prompt = (
+            "A user manually pinned a location on a map for one photo in a folder, and wants "
+            "it applied to this photo too. Look at the image: does it plausibly belong at that "
+            "seed location, or does what you actually see (indoors vs. outdoors, landscape vs. "
+            "cityscape, climate/vegetation, any visible landmarks or signage) suggest otherwise? "
+            "Combine that with the filename/folder/date metadata below. If the seed location "
+            "looks right, return it as-is; if the photo clearly doesn't match it (and you can "
+            "tell where it actually is instead), return your own answer instead. "
+            "Reply with ONLY the location name (e.g. 'Paris, France'). "
+            "No explanation, no hedging, no mention of photos or images.\n\n"
+            + "\n".join(lines)
+        )
+        content = [_ai_image_block(b64), {"type":"text","text":prompt}]
+    else:
+        prompt = (
+            "You are a metadata assistant. The photo file couldn't be read, so you have NO "
+            "access to any image content — work only from the text metadata below.\n\n"
+            "A user manually pinned a location on a map for one photo in a folder. "
+            "Based only on the seed location and the filename/folder/date metadata below, "
+            "return the most likely location name for this photo. "
+            "If the seed location is reasonable, just return it as-is. "
+            "Reply with ONLY the location name (e.g. 'Paris, France'). "
+            "No explanation, no hedging, no mention of photos or images.\n\n"
+            + "\n".join(lines)
+        )
+        content = prompt
     try:
         msg = anthropic.Anthropic().messages.create(
             model=get_ai_model(), max_tokens=30,
-            messages=[{"role":"user","content":prompt}])
+            messages=[{"role":"user","content":content}])
         _ai_increment()
         location_name = msg.content[0].text.strip()
         # Reject any response that sounds like an apology/explanation

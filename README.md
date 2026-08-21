@@ -236,6 +236,48 @@ honor anyway.
 
 ### Unreleased
 
+**Added: 🤖 AI Suggest and the Propagate-to-folder AI check now actually
+look at the photo.** Both were, until now, pure text: the prompt
+literally said "you have NO access to any image files or photos," and
+every guess came from filename/folder/date/neighbor patterns alone — a
+folder full of `IMG_1234.jpg` files with no naming convention gave it
+nothing to work with, no matter how the prompt was worded. Both now
+attach the actual photo (downscaled to ~1024px and re-encoded the same
+way the app's own thumbnails are — no reason to ship a full-resolution
+original for this), and ask for landmarks, architecture, signage/text,
+vegetation, terrain, road signs, license plates, or flags, combined with
+whatever the metadata adds. The Propagate check also now genuinely
+verifies rather than rubber-stamping — it can look at the photo and
+decide it *doesn't* belong at the seed location. Falls back to the
+original text-only behavior if the file can't be decoded (RAW formats
+aren't Pillow-native, the same limitation `/api/thumbnail` already has)
+rather than failing the request. Verified with a mocked Anthropic client
+(no live API key in this environment) — confirmed the multimodal
+request shape and the text-only fallback path both build correctly;
+actual answer quality wants a real API key to judge.
+
+**Added: a sort control for the Sessions list** — Recent (last used,
+the previous fixed behavior), Name A–Z/Z–A, and Newest/Oldest first (by
+creation date). Sorted client-side (the full list was already fetched in
+one shot) and persisted the same way grid filter/sort/search/density
+already were. Sessions named by date needed this most: "recently
+clicked" and "chronological" are genuinely different, both useful,
+orderings, and there was previously no way to get anything but the
+former.
+
+**Improved: the "25/50" AI usage pill's tooltip didn't say what the
+numbers meant** — just the model name and reset time. Now spells out
+"25 of 50 daily AI Suggest calls used today."
+
+**Added: Date Taken to the multi-select batch "Set location" prompt**,
+now "Set location / date for selected" — sets the same timestamp across
+an arbitrary selection (any photos, any folders, via **Select all**/click
+in the grid), not just siblings of one photo in the same folder the way
+Push-date-to-folder works. Goes through the same `/api/save_batch` path
+as the existing batch location fields, which already accepted
+`date_taken` — this was a missing field in the dialog, not a missing
+capability in the backend.
+
 **Added: save a location for one-click reuse, plus a frequent-locations
 list.** A **💾 Save** button next to Geocode/Map in the detail view
 prompts for a label and stores the current coordinates; **📍 Saved**
