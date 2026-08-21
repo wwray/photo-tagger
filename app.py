@@ -1433,6 +1433,65 @@ def api_geocode_search():
         return jsonify({"error":"Search failed","results":[]}), 502
     return jsonify({"results":results})
 
+# ── Saved / frequent locations ──────────────────────────────────────
+# "Saved" is a short, explicit, user-curated list (places worth a single
+# click forever, like home) stored as JSON in the same settings table
+# everything else app-wide already lives in — a handful of entries never
+# justified a whole new table. "Frequent" isn't stored at all; it's
+# recomputed from however location_name is already actually being used
+# in the current library, so it's useful immediately with zero setup and
+# never goes stale relative to the real data.
+def _get_saved_locations():
+    raw = get_setting("saved_locations")
+    try:
+        return json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return []
+
+def _set_saved_locations(locs):
+    set_setting("saved_locations", json.dumps(locs))
+
+@app.route("/api/saved_locations")
+def api_saved_locations():
+    folder = request.args.get("folder","")
+    frequent = []
+    if folder:
+        rows = _get_db().execute("""
+            SELECT location_name AS name, AVG(lat) AS lat, AVG(lon) AS lon, COUNT(*) AS count
+            FROM photos
+            WHERE scan_root=? AND location_name IS NOT NULL AND location_name!=''
+                  AND lat IS NOT NULL AND lon IS NOT NULL
+            GROUP BY location_name
+            ORDER BY count DESC
+            LIMIT 8
+        """, (folder,)).fetchall()
+        frequent = rows_to_dicts(rows)
+    return jsonify({"saved": _get_saved_locations(), "frequent": frequent})
+
+@app.route("/api/saved_locations", methods=["POST"])
+def api_saved_locations_add():
+    data = request.json or {}
+    name, lat, lon = data.get("name"), data.get("lat"), data.get("lon")
+    if not name or lat is None or lon is None:
+        return jsonify({"error":"name, lat, lon required"}), 400
+    locs = _get_saved_locations()
+    locs = [l for l in locs if l.get("name") != name]  # re-saving a name updates it, doesn't duplicate it
+    locs.insert(0, {"name":name, "lat":lat, "lon":lon})
+    locs = locs[:50]  # a sane cap — this is a quick-pick list, not a gazetteer
+    _set_saved_locations(locs)
+    return jsonify({"ok":True, "saved":locs})
+
+@app.route("/api/saved_locations/delete", methods=["POST"])
+def api_saved_locations_delete():
+    data = request.json or {}
+    idx = data.get("index")
+    locs = _get_saved_locations()
+    if not isinstance(idx,int) or not (0 <= idx < len(locs)):
+        return jsonify({"error":"invalid index"}), 400
+    locs.pop(idx)
+    _set_saved_locations(locs)
+    return jsonify({"ok":True, "saved":locs})
+
 # ── Save ──────────────────────────────────────────────────────────
 @app.route("/api/save", methods=["POST"])
 def api_save():

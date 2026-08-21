@@ -55,6 +55,7 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 - **Scans** any folder recursively for JPEG and RAW photos (CR2, NEF, ARW, ORF, RW2, DNG)
 - **Reads EXIF**: date taken, GPS coordinates, existing location tags
 - **Reverse geocodes** GPS coordinates to human-readable city/country names (OpenStreetMap, free, no API key)
+- **Saved and frequent locations**: one-click reuse of places you've saved (home, work, ...) or already used often in the current folder
 - **Infers locations** for un-GPS-tagged photos based on nearby timestamped photos (±4 hour window), automatically on every scan and on demand via **📍 Infer Nearby** right after tagging a photo by hand — no rescan needed to propagate it to siblings; the matched place name is filled in too, not just coordinates
 - **Location history import**: match un-GPS-tagged photos against an imported Google Takeout `Records.json` or GPX track by timestamp — offline, no API key, and more reliable than inferring from other photos since it's where *you* actually were (see below)
 - **AI suggestions** via Claude API for photos that can't be auto-inferred (optional)
@@ -234,6 +235,36 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Added: save a location for one-click reuse, plus a frequent-locations
+list.** A **💾 Save** button next to Geocode/Map in the detail view
+prompts for a label and stores the current coordinates; **📍 Saved**
+opens a dropdown of everything saved (each removable) plus a "Frequent
+in this folder" section computed live from however `location_name` is
+already used in the current library — no setup, and it can never drift
+from the real data. Saved locations persist in the existing app-wide
+settings store, not per-folder, since a place like home doesn't change
+just because you're scanning a different folder.
+
+**Fixed: the detail view's nav arrows and rotate controls physically
+moved around the screen from photo to photo.** Both are positioned
+relative to the image wrap box, which only had a `min-height` — a
+landscape photo rendered a short box, a portrait rendered a tall one (up
+to the image's own height cap), so the controls' absolute position
+shifted with every photo's aspect ratio. The wrap is now a fixed height
+regardless of what's inside it; the image letterboxes within it via
+`object-fit:contain` instead of resizing the box around itself.
+
+**Added: the Propagate/Push-date hover preview shows and toggles the
+checkbox too.** Enlarging a photo to check it used to mean losing sight
+of it again to reach back down to the tiny checkbox on the small card —
+the preview now shows the same checkbox state and can be clicked
+directly to toggle it (via the small card's own click handler, so the
+actual toggle logic still lives in one place). Since the preview is
+centered on top of the card that triggered it, making it clickable meant
+it could also cover that same card — worked around with a short grace
+period before actually hiding on mouseleave, so moving the cursor from
+the card onto the preview doesn't trigger a hide/show flicker.
 
 **Added: hover a filename in "Review pending changes" to see the photo.**
 The list only ever showed field names and old/new values — no way to

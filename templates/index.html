@@ -231,9 +231,18 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .detail-panel{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius-lg);width:100%;max-width:min(94vw,1400px);max-height:92vh;
   overflow:hidden;display:grid;grid-template-columns:1fr 360px}
-.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;min-height:380px;
-  position:relative;overflow:hidden}
-.detail-img-wrap img{max-width:100%;max-height:82vh;object-fit:contain;display:block;transition:transform .2s}
+/* A fixed height, not just a min-height floor — this box used to size
+   itself to whatever the current photo's rendered dimensions were (a
+   landscape photo made it short, a portrait made it tall, up to the
+   image's own 82vh cap), which meant the nav arrows and rotate controls
+   (both positioned relative to *this* box) physically moved around the
+   screen every time an adjacent photo had a different aspect ratio.
+   Fixed height + object-fit:contain on the image means this box is the
+   same size for every photo; the image letterboxes inside it instead of
+   resizing it. */
+.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;
+  height:min(86vh,800px);position:relative;overflow:hidden}
+.detail-img-wrap img{max-width:100%;max-height:100%;object-fit:contain;display:block;transition:transform .2s}
 .detail-img-wrap.zoomed img{transition:none} /* dragging shouldn't lag behind the cursor */
 .zoom-hint{position:absolute;top:10px;right:10px;background:rgba(15,17,23,.65);color:#fff;
   font-size:11px;padding:3px 8px;border-radius:10px;backdrop-filter:blur(4px);pointer-events:none;
@@ -327,6 +336,21 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .map-search-result:last-child{border-bottom:none}
 .map-search-result:hover{background:var(--surface)}
 
+.saved-locations-wrap{position:relative}
+.saved-locations-dropdown{position:absolute;left:0;right:0;top:100%;margin-top:4px;z-index:20;
+  min-width:220px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  max-height:260px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
+.saved-location-section{padding:6px 10px;font-size:10px;font-weight:700;letter-spacing:.4px;
+  text-transform:uppercase;color:var(--text-dim);background:var(--surface)}
+.saved-location-item{display:flex;align-items:center;gap:6px;padding:7px 10px;font-size:12px;
+  cursor:pointer;border-bottom:1px solid var(--border)}
+.saved-location-item:last-child{border-bottom:none}
+.saved-location-item:hover{background:var(--surface)}
+.saved-location-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.saved-location-item .count{color:var(--text-dim);font-size:10px;font-family:var(--mono);flex-shrink:0}
+.saved-location-remove{color:var(--red);cursor:pointer;padding:2px 6px;border-radius:4px;flex-shrink:0}
+.saved-location-remove:hover{background:var(--red-dim)}
+
 /* ── Folder seed bar ── */
 .folder-seed-bar{background:var(--accent-dim);border:1px solid var(--accent);border-radius:var(--radius);
   padding:8px 12px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--accent);flex-wrap:wrap}
@@ -391,6 +415,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   width:380px;aspect-ratio:4/3;background:var(--surface2);border:2px solid var(--accent);
   border-radius:var(--radius-lg);box-shadow:0 24px 60px rgba(0,0,0,.75);overflow:hidden}
 .photo-hover-preview img{width:100%;height:100%;object-fit:cover;display:block}
+/* Only when hovering a checkable Propagate/Push-date card (see
+   showPhotoPreview) — the pending-changes list's plain filename hover
+   never gets this, there's nothing to check there. Lets the checked
+   state be seen — and toggled — without looking away from the enlarged
+   photo to find the tiny checkbox on the small card underneath it. */
+.photo-hover-preview.checkable{pointer-events:auto;cursor:pointer}
 .seed-thumb{position:relative;width:100%;padding-top:75%;overflow:hidden;background:var(--surface)}
 .seed-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
 .seed-item-info{padding:8px 10px}
@@ -400,7 +430,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .seed-checkbox{position:absolute;top:8px;left:8px;width:24px;height:24px;border-radius:6px;
   background:rgba(15,17,23,.75);border:2px solid rgba(255,255,255,.4);
   display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;color:#fff;z-index:1}
-.seed-item.checked .seed-checkbox{background:var(--accent);border-color:var(--accent)}
+.seed-item.checked .seed-checkbox,.seed-checkbox.checked{background:var(--accent);border-color:var(--accent)}
 .seed-tabs{display:flex;gap:6px;padding:12px 16px 0;flex-wrap:wrap}
 .seed-tab{padding:5px 12px;border-radius:14px;border:1px solid var(--border);background:var(--surface2);
   color:var(--text-muted);font-size:12px;cursor:pointer;transition:border-color .1s,color .1s}
@@ -663,6 +693,11 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
         <div style="display:flex;gap:5px;flex-wrap:wrap">
           <button class="btn btn-ghost btn-sm" onclick="reverseGeocode()" id="geocodeBtn">🌍 Geocode</button>
           <button class="btn btn-ghost btn-sm" onclick="openMapPicker()">🗺️ Map</button>
+          <button class="btn btn-ghost btn-sm" onclick="saveCurrentLocation()" title="Save this location for one-click reuse later">💾 Save</button>
+          <div class="saved-locations-wrap">
+            <button class="btn btn-ghost btn-sm" onclick="toggleSavedLocations()" id="savedLocationsBtn">📍 Saved</button>
+            <div class="saved-locations-dropdown" id="savedLocationsDropdown" style="display:none"></div>
+          </div>
         </div>
       </div>
       <div class="field-group" id="detailExifGroup" style="display:none">
@@ -792,7 +827,10 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
      whatever photo is currently hovered. Top-level (not nested in any one
      modal) since it's used from more than one: the Propagate/Push-date
      checklist and the pending-changes review list. See showPhotoPreview(). -->
-<div class="photo-hover-preview" id="photoHoverPreview"><img id="photoHoverPreviewImg" alt=""/></div>
+<div class="photo-hover-preview" id="photoHoverPreview">
+  <div class="seed-checkbox" id="photoHoverPreviewCheckbox" style="display:none"></div>
+  <img id="photoHoverPreviewImg" alt=""/>
+</div>
 
 <!-- Folder browser -->
 <div class="map-modal" id="browserModal" style="display:none" onclick="closeBrowser(event)">
@@ -1068,8 +1106,8 @@ async function openPendingModal() {
         </div>
         ${changes}`;
       const filenameEl = item.querySelector('.pending-filename');
-      filenameEl.onmouseenter = () => showPhotoPreview(filenameEl, p.path);
-      filenameEl.onmouseleave = hidePhotoPreview;
+      filenameEl.onmouseenter = () => { cancelHidePhotoPreview(); showPhotoPreview(filenameEl, p.path); };
+      filenameEl.onmouseleave = scheduleHidePhotoPreview;
       list.appendChild(item);
     });
   }
@@ -1784,6 +1822,91 @@ function numOrNull(str){
   const n=parseFloat(str);
   return Number.isNaN(n)?null:n;
 }
+
+// ── Saved / frequent locations ───────────────────────────────────────
+// "Saved" is a short, user-curated list (persisted server-side, shared
+// across every folder/session — home doesn't change scan roots) for
+// places worth reaching in one click forever. "Frequent" is recomputed
+// live from location_name usage in the CURRENT folder, so it's useful
+// immediately with nothing to set up and never drifts from what's
+// actually in the library.
+let _savedLocsCache=[], _frequentLocsCache=[];
+let _savedLocationsOpen=false;
+
+async function saveCurrentLocation(){
+  const loc=document.getElementById('detailLocation').value.trim();
+  const lat=numOrNull(document.getElementById('detailLat').value);
+  const lon=numOrNull(document.getElementById('detailLon').value);
+  if(lat===null||lon===null){ toast('Set coordinates first','error'); return; }
+  const label=await customPrompt('Save this location as:', loc||'');
+  if(!label) return;
+  const r=await fetch('/api/saved_locations',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({name:label,lat,lon})});
+  const d=await r.json();
+  if(d.error){ toast('Could not save: '+d.error,'error'); return; }
+  toast(`Saved "${label}"`,'success');
+}
+
+async function toggleSavedLocations(){
+  const dd=document.getElementById('savedLocationsDropdown');
+  if(_savedLocationsOpen){ dd.style.display='none'; _savedLocationsOpen=false; return; }
+  const r=await fetch('/api/saved_locations?folder='+encodeURIComponent(currentScanRoot||''));
+  const d=await r.json();
+  _savedLocsCache=d.saved||[]; _frequentLocsCache=d.frequent||[];
+  renderSavedLocationsDropdown();
+  dd.style.display='block';
+  _savedLocationsOpen=true;
+}
+
+function renderSavedLocationsDropdown(){
+  const dd=document.getElementById('savedLocationsDropdown');
+  const rows=[];
+  if(_savedLocsCache.length){
+    rows.push('<div class="saved-location-section">Saved</div>');
+    _savedLocsCache.forEach((s,i)=>rows.push(
+      `<div class="saved-location-item">
+         <span class="name" onclick="applySavedLocation(_savedLocsCache[${i}])">${escapeHtml(s.name)}</span>
+         <span class="saved-location-remove" onclick="removeSavedLocation(${i},event)" title="Remove">✕</span>
+       </div>`));
+  }
+  if(_frequentLocsCache.length){
+    rows.push('<div class="saved-location-section">Frequent in this folder</div>');
+    _frequentLocsCache.forEach((f,i)=>rows.push(
+      `<div class="saved-location-item" onclick="applySavedLocation(_frequentLocsCache[${i}])">
+         <span class="name">${escapeHtml(f.name)}</span><span class="count">${f.count}×</span>
+       </div>`));
+  }
+  dd.innerHTML = rows.length ? rows.join('')
+    : '<div style="padding:12px;color:var(--text-dim);font-size:12px">No saved or frequent locations yet.</div>';
+}
+
+function applySavedLocation(loc){
+  if(!loc) return;
+  document.getElementById('detailLocation').value=loc.name;
+  document.getElementById('detailLat').value=loc.lat;
+  document.getElementById('detailLon').value=loc.lon;
+  markDetailDirty(); onCoordsChanged();
+  document.getElementById('savedLocationsDropdown').style.display='none';
+  _savedLocationsOpen=false;
+}
+
+async function removeSavedLocation(i,e){
+  e.stopPropagation(); // don't also trigger the row's own click (applySavedLocation)
+  await fetch('/api/saved_locations/delete',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({index:i})});
+  _savedLocsCache.splice(i,1);
+  renderSavedLocationsDropdown();
+}
+
+// Closing on outside-click matches every other dropdown/popover in the
+// app (map search results, etc. close on their own next action) — this
+// one's longer-lived (no auto-refresh trigger) so it needs its own.
+document.addEventListener('click',e=>{
+  if(!_savedLocationsOpen) return;
+  if(e.target.closest('.saved-locations-wrap')) return;
+  document.getElementById('savedLocationsDropdown').style.display='none';
+  _savedLocationsOpen=false;
+});
 
 async function saveDetail(){
   const p=currentPhoto();
@@ -2645,8 +2768,8 @@ function renderSeedGrid(){
       item.querySelector('.seed-checkbox').textContent=nowChecked?'✓':'';
       updateSeedBtn();
     };
-    item.onmouseenter=()=>showPhotoPreview(item,t.path);
-    item.onmouseleave=hidePhotoPreview;
+    item.onmouseenter=()=>{ cancelHidePhotoPreview(); showPhotoPreview(item,t.path); };
+    item.onmouseleave=scheduleHidePhotoPreview;
     list.appendChild(item);
   });
   updateSeedBtn();
@@ -2673,8 +2796,55 @@ function showPhotoPreview(item,path){
   preview.style.left=left+'px';
   preview.style.top=top+'px';
   preview.style.display='block';
+
+  // Propagate/Push-date cards are individually checkable — surface that
+  // state on the preview too, and let clicking the preview toggle it
+  // (via the small card's own click handler, so the toggle logic itself
+  // stays in one place), instead of "is this checked?" only being
+  // answerable by looking away from the enlarged photo back down at the
+  // tiny checkbox on the card underneath it.
+  const checkbox=document.getElementById('photoHoverPreviewCheckbox');
+  if(item.classList && item.classList.contains('seed-item')){
+    preview.classList.add('checkable');
+    checkbox.style.display='flex';
+    const sync=()=>{
+      const checked=item.classList.contains('checked');
+      checkbox.classList.toggle('checked',checked);
+      checkbox.textContent=checked?'✓':'';
+    };
+    sync();
+    preview.onclick=()=>{ item.click(); sync(); };
+  } else {
+    preview.classList.remove('checkable');
+    checkbox.style.display='none';
+    preview.onclick=null;
+  }
 }
-function hidePhotoPreview(){ document.getElementById('photoHoverPreview').style.display='none'; }
+function hidePhotoPreview(){
+  const preview=document.getElementById('photoHoverPreview');
+  preview.style.display='none';
+  preview.onclick=null;
+}
+// The preview is centered on top of the hovered card (so the enlarged
+// photo appears "in place" rather than off to one side), which means a
+// checkable preview visually covers the very card whose mouseenter
+// showed it — moving the cursor from the card onto the preview would
+// otherwise register as leaving the card, hide the preview, land back on
+// the now-revealed card, show it again, forever, in a real browser, not
+// just a test. A short grace period before actually hiding lets the
+// cursor cross that gap; entering either the card or the preview cancels
+// a pending hide, leaving both is what actually hides it.
+let _photoPreviewHideTimer=null;
+function cancelHidePhotoPreview(){ clearTimeout(_photoPreviewHideTimer); }
+function scheduleHidePhotoPreview(){
+  clearTimeout(_photoPreviewHideTimer);
+  _photoPreviewHideTimer=setTimeout(hidePhotoPreview,150);
+}
+(function(){
+  const preview=document.getElementById('photoHoverPreview');
+  preview.onmouseenter=cancelHidePhotoPreview;
+  preview.onmouseleave=scheduleHidePhotoPreview;
+})();
 
 function updateSeedBtn(){
   const n=_seedTargets.filter(t=>!_seedUnchecked.has(t.id)).length;
