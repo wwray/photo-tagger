@@ -983,6 +983,19 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       trying a bigger model if suggestions are often wrong. Takes effect on the next AI
       Suggest click, no restart needed.</div>
     </div>
+    <div class="field-group" style="margin-bottom:6px;border-top:1px solid var(--border);padding-top:14px">
+      <div class="field-label">Geocoding provider</div>
+      <select class="field-input" id="settingsGeocoderProvider" onchange="onGeocoderProviderChange()"></select>
+      <div class="field-hint" id="settingsGeocoderHint"></div>
+      <div id="settingsGeocoderKeyWrap" style="display:none;margin-top:6px">
+        <div style="display:flex;gap:6px">
+          <input class="field-input" id="settingsGeocoderKey" type="password"
+                 placeholder="API key" autocomplete="off"/>
+          <button class="btn btn-ghost btn-sm" onclick="clearGeocoderKey()" title="Remove the saved key">✕</button>
+        </div>
+        <div class="field-hint" id="settingsGeocoderKeyStatus"></div>
+      </div>
+    </div>
     <div style="display:flex;gap:8px;margin-top:14px">
       <button class="btn btn-primary" onclick="saveSettings()">Save</button>
       <button class="btn btn-ghost" onclick="closeSettingsModal()">Cancel</button>
@@ -1020,6 +1033,8 @@ function currentPhoto(){
 let dryRun=true, currentScanRoot='';
 let _pollInterval=null;
 let _aiModel='';
+let _geocoderProviders=[];  // [{id,label,needs_key,signup_url}, ...] from /api/config
+let _geocoderProvider='nominatim', _hasGeocoderKey=false;
 let detailRotationDeg=0;   // pending rotation for the open photo — applied on Save, like every other field
 let detailDirty=false;     // true once a detail field has been edited since openDetail() populated it
 let _lastGridClick=null;   // index of the last card clicked — anchor for shift-click range select
@@ -2489,22 +2504,69 @@ function closeHistoryModal(e){
 // ── Settings ───────────────────────────────────────────────────────
 function openSettingsModal(){
   document.getElementById('settingsAiModel').value=_aiModel;
+  renderGeocoderProviderOptions();
+  document.getElementById('settingsGeocoderKey').value='';  // never re-populated with the real key — see saveSettings
   document.getElementById('settingsModal').style.display='flex';
 }
 function closeSettingsModal(e){
   if(e&&e.target!==document.getElementById('settingsModal')) return;
   document.getElementById('settingsModal').style.display='none';
 }
+function renderGeocoderProviderOptions(){
+  const sel=document.getElementById('settingsGeocoderProvider');
+  sel.innerHTML=_geocoderProviders.map(p=>
+    `<option value="${escapeHtml(p.id)}"${p.id===_geocoderProvider?' selected':''}>${escapeHtml(p.label)}</option>`
+  ).join('');
+  onGeocoderProviderChange();
+}
+function onGeocoderProviderChange(){
+  const sel=document.getElementById('settingsGeocoderProvider');
+  const p=_geocoderProviders.find(x=>x.id===sel.value);
+  const keyWrap=document.getElementById('settingsGeocoderKeyWrap');
+  const hint=document.getElementById('settingsGeocoderHint');
+  const status=document.getElementById('settingsGeocoderKeyStatus');
+  if(!p) return;
+  keyWrap.style.display=p.needs_key?'block':'none';
+  hint.textContent = p.needs_key
+    ? `Requires a free/paid API key from ${p.signup_url||'the provider'}.`
+    : 'No key needed — used automatically.';
+  if(p.needs_key){
+    status.textContent = (p.id===_geocoderProvider && _hasGeocoderKey)
+      ? '🔑 A key is already saved for this provider — leave blank to keep it.'
+      : 'No key saved yet for this provider.';
+  }
+}
+async function clearGeocoderKey(){
+  if(!await customConfirm('Remove the saved geocoder API key?',{danger:true})) return;
+  const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({clear_geocoder_key:true})});
+  const d=await r.json();
+  _hasGeocoderKey=d.has_geocoder_key;
+  document.getElementById('settingsGeocoderKey').value='';
+  onGeocoderProviderChange();
+  toast('Geocoder key removed');
+}
 async function saveSettings(){
   const model=document.getElementById('settingsAiModel').value.trim();
+  const provider=document.getElementById('settingsGeocoderProvider').value;
+  const key=document.getElementById('settingsGeocoderKey').value.trim();
+  const body={ai_model:model, geocoder_provider:provider};
+  if(key) body.geocoder_api_key=key;  // blank means "leave the saved key alone" — see api_settings
   const r=await fetch('/api/settings',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({ai_model:model})});
+    body:JSON.stringify(body)});
   const d=await r.json();
   _aiModel=d.ai_model;
+  _geocoderProvider=d.geocoder_provider;
+  _hasGeocoderKey=d.has_geocoder_key;
   document.getElementById('settingsAiModel').value=_aiModel;
   const pill=document.getElementById('aiUsagePill');
   if(pill) pill.title=`Model: ${_aiModel}. Resets midnight.`;
-  toast('Settings saved — model: '+_aiModel,'success');
+  const providerInfo=_geocoderProviders.find(p=>p.id===_geocoderProvider);
+  if(providerInfo && providerInfo.needs_key && !_hasGeocoderKey){
+    toast(`Settings saved, but ${providerInfo.label} needs an API key — falling back to Nominatim until one is set.`,'error');
+  } else {
+    toast('Settings saved — model: '+_aiModel,'success');
+  }
   closeSettingsModal();
 }
 
@@ -3176,6 +3238,9 @@ initGridMarquee();
   try{
     const r=await fetch('/api/config'); const cfg=await r.json();
     _aiModel = cfg.ai_model||'';
+    _geocoderProviders = cfg.geocoder_providers||[];
+    _geocoderProvider = cfg.geocoder_provider||'nominatim';
+    _hasGeocoderKey = !!cfg.has_geocoder_key;
     const _vp=loadViewPrefs();
     // Two different <select class="sort-select"> exist now (grid sort, session
     // sort) — querySelector('.sort-select') alone would just grab whichever

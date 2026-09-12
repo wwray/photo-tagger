@@ -144,6 +144,7 @@ ANTHROPIC_API_KEY=sk-ant-... docker compose up -d
 | `PHOTO_ROOT` | `/photos` | Container path pre-filled in the scan box |
 | `AI_DAILY_LIMIT` | `50` | Max AI suggestion calls per day (cost control) |
 | `AI_MODEL` | `claude-haiku-4-5-20251001` | Anthropic model used for AI suggestions |
+| `SCAN_WORKERS` | `min(8, cpu_count*2)` | Concurrent threads reading EXIF/hashes during a scan. Lower this if scanning over a slow network share or spinning-disk NAS makes things *worse* (seek thrashing), not better |
 
 ---
 
@@ -200,6 +201,33 @@ timezone (UTC is the safe case); there's no per-import offset setting.
 
 ---
 
+## Geocoding providers
+
+Reverse/forward geocoding (turning GPS coordinates into a place name, and
+the map picker's address search) defaults to **Nominatim** (OpenStreetMap) —
+free, no signup, no API key. Its usage policy caps anonymous use at ~1
+request/sec, which is the real, unavoidable pace for geocoding a large
+backlog of GPS photos on the default setup (500 photos ≈ 10 min).
+
+If you have (or are willing to get) a free-tier key from a faster service,
+**⚙️ Settings → Geocoding provider** lets you switch to:
+
+| Provider | Free tier | Needs a key? |
+|----------|-----------|--------------|
+| Nominatim (default) | Unlimited, ~1 req/sec | No |
+| LocationIQ | 5,000/day | Yes |
+| OpenCage | 2,500/day | Yes |
+| Mapbox | 100,000/month | Yes |
+| Google Maps | Paid, $200/mo credit | Yes (billing-enabled project) |
+
+The key is stored server-side (same settings store as the AI model), never
+re-displayed once saved, and can be cleared from the same screen. Picking a
+provider that needs a key but leaving the key blank falls back to Nominatim
+automatically rather than failing every geocode call — the same
+fail-safe pattern the app uses for dry run and the AI model.
+
+---
+
 ## How metadata is written
 
 | Format | Method |
@@ -218,9 +246,10 @@ honor anyway.
 
 ## Notes
 
-- Nominatim geocoding is rate-limited to ~1 req/sec (OSM policy). Geocoding 500 photos takes ~10 min.
+- Nominatim geocoding is rate-limited to ~1 req/sec (OSM policy). Geocoding 500 photos takes ~10 min. A faster provider can be configured in Settings — see "Geocoding providers" above.
 - AI suggestions are optional — the app works fully without an API key, just without that one button.
-- Thumbnails are generated on-the-fly; first grid load on a large library may take a moment.
+- Thumbnails are cached to disk on first request (keyed by path+size, self-invalidating on file changes), so only the very first view of a photo at a given size pays the decode cost.
+- Scanning reads EXIF and computes hashes for multiple photos concurrently (`SCAN_WORKERS`, default up to 8) instead of one file at a time.
 - **Always keep backups before writing metadata in bulk.**
 - Back up `data/phototagger.db` too — it holds your sessions, hash cache, and any pending (not-yet-committed) changes. Losing it doesn't touch your photos, but you'd lose that state and have to rescan.
 
@@ -235,6 +264,42 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Performance: scans now read EXIF/hash multiple photos concurrently
+instead of one at a time.** Reading EXIF and computing two perceptual
+hashes per photo is both I/O-bound (opening the file) and CPU-bound
+(imagehash) work that never overlapped — one photo fully finished before
+the next was even opened. A thread pool (`SCAN_WORKERS`, default up to 8)
+now overlaps many files' I/O and hashing at once; the database writes,
+commits, and progress updates stay single-threaded on the scan's own
+connection, so nothing about the DB access becomes concurrent — only the
+pure per-file read/hash work does.
+
+**Performance: thumbnails are now cached to disk instead of being
+regenerated from the full-resolution source on every request.** Every
+grid render, scroll, and duplicate-group view decoded and re-encoded the
+same photo over and over — no disk cache, and no `Cache-Control` header
+telling the browser to keep its own copy either. Cached one file per
+(path, size); a rotate or EXIF write overwrites that same cache entry in
+place instead of leaving the old version behind, so cache footprint stays
+proportional to distinct photos × sizes actually viewed.
+
+**Added: selectable geocoding provider.** Nominatim (free, no key) is
+still the default, but **⚙️ Settings** now has a **Geocoding provider**
+dropdown to switch to LocationIQ, OpenCage, Mapbox, or Google Maps — each
+faster than Nominatim's ~1 req/sec usage-policy pace if you have (or get)
+a free-tier key. See the new "Geocoding providers" section above. Falls
+back to Nominatim automatically if a keyed provider is selected with no
+key saved, rather than failing every geocode call.
+
+**Fixed: the History modal's "✕ remove import" and "🔎 Match photos"
+appeared to do nothing.** Both `customConfirm()`/`customPrompt()` (z-index
+200) and toast notifications (z-index 300) rendered *below* the modal
+overlay class they were most often triggered from (z-index 400) — the
+confirm dialog for removing an import was invisible and unclickable
+behind the still-open History modal, and a Match Photos result toast was
+hidden the same way, making a working request look like a no-op. Both
+now render above any modal.
 
 **Added: drag-and-drop custom ordering for the Sessions list**, alongside
 the existing sort dropdown — pick "Custom (drag to reorder)" and it seeds

@@ -17,6 +17,8 @@ from array import array
 from collections import deque
 from pathlib import Path
 from datetime import datetime
+from urllib.parse import quote as _url_quote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ijson
 import exifread
@@ -85,8 +87,16 @@ sys.stderr = _TeeStream(sys.stderr, "err")
 # ─── Config ───────────────────────────────────────────────────────────────────
 
 PHOTO_EXTENSIONS   = {".jpg", ".jpeg", ".cr2", ".nef", ".arw", ".orf", ".rw2", ".dng"}
-GEOCODE_DELAY      = 1.1
 _EPOCH = datetime(1970, 1, 1)  # fixed reference point for turning a naive date_taken into a sortable float
+# EXIF/hash reading during a scan is one file at a time in I/O (open the
+# file) and CPU (phash/dhash) work — neither saturates a single core, so a
+# thread pool overlaps many files' I/O and hashing instead of doing it
+# strictly one-at-a-time. Capped rather than unbounded: too many threads
+# hammering a spinning-disk NAS at once can make each individual read
+# *slower* (seek thrashing) even though total throughput might rise on an
+# SSD — SCAN_WORKERS lets that be tuned per deployment instead of assumed.
+SCAN_WORKERS       = int(os.environ.get("SCAN_WORKERS", min(8, (os.cpu_count() or 4) * 2)))
+THUMB_CACHE_DIR    = Path(os.environ.get("DB_PATH", "/app/data/phototagger.db")).parent / "thumb_cache"
 DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
 AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
 AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5")
@@ -608,42 +618,177 @@ def compute_hashes(filepath):
     except Exception: pass
     return file_hash, phash_str, dhash_str
 
-def _geocode_throttle():
-    """Nominatim's usage policy caps anonymous use at ~1 req/sec — every
-    call that hits it (reverse or forward) goes through this one gate
-    so the limit holds regardless of which endpoint is calling."""
+# ─── Geocoder providers ────────────────────────────────────────────────────
+# Nominatim is the zero-config default (free, no key, ~1 req/sec usage
+# policy) — but that 1/sec pace is the single biggest fixed cost in a scan
+# with a large GPS backlog (500 photos ≈ 10 min, unavoidably). Every
+# provider below is pluggable behind the same reverse/forward interface so
+# someone with a key for a faster service can opt in from Settings without
+# anyone else's zero-config setup breaking. "delay" is each provider's own
+# published free-tier rate limit (kept conservative on purpose — better to
+# under-use a free tier than get the key throttled/banned).
+GEOCODER_PROVIDERS = {
+    "nominatim":  {"label": "Nominatim (OpenStreetMap) — free, no key",
+                   "needs_key": False, "delay": 1.1,  "signup_url": None},
+    "locationiq": {"label": "LocationIQ — free tier, 5,000/day",
+                   "needs_key": True,  "delay": 0.55, "signup_url": "https://locationiq.com"},
+    "opencage":   {"label": "OpenCage — free tier, 2,500/day",
+                   "needs_key": True,  "delay": 1.05, "signup_url": "https://opencagedata.com"},
+    "mapbox":     {"label": "Mapbox — free tier, 100,000/mo",
+                   "needs_key": True,  "delay": 0.15, "signup_url": "https://www.mapbox.com"},
+    "google":     {"label": "Google Maps — paid (billing required), $200/mo credit",
+                   "needs_key": True,  "delay": 0.05, "signup_url": "https://console.cloud.google.com/google/maps-apis"},
+}
+_GEOCODE_UA = {"User-Agent": "PhotoTagger/1.0"}
+
+def get_geocoder_provider():
+    p = get_setting("geocoder_provider", "nominatim")
+    return p if p in GEOCODER_PROVIDERS else "nominatim"
+
+def get_geocoder_api_key():
+    return get_setting("geocoder_api_key", "") or ""
+
+def _active_geocoder():
+    """Resolve (provider, key) for the next call. Fails safe: a provider
+    that needs a key but has none configured silently falls back to
+    Nominatim rather than erroring on every single geocode call — the same
+    "never break the zero-config path" approach as dry_run/ai_model."""
+    provider = get_geocoder_provider()
+    key = get_geocoder_api_key()
+    if GEOCODER_PROVIDERS[provider]["needs_key"] and not key:
+        return "nominatim", ""
+    return provider, key
+
+def _geocode_throttle(provider):
+    """Every call that hits a geocoder (reverse or forward) goes through
+    this one gate so that provider's own rate limit holds regardless of
+    which endpoint/thread is calling."""
     global _last_geocode
+    delay = GEOCODER_PROVIDERS.get(provider, GEOCODER_PROVIDERS["nominatim"])["delay"]
     with _geocode_lock:
-        wait = GEOCODE_DELAY - (time.time() - _last_geocode)
+        wait = delay - (time.time() - _last_geocode)
         if wait > 0: time.sleep(wait)
         _last_geocode = time.time()
 
+def _nominatim_style_name(data):
+    """Nominatim and LocationIQ (a Nominatim-compatible API) share this
+    exact response shape — one parser covers both."""
+    addr = data.get("address", {})
+    parts = []
+    for key in ("city","town","village","municipality","county"):
+        if key in addr: parts.append(addr[key]); break
+    if "country" in addr: parts.append(addr["country"])
+    return ", ".join(parts) if parts else data.get("display_name","")
+
+def _reverse_nominatim(lat, lon, key):
+    r = requests.get("https://nominatim.openstreetmap.org/reverse",
+        params={"lat":lat,"lon":lon,"format":"json","zoom":14},
+        headers=_GEOCODE_UA, timeout=10)
+    return _nominatim_style_name(r.json())
+
+def _reverse_locationiq(lat, lon, key):
+    r = requests.get("https://us1.locationiq.com/v1/reverse",
+        params={"key":key,"lat":lat,"lon":lon,"format":"json"}, timeout=10)
+    return _nominatim_style_name(r.json())
+
+def _reverse_opencage(lat, lon, key):
+    r = requests.get("https://api.opencagedata.com/geocode/v1/json",
+        params={"q":f"{lat}+{lon}","key":key,"no_annotations":1,"limit":1}, timeout=10)
+    results = r.json().get("results", [])
+    if not results: return None
+    comp = results[0].get("components", {})
+    parts = []
+    for k in ("city","town","village","municipality","county"):
+        if k in comp: parts.append(comp[k]); break
+    if "country" in comp: parts.append(comp["country"])
+    return ", ".join(parts) if parts else results[0].get("formatted")
+
+def _reverse_mapbox(lat, lon, key):
+    r = requests.get(f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json",
+        params={"access_token":key,"types":"place,locality,region,country"}, timeout=10)
+    features = r.json().get("features", [])
+    return features[0].get("place_name") if features else None
+
+def _reverse_google(lat, lon, key):
+    r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
+        params={"latlng":f"{lat},{lon}","key":key}, timeout=10)
+    results = r.json().get("results", [])
+    if not results: return None
+    by_type = {}
+    for c in results[0].get("address_components", []):
+        for t in c.get("types", []):
+            by_type.setdefault(t, c.get("long_name"))
+    parts = []
+    for t in ("locality","postal_town","administrative_area_level_2"):
+        if t in by_type: parts.append(by_type[t]); break
+    if "country" in by_type: parts.append(by_type["country"])
+    return ", ".join(parts) if parts else results[0].get("formatted_address")
+
+_REVERSE_GEOCODERS = {"nominatim":_reverse_nominatim, "locationiq":_reverse_locationiq,
+                      "opencage":_reverse_opencage, "mapbox":_reverse_mapbox, "google":_reverse_google}
+
 def reverse_geocode(lat, lon):
-    _geocode_throttle()
+    provider, key = _active_geocoder()
+    _geocode_throttle(provider)
     try:
-        r = requests.get("https://nominatim.openstreetmap.org/reverse",
-            params={"lat":lat,"lon":lon,"format":"json","zoom":14},
-            headers={"User-Agent":"PhotoTagger/1.0"}, timeout=10)
-        addr = r.json().get("address",{})
-        parts = []
-        for key in ("city","town","village","municipality","county"):
-            if key in addr: parts.append(addr[key]); break
-        if "country" in addr: parts.append(addr["country"])
-        return ", ".join(parts) if parts else r.json().get("display_name","")
-    except Exception: return None
+        return _REVERSE_GEOCODERS[provider](lat, lon, key)
+    except Exception:
+        return None
+
+def _forward_nominatim(query, limit, key):
+    r = requests.get("https://nominatim.openstreetmap.org/search",
+        params={"q":query,"format":"json","limit":limit},
+        headers=_GEOCODE_UA, timeout=10)
+    return [{"name":x.get("display_name",""),"lat":float(x["lat"]),"lon":float(x["lon"])}
+            for x in r.json()]
+
+def _forward_locationiq(query, limit, key):
+    r = requests.get("https://us1.locationiq.com/v1/search",
+        params={"key":key,"q":query,"format":"json","limit":limit}, timeout=10)
+    return [{"name":x.get("display_name",""),"lat":float(x["lat"]),"lon":float(x["lon"])}
+            for x in r.json()]
+
+def _forward_opencage(query, limit, key):
+    r = requests.get("https://api.opencagedata.com/geocode/v1/json",
+        params={"q":query,"key":key,"limit":limit,"no_annotations":1}, timeout=10)
+    out = []
+    for x in r.json().get("results", []):
+        g = x.get("geometry", {})
+        if "lat" in g and "lng" in g:
+            out.append({"name":x.get("formatted",""),"lat":g["lat"],"lon":g["lng"]})
+    return out
+
+def _forward_mapbox(query, limit, key):
+    r = requests.get(f"https://api.mapbox.com/geocoding/v5/mapbox.places/{_url_quote(query, safe='')}.json",
+        params={"access_token":key,"limit":limit}, timeout=10)
+    out = []
+    for f in r.json().get("features", []):
+        lon, lat = f.get("center", [None, None])
+        if lat is not None and lon is not None:
+            out.append({"name":f.get("place_name",""),"lat":lat,"lon":lon})
+    return out
+
+def _forward_google(query, limit, key):
+    r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
+        params={"address":query,"key":key}, timeout=10)
+    out = []
+    for x in r.json().get("results", [])[:limit]:
+        loc = x.get("geometry", {}).get("location", {})
+        if "lat" in loc and "lng" in loc:
+            out.append({"name":x.get("formatted_address",""),"lat":loc["lat"],"lon":loc["lng"]})
+    return out
+
+_FORWARD_GEOCODERS = {"nominatim":_forward_nominatim, "locationiq":_forward_locationiq,
+                      "opencage":_forward_opencage, "mapbox":_forward_mapbox, "google":_forward_google}
 
 def forward_geocode_search(query, limit=5):
     """Address/place-name -> candidate list of {name,lat,lon}, for the map
-    picker's search box. Nominatim's free-text /search endpoint, not the
-    /reverse one reverse_geocode() uses."""
-    _geocode_throttle()
+    picker's search box. Each provider's free-text "search" endpoint, not
+    the reverse one reverse_geocode() uses."""
+    provider, key = _active_geocoder()
+    _geocode_throttle(provider)
     try:
-        r = requests.get("https://nominatim.openstreetmap.org/search",
-            params={"q":query,"format":"json","limit":limit},
-            headers={"User-Agent":"PhotoTagger/1.0"}, timeout=10)
-        return [{"name":x.get("display_name",""),
-                  "lat":float(x["lat"]),"lon":float(x["lon"])}
-                for x in r.json()]
+        return _FORWARD_GEOCODERS[provider](query, limit, key)
     except Exception:
         return None
 
@@ -1021,6 +1166,23 @@ def _infer_locations(conn, folder):
             inferred += 1
     return inferred
 
+def _scan_read_one(p):
+    """
+    Pure per-photo I/O + CPU work for one scan entry — read_exif,
+    compute_hashes, and a stat() — with no DB access at all, so it's safe
+    to run many of these concurrently (see SCAN_WORKERS). Exceptions are
+    caught and returned rather than raised so one unreadable/removed file
+    (a real possibility mid-scan on a live library) can't abort the whole
+    batch the way letting it propagate into a worker thread would.
+    """
+    try:
+        exif = read_exif(str(p))
+        file_hash, phash_str, dhash_str = compute_hashes(str(p))
+        st = p.stat()
+        return p, exif, file_hash, phash_str, dhash_str, st.st_mtime, round(st.st_size/1024), None
+    except Exception as e:
+        return p, None, None, None, None, None, None, str(e)
+
 def _run_scan(folder, rescan=False):
     base = Path(folder)
     now_iso = datetime.now().isoformat()
@@ -1061,51 +1223,66 @@ def _run_scan(folder, rescan=False):
                                message=f"Found {total} photos — reading EXIF…")
 
         # ── EXIF + hashes ──────────────────────────────────────────
+        # Reading EXIF and computing two perceptual hashes per photo is both
+        # I/O-bound (opening the file) and CPU-bound (imagehash) — this used
+        # to fully finish one photo before even opening the next, one at a
+        # time. A thread pool overlaps many files' I/O and hashing instead;
+        # the sqlite writes, commits, and progress updates below all stay on
+        # this one thread (db_upsert_photo/conn are never touched from a
+        # worker), so nothing about the DB access here becomes concurrent —
+        # only the pure read_exif/compute_hashes work does.
         conn = _connect_db()
-        photos_batch = []
+        total_paths = len(all_paths)
+        done = 0
 
-        for i, p in enumerate(all_paths):
-            exif = read_exif(str(p))
-            file_hash, phash_str, dhash_str = compute_hashes(str(p))
-            mtime = p.stat().st_mtime
+        with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+            futures = {pool.submit(_scan_read_one, p): p for p in all_paths}
+            for fut in as_completed(futures):
+                p, exif, file_hash, phash_str, dhash_str, mtime, size_kb, err = fut.result()
+                done += 1
+                if err is not None:
+                    _log(f"[scan] Skipping {p.name}: {err}")
+                else:
+                    photo = {
+                        "id":           str(p.relative_to(base)),
+                        "path":         str(p),
+                        "filename":     p.name,
+                        "folder":       str(p.parent.relative_to(base)),
+                        "size_kb":      size_kb,
+                        "file_mtime":   mtime,
+                        "date_taken":   exif["date_taken"],
+                        "lat":          exif["lat"],
+                        "lon":          exif["lon"],
+                        "location_name":exif["location_name"],
+                        "has_gps":      1 if exif["has_gps"] else 0,
+                        "status":       "gps" if exif["has_gps"] else ("named" if exif["location_name"] else "unknown"),
+                        "camera":       exif.get("camera"),
+                        "lens":         exif.get("lens"),
+                        "aperture":     exif.get("aperture"),
+                        "shutter":      exif.get("shutter"),
+                        "iso":          exif.get("iso"),
+                        "focal_length": exif.get("focal_length"),
+                        "phash":        phash_str,
+                        "dhash":        dhash_str,
+                        "file_hash":    file_hash,
+                        "inferred_lat": None,"inferred_lon":None,
+                        "inferred_from":None,"inferred_delta_min":None,
+                        "scan_root":    folder,
+                        "last_scanned": now_iso,
+                        "date_source":  exif.get("date_source"),
+                    }
+                    db_upsert_photo(conn, photo)
 
-            photo = {
-                "id":           str(p.relative_to(base)),
-                "path":         str(p),
-                "filename":     p.name,
-                "folder":       str(p.parent.relative_to(base)),
-                "size_kb":      round(p.stat().st_size/1024),
-                "file_mtime":   mtime,
-                "date_taken":   exif["date_taken"],
-                "lat":          exif["lat"],
-                "lon":          exif["lon"],
-                "location_name":exif["location_name"],
-                "has_gps":      1 if exif["has_gps"] else 0,
-                "status":       "gps" if exif["has_gps"] else ("named" if exif["location_name"] else "unknown"),
-                "camera":       exif.get("camera"),
-                "lens":         exif.get("lens"),
-                "aperture":     exif.get("aperture"),
-                "shutter":      exif.get("shutter"),
-                "iso":          exif.get("iso"),
-                "focal_length": exif.get("focal_length"),
-                "phash":        phash_str,
-                "dhash":        dhash_str,
-                "file_hash":    file_hash,
-                "inferred_lat": None,"inferred_lon":None,
-                "inferred_from":None,"inferred_delta_min":None,
-                "scan_root":    folder,
-                "last_scanned": now_iso,
-                "date_source":  exif.get("date_source"),
-            }
-            photos_batch.append(photo)
-            db_upsert_photo(conn, photo)
-
-            if i % 50 == 0 or i == len(all_paths)-1:
-                conn.commit()
-                _log(f"[scan] EXIF {i+1}/{len(all_paths)}  {p.name}")
-                with _scan_lock:
-                    _scan_state.update(phase="reading", current=i+1,
-                        message=f"Reading EXIF: {i+1} / {len(all_paths)}  ({p.name})")
+                # Checked by `done` reaching a checkpoint, not gated on this
+                # particular file having succeeded — otherwise the very last
+                # file in the scan erroring would skip the final commit and
+                # progress update entirely.
+                if done % 50 == 0 or done == total_paths:
+                    conn.commit()
+                    _log(f"[scan] EXIF {done}/{total_paths}  {p.name}")
+                    with _scan_lock:
+                        _scan_state.update(phase="reading", current=done,
+                            message=f"Reading EXIF: {done} / {total_paths}  ({p.name})")
 
         # ── Infer locations ────────────────────────────────────────
         with _scan_lock:
@@ -1120,10 +1297,12 @@ def _run_scan(folder, rescan=False):
         # ── Geocode ────────────────────────────────────────────────
         # No cap here anymore — a cap meant a library with 1,000+ ungeocoded
         # GPS photos needed several full rescans just to advance it. The
-        # rate limit (GEOCODE_DELAY, ~1.1s/request per Nominatim's usage
-        # policy) is the real, already-documented pace ("Geocoding 500
-        # photos takes ~10 min" — README); this just lets a scan finish the
-        # whole backlog instead of stopping partway through it.
+        # rate limit (GEOCODER_PROVIDERS[provider]["delay"], ~1.1s/request
+        # on the default Nominatim per its usage policy — faster on an
+        # opted-in provider with its own key, see Settings) is the real,
+        # already-documented pace ("Geocoding 500 photos takes ~10 min" —
+        # README, Nominatim case); this just lets a scan finish the whole
+        # backlog instead of stopping partway through it.
         # Queried fresh rather than reusing a stale in-memory snapshot from
         # before _infer_locations() ran — _infer_locations() used to leave
         # its `all_db` list lying around in this same scope for exactly this
@@ -1191,21 +1370,42 @@ def api_config():
         "ai_model": get_ai_model(),
         "ai_model_default": AI_MODEL,
         "dry_run": True,
+        "geocoder_provider": get_geocoder_provider(),
+        "has_geocoder_key": bool(get_geocoder_api_key()),
+        "geocoder_providers": [{"id": pid, **meta} for pid, meta in GEOCODER_PROVIDERS.items()],
     })
 
 @app.route("/api/settings", methods=["GET", "POST"])
 def api_settings():
     """User-configurable settings that aren't safety-critical enough to need
     their own endpoint (c.f. /api/dry_run, which is deliberately separate
-    and more defensive). Currently just the AI model; add keys here as
-    the settings surface grows."""
+    and more defensive). Add keys here as the settings surface grows."""
     if request.method == "POST":
         data = request.json or {}
         if "ai_model" in data:
             model = (data.get("ai_model") or "").strip()
             set_setting("ai_model", model or AI_MODEL)
             _log(f"[settings] AI model set to {model or AI_MODEL}")
-    return jsonify({"ai_model": get_ai_model()})
+        if "geocoder_provider" in data:
+            provider = (data.get("geocoder_provider") or "").strip()
+            if provider in GEOCODER_PROVIDERS:
+                set_setting("geocoder_provider", provider)
+                _log(f"[settings] Geocoder provider set to {provider}")
+        if data.get("clear_geocoder_key"):
+            set_setting("geocoder_api_key", "")
+            _log("[settings] Geocoder API key cleared")
+        # Only overwrite a saved key when a new non-blank one is actually
+        # sent — the Settings form never re-populates the key field with
+        # the real value (see api_settings GET / has_geocoder_key below),
+        # so a blank submit here means "unchanged", not "clear the key".
+        elif data.get("geocoder_api_key"):
+            set_setting("geocoder_api_key", data["geocoder_api_key"].strip())
+            _log("[settings] Geocoder API key updated")
+    return jsonify({
+        "ai_model": get_ai_model(),
+        "geocoder_provider": get_geocoder_provider(),
+        "has_geocoder_key": bool(get_geocoder_api_key()),
+    })
 
 @app.route("/api/logs")
 def api_logs():
@@ -1619,18 +1819,51 @@ def api_save_batch():
 # ── Thumbnail ─────────────────────────────────────────────────────
 @app.route("/api/thumbnail")
 def api_thumbnail():
+    """
+    Every grid render, scroll, and duplicate-group view was decoding the
+    full-resolution source image and re-encoding a JPEG from scratch, on
+    every single request — with a library of any size and a browser that
+    doesn't cache the response (no Cache-Control was ever sent), the same
+    photo gets fully re-decoded over and over just scrolling around.
+
+    Cached to disk, one file per (path, size): keying on path+size only
+    (not mtime) means a rotate/EXIF-write that changes mtime overwrites
+    that same cache file in place via os.replace() rather than leaving the
+    old version behind as an orphan — cache footprint stays proportional to
+    "distinct photos x thumbnail sizes actually requested", not to how many
+    times a photo has ever been touched. Freshness is just "is the cached
+    file newer than the source file" — no separate metadata store needed.
+    """
     filepath = request.args.get("path","")
     if not filepath or not os.path.isfile(filepath):
         return "",404
     size = int(request.args.get("size",280))
     try:
-        from io import BytesIO
+        src_mtime = os.path.getmtime(filepath)
+    except OSError as e:
+        return str(e),500
+
+    cache_key = hashlib.md5(f"{filepath}|{size}".encode("utf-8")).hexdigest()
+    cache_path = THUMB_CACHE_DIR / f"{cache_key}.jpg"
+    try:
+        if cache_path.is_file() and cache_path.stat().st_mtime >= src_mtime:
+            return send_file(cache_path, mimetype="image/jpeg",
+                              max_age=31536000, conditional=True)
+    except OSError:
+        pass  # cache file vanished between the is_file() and stat() checks — fall through and regenerate
+
+    try:
         img = Image.open(filepath)
         img.thumbnail((size,size), Image.LANCZOS)
-        buf = BytesIO()
-        img.convert("RGB").save(buf,"JPEG",quality=75)
-        buf.seek(0)
-        return send_file(buf, mimetype="image/jpeg")
+        THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Write to a per-request temp name and rename into place: two
+        # requests for the same never-before-cached thumbnail racing each
+        # other must not let one see the other's half-written file.
+        tmp_path = cache_path.with_name(f"{cache_key}.{os.getpid()}.{threading.get_ident()}.tmp")
+        img.convert("RGB").save(tmp_path, "JPEG", quality=75)
+        os.replace(tmp_path, cache_path)
+        return send_file(cache_path, mimetype="image/jpeg",
+                          max_age=31536000, conditional=True)
     except Exception as e:
         return str(e),500
 
