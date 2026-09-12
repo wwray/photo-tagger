@@ -972,7 +972,8 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <h3 style="margin-bottom:14px">⚙️ Settings</h3>
     <div class="field-group" style="margin-bottom:6px">
       <div class="field-label">AI model</div>
-      <input class="field-input" id="settingsAiModel" type="text" list="aiModelOptions" placeholder="claude-haiku-4-5"/>
+      <input class="field-input" id="settingsAiModel" type="text" list="aiModelOptions" placeholder="claude-haiku-4-5"
+             onkeydown="if(event.key==='Enter'){event.preventDefault();saveSettings();}"/>
       <datalist id="aiModelOptions">
         <option value="claude-haiku-4-5">
         <option value="claude-sonnet-5">
@@ -989,8 +990,8 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <div class="field-hint" id="settingsGeocoderHint"></div>
       <div id="settingsGeocoderKeyWrap" style="display:none;margin-top:6px">
         <div style="display:flex;gap:6px">
-          <input class="field-input" id="settingsGeocoderKey" type="password"
-                 placeholder="API key" autocomplete="off"/>
+          <input class="field-input" id="settingsGeocoderKey" type="password" placeholder="API key" autocomplete="off"
+                 onkeydown="if(event.key==='Enter'){event.preventDefault();saveSettings();}"/>
           <button class="btn btn-ghost btn-sm" onclick="clearGeocoderKey()" title="Remove the saved key">✕</button>
         </div>
         <div class="field-hint" id="settingsGeocoderKeyStatus"></div>
