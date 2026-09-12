@@ -300,7 +300,10 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    while a geocode toast is still up) meant one message got silently
    replaced before it was readable. Toasts now stack: each is its own
    element appended to .toast-stack, with its own independent timer. */
-.toast-stack{position:fixed;bottom:68px;right:20px;z-index:300;
+/* Above every modal (.map-modal/.detail-overlay top out at 400) so a toast
+   fired while any modal is open — e.g. the History modal's Match/Import
+   results — is never silently rendered behind it. */
+.toast-stack{position:fixed;bottom:68px;right:20px;z-index:5000;
   display:flex;flex-direction:column;gap:8px;max-width:280px;pointer-events:none}
 .toast{background:var(--surface);border:1px solid var(--border);
   border-radius:var(--radius);padding:9px 14px;font-size:13px;color:var(--text);
@@ -3098,7 +3101,14 @@ function toast(msg,type=''){
 function customConfirm(message,{okText='OK',cancelText='Cancel',danger=false}={}){
   return new Promise(resolve=>{
     const overlay=document.createElement('div');
-    overlay.className='detail-overlay'; overlay.style.display='flex';
+    // .detail-overlay's z-index (200) sits BELOW .map-modal (400) on purpose —
+    // the real photo-detail view needs to stay under the map picker when both
+    // are open. A confirm dialog has no such ordering need: it must always be
+    // the topmost thing on screen, including over the History/map modals that
+    // are the most common callers (e.g. "Remove this import?") — otherwise it
+    // renders invisibly behind whichever modal triggered it and can never be
+    // clicked, which looked exactly like the button doing nothing.
+    overlay.className='detail-overlay'; overlay.style.display='flex'; overlay.style.zIndex='5000';
     overlay.innerHTML=`
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
                   width:100%;max-width:380px;padding:22px">
@@ -3120,7 +3130,8 @@ function customConfirm(message,{okText='OK',cancelText='Cancel',danger=false}={}
 function customPrompt(message,defaultValue=''){
   return new Promise(resolve=>{
     const overlay=document.createElement('div');
-    overlay.className='detail-overlay'; overlay.style.display='flex';
+    // Same always-on-top reasoning as customConfirm() above.
+    overlay.className='detail-overlay'; overlay.style.display='flex'; overlay.style.zIndex='5000';
     overlay.innerHTML=`
       <div style="background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
                   width:100%;max-width:380px;padding:22px">
