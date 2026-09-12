@@ -1482,6 +1482,83 @@ def api_delete_session(sid):
     db.commit()
     return jsonify({"ok": True})
 
+# ── Reset library data ──────────────────────────────────────────────
+def _reset_library_data():
+    """
+    Wipe all tracked library data — scanned photos, pending dry-run
+    changes, sessions, duplicate results, rename log, and imported
+    location history/points — back to an empty database, as if freshly
+    installed. Deliberately leaves the settings table alone (dry_run
+    default, AI model, geocoder provider/key): those are app
+    configuration, not library data, and losing a saved API key isn't
+    the point of "start over with my photos." Actual photo files on disk
+    are never touched — this only clears what PhotoTagger has recorded
+    about them.
+    """
+    conn = _connect_db()
+    try:
+        conn.executescript("""
+            DELETE FROM location_points;
+            DELETE FROM location_imports;
+            DELETE FROM rename_log;
+            DELETE FROM pending_changes;
+            DELETE FROM sessions;
+            DELETE FROM photos;
+        """)
+        conn.commit()
+    finally:
+        conn.close()
+    # Cached thumbnails are keyed by (path, size) alone — harmless to leave,
+    # since a rescan of the same folder would just re-populate matching
+    # cache hits, but "start from scratch" reasonably includes not leaving
+    # gigabytes of derived thumbnail data behind for a library that's about
+    # to be un-tracked.
+    if THUMB_CACHE_DIR.is_dir():
+        shutil.rmtree(THUMB_CACHE_DIR, ignore_errors=True)
+
+@app.route("/api/reset_database", methods=["POST"])
+def api_reset_database():
+    """
+    Refuses while any background job is running: each of those threads
+    holds its own sqlite connection and writes mid-job assuming the rows
+    it started with still exist — wiping the tables out from under a live
+    scan/dup-scan/history job would corrupt its state or crash it, not
+    just get skipped cleanly.
+    """
+    with _scan_lock:
+        if _scan_state["running"]:
+            return jsonify({"error": "A scan is running — wait for it to finish first"}), 409
+    with _dup_lock:
+        if _dup_state["running"]:
+            return jsonify({"error": "Duplicate detection is running — wait for it to finish first"}), 409
+    with _hist_import_lock:
+        if _hist_import_state["running"]:
+            return jsonify({"error": "A location history import is running — wait for it to finish first"}), 409
+    with _hist_match_lock:
+        if _hist_match_state["running"]:
+            return jsonify({"error": "A location history match is running — wait for it to finish first"}), 409
+
+    _reset_library_data()
+
+    # Also clear in-memory job state — a stale "done"/"error" result left
+    # over from before the wipe would otherwise reference a scan_root or
+    # import_id that no longer has a single row behind it.
+    with _scan_lock:
+        _scan_state.update(running=False, phase="", current=0, total=0,
+                            message="", error=None, scan_root=None)
+    with _dup_lock:
+        _dup_state.update(running=False, phase="", current=0, total=0,
+                           message="", error=None, folder=None, result=None)
+    with _hist_import_lock:
+        _hist_import_state.update(running=False, phase="", current=0, total=0,
+                                   message="", error=None, import_id=None)
+    with _hist_match_lock:
+        _hist_match_state.update(running=False, phase="", current=0, total=0,
+                                  message="", error=None, result=None)
+
+    _log("[reset] Library data wiped — photos, pending changes, sessions, duplicates, rename log, location history")
+    return jsonify({"ok": True})
+
 # ── Scan ──────────────────────────────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
 def api_scan():

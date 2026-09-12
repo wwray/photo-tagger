@@ -1000,6 +1000,16 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <button class="btn btn-primary" onclick="saveSettings()">Save</button>
       <button class="btn btn-ghost" onclick="closeSettingsModal()">Cancel</button>
     </div>
+    <div class="field-group" style="margin-top:18px;border-top:1px solid var(--red);padding-top:14px">
+      <div class="field-label" style="color:var(--red)">⚠️ Danger zone</div>
+      <div class="field-hint" style="margin-bottom:8px">
+        Wipes every scanned photo, pending unsaved change, session, duplicate result, rename log entry,
+        and imported location history from PhotoTagger's database — as if freshly installed. Your actual
+        photo files on disk are never touched, and this doesn't change the AI model or geocoder settings
+        above. This cannot be undone.
+      </div>
+      <button class="btn btn-red btn-sm" onclick="resetLibraryData()">🗑️ Reset library data</button>
+    </div>
   </div>
 </div>
 
@@ -2568,6 +2578,23 @@ async function saveSettings(){
     toast('Settings saved — model: '+_aiModel,'success');
   }
   closeSettingsModal();
+}
+
+async function resetLibraryData(){
+  const ok = await customConfirm(
+    'Wipe every scanned photo, pending change, session, duplicate result, rename log entry, and '+
+    'imported location history? Your actual photo files are never touched, but this cannot be undone.',
+    {danger:true, okText:'Reset everything', cancelText:'Cancel'});
+  if(!ok) return;
+  const r=await fetch('/api/reset_database',{method:'POST'});
+  const d=await r.json();
+  if(d.error){ toast(d.error,'error'); return; }
+  // Almost every piece of client state (currentScanRoot, allPhotos, open
+  // modals, poll timers) refers to data that no longer exists after this —
+  // a full reload is the only way to guarantee none of it lingers, rather
+  // than hand-clearing a long, easy-to-miss list of globals one by one.
+  toast('Library data reset — reloading…','success');
+  setTimeout(()=>location.reload(), 700);
 }
 
 async function loadHistoryImports(){

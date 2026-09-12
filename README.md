@@ -46,9 +46,10 @@ docker pull ghcr.io/YOUR_USERNAME/phototagger:latest
 > ⚠️ **This app has no authentication and no path restriction on the
 > filesystem browser/scanner.** Anyone who can reach port 5000 can browse and
 > read directories anywhere the container's user can see, not just your
-> photo share. It's meant to run on a trusted LAN — don't expose it directly
-> to the internet without putting it behind a reverse proxy with auth (or a
-> VPN).
+> photo share, and can also trigger destructive in-app actions like
+> **Reset library data**. It's meant to run on a trusted LAN — don't expose
+> it directly to the internet without putting it behind a reverse proxy
+> with auth (or a VPN).
 
 ## Features
 
@@ -264,6 +265,18 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Added: "🗑️ Reset library data" in Settings.** Wipes every scanned
+photo, pending unsaved change, session, duplicate result, rename log
+entry, and imported location history/points from the database — back to
+an empty install — for whoever wants to start completely over rather
+than track down which stale session/import is causing trouble. Actual
+photo files on disk are never touched, and the AI model / geocoder
+provider & key settings are left alone (losing a saved API key isn't the
+point of "start over with my photos"). Refuses while a scan, duplicate
+scan, or location-history import/match is actively running, since those
+background jobs hold their own connection and assume the rows they
+started with still exist.
 
 **Performance: scans now read EXIF/hash multiple photos concurrently
 instead of one at a time.** Reading EXIF and computing two perceptual
