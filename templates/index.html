@@ -589,19 +589,18 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   <div class="sidebar-section">
     <div class="sidebar-label" style="display:flex;justify-content:space-between;align-items:center;gap:4px">
       Sessions
-      <div style="display:flex;gap:4px;align-items:center;text-transform:none;letter-spacing:0">
-        <select class="sort-select" id="sessionSortSelect" onchange="setSessionSort(this.value)"
-                style="font-size:10px;padding:2px 4px" title="Sort sessions">
-          <option value="recent">Recent</option>
-          <option value="name_asc">Name A–Z</option>
-          <option value="name_desc">Name Z–A</option>
-          <option value="date_desc">Newest first</option>
-          <option value="date_asc">Oldest first</option>
-          <option value="custom">Custom (drag to reorder)</option>
-        </select>
-        <button class="btn btn-ghost btn-sm" onclick="newSession()" style="font-size:10px;padding:2px 6px">+ New</button>
-      </div>
+      <button class="btn btn-ghost btn-sm" onclick="newSession()"
+              style="font-size:10px;padding:2px 6px;text-transform:none;letter-spacing:0">+ New</button>
     </div>
+    <select class="sort-select" id="sessionSortSelect" onchange="setSessionSort(this.value)"
+            style="width:100%;font-size:10px;padding:3px 6px;margin-bottom:8px" title="Sort sessions">
+      <option value="recent">Recent</option>
+      <option value="name_asc">Name A–Z</option>
+      <option value="name_desc">Name Z–A</option>
+      <option value="date_desc">Newest first</option>
+      <option value="date_asc">Oldest first</option>
+      <option value="custom">Custom (drag to reorder)</option>
+    </select>
     <div id="sessionList"></div>
   </div>
 </aside>
