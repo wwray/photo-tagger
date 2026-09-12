@@ -2576,7 +2576,12 @@ async function saveSettings(){
   if(providerInfo && providerInfo.needs_key && !_hasGeocoderKey){
     toast(`Settings saved, but ${providerInfo.label} needs an API key — falling back to Nominatim until one is set.`,'error');
   } else {
-    toast('Settings saved — model: '+_aiModel,'success');
+    // Previously only ever said "model: X" — saying nothing about the
+    // geocoder made a successful key save look like it hadn't happened,
+    // since there was no visible confirmation of it at all.
+    let msg='Settings saved — model: '+_aiModel;
+    if(providerInfo) msg += ', geocoder: '+providerInfo.label + (key ? ' (key saved)' : '');
+    toast(msg,'success');
   }
   closeSettingsModal();
 }
