@@ -684,16 +684,19 @@ def _reverse_nominatim(lat, lon, key):
     r = requests.get("https://nominatim.openstreetmap.org/reverse",
         params={"lat":lat,"lon":lon,"format":"json","zoom":14},
         headers=_GEOCODE_UA, timeout=10)
+    r.raise_for_status()
     return _nominatim_style_name(r.json())
 
 def _reverse_locationiq(lat, lon, key):
     r = requests.get("https://us1.locationiq.com/v1/reverse",
         params={"key":key,"lat":lat,"lon":lon,"format":"json"}, timeout=10)
+    r.raise_for_status()
     return _nominatim_style_name(r.json())
 
 def _reverse_opencage(lat, lon, key):
     r = requests.get("https://api.opencagedata.com/geocode/v1/json",
         params={"q":f"{lat}+{lon}","key":key,"no_annotations":1,"limit":1}, timeout=10)
+    r.raise_for_status()
     results = r.json().get("results", [])
     if not results: return None
     comp = results[0].get("components", {})
@@ -706,13 +709,23 @@ def _reverse_opencage(lat, lon, key):
 def _reverse_mapbox(lat, lon, key):
     r = requests.get(f"https://api.mapbox.com/geocoding/v5/mapbox.places/{lon},{lat}.json",
         params={"access_token":key,"types":"place,locality,region,country"}, timeout=10)
+    r.raise_for_status()
     features = r.json().get("features", [])
     return features[0].get("place_name") if features else None
 
 def _reverse_google(lat, lon, key):
     r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
         params={"latlng":f"{lat},{lon}","key":key}, timeout=10)
-    results = r.json().get("results", [])
+    r.raise_for_status()
+    data = r.json()
+    # Google's /geocode/json returns HTTP 200 even for an invalid/unauthorized
+    # key or a billing-disabled project — the actual failure is only visible
+    # in the "status" field (REQUEST_DENIED, OVER_QUERY_LIMIT, ...), so
+    # raise_for_status() alone would miss it and this would silently read as
+    # zero results, same as the bug this whole change is fixing.
+    if data.get("status") not in ("OK", "ZERO_RESULTS"):
+        raise RuntimeError(f"Google geocode error: {data.get('status')} — {data.get('error_message','')}")
+    results = data.get("results", [])
     if not results: return None
     by_type = {}
     for c in results[0].get("address_components", []):
@@ -732,25 +745,32 @@ def reverse_geocode(lat, lon):
     _geocode_throttle(provider)
     try:
         return _REVERSE_GEOCODERS[provider](lat, lon, key)
-    except Exception:
+    except Exception as e:
+        # Logged (visible in the in-app 🪵 Logs viewer) rather than swallowed
+        # silently — a bad/expired key or wrong endpoint for the selected
+        # provider used to come back indistinguishable from "found nothing."
+        _log(f"[geocode] {provider} reverse_geocode failed: {e}")
         return None
 
 def _forward_nominatim(query, limit, key):
     r = requests.get("https://nominatim.openstreetmap.org/search",
         params={"q":query,"format":"json","limit":limit},
         headers=_GEOCODE_UA, timeout=10)
+    r.raise_for_status()
     return [{"name":x.get("display_name",""),"lat":float(x["lat"]),"lon":float(x["lon"])}
             for x in r.json()]
 
 def _forward_locationiq(query, limit, key):
     r = requests.get("https://us1.locationiq.com/v1/search",
         params={"key":key,"q":query,"format":"json","limit":limit}, timeout=10)
+    r.raise_for_status()
     return [{"name":x.get("display_name",""),"lat":float(x["lat"]),"lon":float(x["lon"])}
             for x in r.json()]
 
 def _forward_opencage(query, limit, key):
     r = requests.get("https://api.opencagedata.com/geocode/v1/json",
         params={"q":query,"key":key,"limit":limit,"no_annotations":1}, timeout=10)
+    r.raise_for_status()
     out = []
     for x in r.json().get("results", []):
         g = x.get("geometry", {})
@@ -761,6 +781,7 @@ def _forward_opencage(query, limit, key):
 def _forward_mapbox(query, limit, key):
     r = requests.get(f"https://api.mapbox.com/geocoding/v5/mapbox.places/{_url_quote(query, safe='')}.json",
         params={"access_token":key,"limit":limit}, timeout=10)
+    r.raise_for_status()
     out = []
     for f in r.json().get("features", []):
         lon, lat = f.get("center", [None, None])
@@ -771,8 +792,12 @@ def _forward_mapbox(query, limit, key):
 def _forward_google(query, limit, key):
     r = requests.get("https://maps.googleapis.com/maps/api/geocode/json",
         params={"address":query,"key":key}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    if data.get("status") not in ("OK", "ZERO_RESULTS"):
+        raise RuntimeError(f"Google geocode error: {data.get('status')} — {data.get('error_message','')}")
     out = []
-    for x in r.json().get("results", [])[:limit]:
+    for x in data.get("results", [])[:limit]:
         loc = x.get("geometry", {}).get("location", {})
         if "lat" in loc and "lng" in loc:
             out.append({"name":x.get("formatted_address",""),"lat":loc["lat"],"lon":loc["lng"]})
@@ -789,7 +814,8 @@ def forward_geocode_search(query, limit=5):
     _geocode_throttle(provider)
     try:
         return _FORWARD_GEOCODERS[provider](query, limit, key)
-    except Exception:
+    except Exception as e:
+        _log(f"[geocode] {provider} forward_geocode_search failed: {e}")
         return None
 
 def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str=None):
