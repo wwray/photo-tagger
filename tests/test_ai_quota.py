@@ -3,8 +3,17 @@ import threading
 import time
 
 import anthropic
-import httpx
 import pytest
+
+# Stand-ins for the SDK's HTTP request/response objects. The SDK's HTTP
+# library changed across major versions (httpx in 0.x, httpx2 in 1.x), so
+# the tests don't import either — the error constructors only read these
+# attributes.
+class _Req:
+    method, url, headers = "POST", "https://api.anthropic.com/v1/messages", {}
+
+class _Resp:
+    status_code, headers, request = 500, {}, _Req()
 
 from conftest import app_module, make_jpeg
 
@@ -28,10 +37,9 @@ class FakeAnthropic:
         try:
             time.sleep(0.05)
             if cls.behavior == "status_error":
-                req = httpx.Request("POST", "https://api.anthropic.com/v1/messages")
-                raise anthropic.InternalServerError("boom", response=httpx.Response(500, request=req), body=None)
+                raise anthropic.InternalServerError("boom", response=_Resp(), body=None)
             if cls.behavior == "timeout":
-                raise anthropic.APITimeoutError(request=httpx.Request("POST", "https://api.anthropic.com"))
+                raise anthropic.APITimeoutError(request=_Req())
             return type("M", (), {"content": [type("C", (), {"text": "Paris, France"})()]})()
         finally:
             with cls.lock:
