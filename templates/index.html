@@ -3,6 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="phototagger-token" content="{{ csrf_token }}">
 <title>PhotoTagger ({{ version }})</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
@@ -1029,6 +1030,62 @@ function escapeHtml(str){
   return String(str??'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 
+// Builds DOM nodes instead of HTML strings. Anything that came from the
+// filesystem, a photo's metadata, a geocoder, the AI, or a server error
+// goes in as a text node or an attribute value — never parsed as markup —
+// and handlers are real closures (on*: fn), never inline onclick="..."
+// strings with data spliced in. (Escaping quotes inside an inline handler
+// isn't enough: the browser decodes &#39; back to ' before the JS runs.)
+function h(tag, props, ...children){
+  const e=document.createElement(tag);
+  for(const [k,v] of Object.entries(props||{})){
+    if(v==null||v===false) continue;
+    if(k==='class') e.className=v;
+    else if(k==='style') e.style.cssText=v;
+    else if(k==='dataset') Object.assign(e.dataset,v);
+    else if(k.startsWith('on') && typeof v==='function') e.addEventListener(k.slice(2),v);
+    else e.setAttribute(k, v===true?'':String(v));
+  }
+  for(const c of children.flat()){
+    if(c==null||c===false) continue;
+    e.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+  return e;
+}
+function setChildren(parent, ...children){
+  parent.replaceChildren();
+  for(const c of children.flat()){
+    if(c==null||c===false) continue;
+    parent.appendChild(c instanceof Node ? c : document.createTextNode(String(c)));
+  }
+}
+// Thumbnails are requested by library id; the server maps that to the file.
+function thumbUrl(id,size,bust){
+  return '/api/thumbnail?id='+encodeURIComponent(id)+'&size='+size+(bust?'&t='+bust:'');
+}
+
+// ── Request protection ───────────────────────────────────────────────
+// Every change-making request carries the page's token so the server can
+// tell it came from this page and not from another site open in the same
+// browser. Added here once, for every fetch() below.
+const _pageToken=(document.querySelector('meta[name="phototagger-token"]')||{}).content||'';
+const _rawFetch=window.fetch.bind(window);
+window.fetch=async (url,opts={})=>{
+  const method=(opts.method||'GET').toUpperCase();
+  if(method!=='GET' && method!=='HEAD'){
+    const headers=new Headers(opts.headers||{});
+    headers.set('X-PhotoTagger-CSRF',_pageToken);
+    opts={...opts,headers};
+  }
+  const r=await _rawFetch(url,opts);
+  if(r.status===403){
+    r.clone().json().then(d=>{
+      if(d&&(d.code==='csrf'||d.code==='origin')) toast('This page is out of date — reload it and try again','error');
+    }).catch(()=>{});
+  }
+  return r;
+};
+
 // Resolve the photo currently open in the detail panel BY ID, not by position.
 // sortedFiltered() is recomputed on every call, so a stale positional index
 // silently returns undefined and throws downstream.
@@ -1125,36 +1182,30 @@ async function openPendingModal() {
   document.getElementById('pendingModalHint').textContent =
     `${d.photo_count} photo${d.photo_count!==1?'s':''}, ${d.count} field change${d.count!==1?'s':''}`;
   const list = document.getElementById('pendingModalList');
-  list.innerHTML = '';
+  list.replaceChildren();
   if (!d.pending.length) {
-    list.innerHTML='<div style="color:var(--text-muted);padding:16px">No pending changes.</div>';
+    list.appendChild(h('div',{style:'color:var(--text-muted);padding:16px'},'No pending changes.'));
   } else {
+    const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date',
+                          rotate_degrees:'Rotation', rename:'Filename', move_to_duplicates:'Duplicate cleanup'};
+    const fmtVal = (field,v) => {
+      if (field==='rotate_degrees') return v ? v+'°' : '—';
+      if (field==='move_to_duplicates') return v ? 'Move to _duplicates/' : '—';
+      return v || '—';
+    };
     d.pending.forEach(p => {
-      const item = document.createElement('div');
-      item.className = 'pending-item';
-      const fieldLabels = {location_name:'Location', lat:'Latitude', lon:'Longitude', date_taken:'Date',
-                            rotate_degrees:'Rotation', rename:'Filename', move_to_duplicates:'Duplicate cleanup'};
-      const fmtVal = (field,v) => {
-        if (field==='rotate_degrees') return v ? v+'°' : '—';
-        if (field==='move_to_duplicates') return v ? 'Move to _duplicates/' : '—';
-        return v || '—';
-      };
-      const changes = p.changes.map(c => `
-        <div class="pending-change">
-          <span class="pending-field">${fieldLabels[c.field]||c.field}</span>
-          <span class="pending-old">${fmtVal(c.field,c.old_value)}</span>
-          <span class="pending-arrow">→</span>
-          <span class="pending-new">${fmtVal(c.field,c.new_value)}</span>
-        </div>`).join('');
-      item.innerHTML = `
-        <div class="pending-item-header">
-          <span class="pending-filename" title="Hover to preview the photo">📷 ${escapeHtml(p.filename)}</span>
-          <span class="pending-folder">${escapeHtml(p.folder)||'root'}</span>
-        </div>
-        ${changes}`;
-      const filenameEl = item.querySelector('.pending-filename');
-      filenameEl.onmouseenter = () => { cancelHidePhotoPreview(); showPhotoPreview(filenameEl, p.path); };
+      const filenameEl = h('span',{class:'pending-filename', title:'Hover to preview the photo'}, '📷 '+p.filename);
+      filenameEl.onmouseenter = () => { cancelHidePhotoPreview(); showPhotoPreview(filenameEl, p.photo_id); };
       filenameEl.onmouseleave = scheduleHidePhotoPreview;
+      const item = h('div',{class:'pending-item'},
+        h('div',{class:'pending-item-header'},
+          filenameEl,
+          h('span',{class:'pending-folder'}, p.folder||'root')),
+        p.changes.map(c => h('div',{class:'pending-change'},
+          h('span',{class:'pending-field'}, fieldLabels[c.field]||c.field),
+          h('span',{class:'pending-old'}, fmtVal(c.field,c.old_value)),
+          h('span',{class:'pending-arrow'}, '→'),
+          h('span',{class:'pending-new'}, fmtVal(c.field,c.new_value)))));
       list.appendChild(item);
     });
   }
@@ -1172,7 +1223,13 @@ async function commitPending() {
   hidePhotoPreview();
   const r = await fetch('/api/pending/commit', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});
   const d = await r.json();
-  toast(`Written ${d.committed} changes to files`, 'success');
+  if (d.error) { toast('Commit failed: '+d.error,'error'); return; }
+  const failed = (d.results||[]).filter(x=>!x.ok);
+  if (failed.length) {
+    toast(`Written ${d.committed} photo(s); ${failed.length} failed — first error: ${failed[0].error}`, 'error');
+  } else {
+    toast(`Written ${d.committed} changes to files`, 'success');
+  }
   refreshPendingBar();
 }
 
@@ -1239,7 +1296,7 @@ async function pollProgress() {
     clearInterval(_pollInterval);
     const btn=document.getElementById('scanBtn'); btn.disabled=false; btn.textContent='Scan';
     if (_activeView==='empty') {
-      showEmpty(`<div class="empty-icon">⚠️</div><h2>Scan failed</h2><p>${s.error}</p>`);
+      showEmpty(h('div',{class:'empty-icon'},'⚠️'), h('h2',null,'Scan failed'), h('p',null,s.error));
     } else {
       reportScanProgress('Scan failed: '+s.error, 0, 1, true);
       setTimeout(hideScanStatusBar, 6000);
@@ -1286,25 +1343,25 @@ async function loadResult() {
 
 function showProgress(msg, cur, tot) {
   const pct = tot>0 ? Math.round(cur/tot*100) : 0;
-  document.getElementById('emptyState').innerHTML=`
-    <div style="display:flex;flex-direction:column;align-items:center;gap:16px;min-height:60vh;justify-content:center;width:100%;max-width:460px;margin:0 auto">
-      <div class="spinner"></div>
-      <div style="width:100%">
-        <div style="display:flex;justify-content:space-between;margin-bottom:6px;font-size:12px;color:var(--text-muted)">
-          <span>${msg}</span><span style="font-family:var(--mono)">${cur>0?cur+(tot>1?' / '+tot:''):''}</span>
-        </div>
-        <div class="progress-bar-wrap"><div class="progress-bar-fill" style="width:${pct}%"></div></div>
-      </div>
-      <p style="font-size:11px;color:var(--text-dim)">Watch it live in the 🪵 Logs tab</p>
-    </div>`;
+  // msg includes filenames ("Reading EXIF: 12 / 300 (IMG_1.jpg)") — text only.
+  setChildren(document.getElementById('emptyState'),
+    h('div',{style:'display:flex;flex-direction:column;align-items:center;gap:16px;min-height:60vh;justify-content:center;width:100%;max-width:460px;margin:0 auto'},
+      h('div',{class:'spinner'}),
+      h('div',{style:'width:100%'},
+        h('div',{style:'display:flex;justify-content:space-between;margin-bottom:6px;font-size:12px;color:var(--text-muted)'},
+          h('span',null,msg),
+          h('span',{style:'font-family:var(--mono)'}, cur>0?cur+(tot>1?' / '+tot:''):'')),
+        h('div',{class:'progress-bar-wrap'}, h('div',{class:'progress-bar-fill',style:`width:${pct}%`}))),
+      h('p',{style:'font-size:11px;color:var(--text-dim)'},'Watch it live in the 🪵 Logs tab')));
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='none';
   _activeView='empty';
 }
 
-function showEmpty(html) {
-  document.getElementById('emptyState').innerHTML=`<div style="display:flex;flex-direction:column;align-items:center;gap:14px;min-height:60vh;justify-content:center">${html}</div>`;
+function showEmpty(...nodes) {
+  setChildren(document.getElementById('emptyState'),
+    h('div',{style:'display:flex;flex-direction:column;align-items:center;gap:14px;min-height:60vh;justify-content:center'}, nodes));
   document.getElementById('emptyState').style.display='flex';
   document.getElementById('gridContainer').style.display='none';
   document.getElementById('dupContainer').style.display='none';
@@ -1391,49 +1448,44 @@ function renderGrid() {
   if (!allPhotos.length) return;
   showGrid();
   const arr = sortedFiltered();
-  document.getElementById('gridTitle').innerHTML=`<strong>${arr.length}</strong> photos`;
+  setChildren(document.getElementById('gridTitle'), h('strong',null,arr.length), ' photos');
   const grid = document.getElementById('photoGrid');
-  grid.innerHTML='';
+  grid.replaceChildren();
   arr.forEach((p,i)=>{
-    const card=document.createElement('div');
     const bc={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',history:'badge-history',unknown:'badge-unknown'}[p.status]||'badge-unknown';
-    const bl={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'}[p.status];
-    const locName=escapeHtml(p.location_name);
+    const bl={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'}[p.status]||'?';
     const loc = p.location_name
-      ? `<span style="color:var(--text)">${locName}</span>`
+      ? h('span',{style:'color:var(--text)'},p.location_name)
       : p.status==='inferred'
-        ? `<span style="color:var(--gold)">≈ inferred</span>`
+        ? h('span',{style:'color:var(--gold)'},'≈ inferred')
         : p.status==='history'
-          ? `<span style="color:var(--teal)">🛰️ history match</span>`
-          : `<span style="color:var(--red)">Untagged</span>`;
+          ? h('span',{style:'color:var(--teal)'},'🛰️ history match')
+          : h('span',{style:'color:var(--red)'},'Untagged');
     const dt = p.date_taken
       ? new Date(p.date_taken).toLocaleDateString('en-US',{year:'numeric',month:'short',day:'numeric'})
       : 'No date';
     const isSel=selected.has(p.id);
-    const idAttr=p.id.replace(/'/g,"\\'");
-    const fileEsc=escapeHtml(p.filename);
-    card.className='photo-card'+(isSel?' selected':'');
-    card.dataset.id=p.id;
-    card.innerHTML=`
-      <div class="select-hit" tabindex="0" role="checkbox" aria-checked="${isSel}" aria-label="Select ${fileEsc}"
-           onclick="toggleSelect(event,'${idAttr}')"
-           onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();toggleSelect(event,'${idAttr}')}">
-        <div class="select-checkbox">${isSel?'✓':''}</div>
-      </div>
-      <img class="photo-thumb" draggable="false" src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=220${p._thumbCacheBust?'&t='+p._thumbCacheBust:''}"
-           loading="lazy" onerror="this.outerHTML='<div class=\\'photo-thumb-placeholder\\'>📷</div>'"/>
-      <div class="status-badge ${bc}">${bl}</div>
-      <div class="photo-info">
-        <div class="photo-filename">${fileEsc}</div>
-        <div class="photo-date">${dt}</div>
-        <div class="photo-location">${loc}</div>
-      </div>`;
+    const thumb=h('img',{class:'photo-thumb', draggable:'false', loading:'lazy',
+      src:thumbUrl(p.id,220,p._thumbCacheBust)});
+    thumb.addEventListener('error',()=>thumb.replaceWith(h('div',{class:'photo-thumb-placeholder'},'📷')),{once:true});
+    const card=h('div',{class:'photo-card'+(isSel?' selected':''), dataset:{id:p.id}},
+      h('div',{class:'select-hit', tabindex:'0', role:'checkbox', 'aria-checked':String(isSel),
+               'aria-label':'Select '+p.filename,
+               onclick:e=>toggleSelect(e,p.id),
+               onkeydown:e=>{ if(e.key==='Enter'||e.key===' '){ e.preventDefault(); toggleSelect(e,p.id); } }},
+        h('div',{class:'select-checkbox'}, isSel?'✓':'')),
+      thumb,
+      h('div',{class:'status-badge '+bc}, bl),
+      h('div',{class:'photo-info'},
+        h('div',{class:'photo-filename'}, p.filename),
+        h('div',{class:'photo-date'}, dt),
+        h('div',{class:'photo-location'}, loc)));
     // tabindex/role/aria + keydown make the card itself keyboard-operable —
     // previously this whole grid was mouse-only, with no way to tab to a
     // photo or open/select it without a pointer.
     card.tabIndex=0;
     card.setAttribute('role','button');
-    card.setAttribute('aria-label',`Open ${fileEsc}`);
+    card.setAttribute('aria-label','Open '+p.filename);
     card.addEventListener('click', e=>{
       if (_suppressNextCardClick){ _suppressNextCardClick=false; return; }  // ghost click after a drag-select
       if (e.target.closest('.select-hit')) return;   // handled by toggleSelect itself
@@ -1496,11 +1548,11 @@ function updateStats() {
 function buildFolderList() {
   const folders={};
   allPhotos.forEach(p=>folders[p.folder]=(folders[p.folder]||0)+1);
-  const list=document.getElementById('folderList'); list.innerHTML='';
+  const list=document.getElementById('folderList'); list.replaceChildren();
   Object.entries(folders).sort().forEach(([f,cnt])=>{
-    const btn=document.createElement('button');
-    btn.className='folder-item'; btn.title=f||'(root)';
-    btn.innerHTML=`<span>📁 ${escapeHtml(f)||'(root)'}</span><span style="margin-left:auto;color:var(--text-dim);font-size:10px">${cnt}</span>`;
+    const btn=h('button',{class:'folder-item', title:f||'(root)'},
+      h('span',null,'📁 '+(f||'(root)')),
+      h('span',{style:'margin-left:auto;color:var(--text-dim);font-size:10px'},cnt));
     btn.onclick=()=>{ currentFolder=f; currentFilter='all';
       document.querySelectorAll('.folder-item').forEach(b=>b.classList.remove('active'));
       btn.classList.add('active');
@@ -1580,13 +1632,14 @@ async function loadSessions() {
     sessions=sorter ? [...d.sessions].sort(sorter) : d.sessions;
   }
   const dragEnabled=sessionSort==='custom';
-  const list=document.getElementById('sessionList'); list.innerHTML='';
+  const list=document.getElementById('sessionList'); list.replaceChildren();
   sessions.forEach(s=>{
-    const el=document.createElement('div'); el.className='session-item'; el.dataset.id=s.id;
-    el.innerHTML=`<div style="flex:1;min-width:0"><div class="session-name">${escapeHtml(s.name)}</div>
-      <div class="session-root">${escapeHtml(s.scan_root)}</div></div>
-      <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px"
-        onclick="event.stopPropagation();deleteSession(${s.id})">✕</button>`;
+    const el=h('div',{class:'session-item', dataset:{id:s.id}},
+      h('div',{style:'flex:1;min-width:0'},
+        h('div',{class:'session-name'},s.name),
+        h('div',{class:'session-root'},s.scan_root)),
+      h('button',{class:'btn btn-ghost btn-sm', style:'padding:2px 6px;font-size:10px',
+                  onclick:e=>{ e.stopPropagation(); deleteSession(s.id); }},'✕'));
     el.onclick=()=>{ document.getElementById('folderInput').value=s.scan_root;
       fetch('/api/sessions/'+s.id+'/use',{method:'POST'});
       switchToSession(s.scan_root); };
@@ -1654,8 +1707,10 @@ async function newSession() {
   if (!root) { toast('Scan a folder first','error'); return; }
   const name=await customPrompt('Session name:', root.split('/').pop()||root);
   if (!name) return;
-  await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
+  const r=await fetch('/api/sessions',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({name,scan_root:root})});
+  const d=await r.json();
+  if(d.error){ toast('Could not save session: '+d.error,'error'); return; }
   loadSessions();
   toast('Session saved','success');
 }
@@ -1775,7 +1830,7 @@ function openDetail(idx) {
   // 1400 matches .detail-panel's new max-width — below that, the old
   // size=600 fetch was the real ceiling on how big the image could look,
   // no matter how much room the enlarged panel/CSS max-height gave it.
-  document.getElementById('detailImg').src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400';
+  document.getElementById('detailImg').src=thumbUrl(p.id,1400);
   detailRotationDeg=0; resetDetailZoom();
   const canRotate=/\.(jpe?g)$/i.test(p.filename);
   document.getElementById('rotateLeftBtn').disabled=!canRotate;
@@ -1820,9 +1875,9 @@ function openDetail(idx) {
   const exifGroup=document.getElementById('detailExifGroup');
   if(exifParts.length||exifLine2){
     exifGroup.style.display='block';
-    document.getElementById('detailExifInfo').innerHTML =
-      (exifParts.length?`<div>${escapeHtml(exifParts.join(' — '))}</div>`:'')
-      + (exifLine2?`<div>${escapeHtml(exifLine2)}</div>`:'');
+    setChildren(document.getElementById('detailExifInfo'),
+      exifParts.length ? h('div',null,exifParts.join(' — ')) : null,
+      exifLine2 ? h('div',null,exifLine2) : null);
   } else {
     exifGroup.style.display='none';
   }
@@ -1937,8 +1992,11 @@ async function aiInfer(){
   try{
   const neighbors=allPhotos.filter(n=>n.location_name&&n.id!==p.id&&n.date_taken&&p.date_taken)
     .filter(n=>Math.abs(new Date(n.date_taken)-new Date(p.date_taken))<7*86400000).slice(0,6);
+  // The server loads the image and filename from the library by id; only
+  // context it can't know (an unsaved date, neighbors' names) is sent.
   const r=await fetch('/api/ai_infer',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({photo:p,neighbors})});
+    body:JSON.stringify({photo:{id:p.id,date_taken:p.date_taken},
+      neighbors:neighbors.map(n=>({filename:n.filename,location_name:n.location_name,date_taken:n.date_taken}))})});
   const d=await r.json();
   if(d.limit_reached){toast('Daily AI limit reached','error');btn.textContent='🤖 Limit reached';return;}
   if(d.error){toast('AI error: '+d.error,'error');return;}
@@ -2026,22 +2084,20 @@ function renderSavedLocationsDropdown(){
   const dd=document.getElementById('savedLocationsDropdown');
   const rows=[];
   if(_savedLocsCache.length){
-    rows.push('<div class="saved-location-section">Saved</div>');
+    rows.push(h('div',{class:'saved-location-section'},'Saved'));
     _savedLocsCache.forEach((s,i)=>rows.push(
-      `<div class="saved-location-item">
-         <span class="name" onclick="applySavedLocation(_savedLocsCache[${i}])">${escapeHtml(s.name)}</span>
-         <span class="saved-location-remove" onclick="removeSavedLocation(${i},event)" title="Remove">✕</span>
-       </div>`));
+      h('div',{class:'saved-location-item'},
+        h('span',{class:'name', onclick:()=>applySavedLocation(_savedLocsCache[i])}, s.name),
+        h('span',{class:'saved-location-remove', title:'Remove', onclick:e=>removeSavedLocation(i,e)},'✕'))));
   }
   if(_frequentLocsCache.length){
-    rows.push('<div class="saved-location-section">Frequent in this folder</div>');
+    rows.push(h('div',{class:'saved-location-section'},'Frequent in this folder'));
     _frequentLocsCache.forEach((f,i)=>rows.push(
-      `<div class="saved-location-item" onclick="applySavedLocation(_frequentLocsCache[${i}])">
-         <span class="name">${escapeHtml(f.name)}</span><span class="count">${f.count}×</span>
-       </div>`));
+      h('div',{class:'saved-location-item', onclick:()=>applySavedLocation(_frequentLocsCache[i])},
+        h('span',{class:'name'}, f.name), h('span',{class:'count'}, `${f.count}×`))));
   }
-  dd.innerHTML = rows.length ? rows.join('')
-    : '<div style="padding:12px;color:var(--text-dim);font-size:12px">No saved or frequent locations yet.</div>';
+  setChildren(dd, rows.length ? rows
+    : h('div',{style:'padding:12px;color:var(--text-dim);font-size:12px'},'No saved or frequent locations yet.'));
 }
 
 function applySavedLocation(loc){
@@ -2103,7 +2159,7 @@ async function saveDetail(){
         const bust=Date.now();
         const img=document.getElementById('detailImg');
         img.style.transform='';
-        img.src='/api/thumbnail?path='+encodeURIComponent(p.path)+'&size=1400&t='+bust;
+        img.src=thumbUrl(p.id,1400,bust);
         if(orig) orig._thumbCacheBust=bust;
       }
       updateStats(); renderGrid();
@@ -2161,16 +2217,27 @@ async function batchGeocode(){
   }finally{ btn.disabled=false; }
 }
 
+// Only what the batch endpoint uses — the full photo objects made "Save
+// all" on a big library a multi-megabyte request for no reason.
+function batchSaveEntry(p){
+  return {id:p.id, location_name:p.location_name, lat:p.lat, lon:p.lon, date_taken:p.date_taken};
+}
+function batchSaveToast(d){
+  if(d.error){ toast('Save failed: '+d.error,'error'); return; }
+  const ok=d.results.filter(x=>x.ok).length;
+  const failed=d.results.length-ok;
+  const msg=(d.dry_run?`Dry run: ${ok} previewed`:`Saved ${ok}`)+(failed?`, ${failed} failed`:'');
+  toast(msg, failed?'error':(d.dry_run?'':'success'));
+}
 async function saveAll(){
   if(!await customConfirm(`Write location data to ${allPhotos.filter(p=>p.location_name||p.lat).length} files?`)) return;
   const btn=document.getElementById('saveAllBtn'); btn.disabled=true;
   try{
-    const toSave=allPhotos.filter(p=>p.location_name||p.lat);
+    const toSave=allPhotos.filter(p=>p.location_name||p.lat).map(batchSaveEntry);
     const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify({photos:toSave,dry_run:dryRun})});
     const d=await r.json();
-    const ok=d.results.filter(x=>x.ok).length;
-    toast(d.dry_run?`Dry run: ${ok} previewed`:` Saved ${ok}`,d.dry_run?'':'success');
+    batchSaveToast(d);
     if(dryRun) refreshPendingBar();
   }finally{ btn.disabled=false; }
 }
@@ -2208,10 +2275,9 @@ async function batchSave(){
   const btn=document.getElementById('batchSaveBtn'); btn.disabled=true;
   try{
     const r=await fetch('/api/save_batch',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({photos:toSave,dry_run:dryRun})});
+      body:JSON.stringify({photos:toSave.map(batchSaveEntry),dry_run:dryRun})});
     const d=await r.json();
-    const ok=d.results.filter(x=>x.ok).length;
-    toast(d.dry_run?`Dry run: ${ok} previewed`:`Saved ${ok}`,'success');
+    batchSaveToast(d);
     if(dryRun) refreshPendingBar();
   }finally{ btn.disabled=false; }
 }
@@ -2240,9 +2306,9 @@ async function previewRename(){
   const d=await r.json();
   _renamePreview=d.preview||[];
   const list=document.getElementById('renamePreviewList');
-  list.innerHTML = _renamePreview.map(p=>
-    `<div style="${p.unchanged?'color:var(--text-dim)':''}">${escapeHtml(p.old_filename)} → ${escapeHtml(p.new_filename)}</div>`
-  ).join('') || '<div style="color:var(--text-dim)">Nothing selected.</div>';
+  setChildren(list, _renamePreview.length
+    ? _renamePreview.map(p=>h('div',{style:p.unchanged?'color:var(--text-dim)':''}, `${p.old_filename} → ${p.new_filename}`))
+    : h('div',{style:'color:var(--text-dim)'},'Nothing selected.'));
 }
 async function applyRename(){
   const items=_renamePreview.filter(p=>!p.unchanged).map(p=>({id:p.id,new_filename:p.new_filename}));
@@ -2279,7 +2345,7 @@ async function showDuplicates(force){
       body:JSON.stringify({folder:currentScanRoot, force: !!force})});
     started=await r.json();
   }catch(err){
-    list.innerHTML=`<div style="color:var(--red);padding:20px">Could not start duplicate scan: ${err.message}</div>`;
+    setChildren(list, h('div',{style:'color:var(--red);padding:20px'},'Could not start duplicate scan: '+err.message));
     return;
   }
   if(started.cached){ await renderDupResult(); return; }
@@ -2304,7 +2370,7 @@ async function showDuplicates(force){
     if(st.phase==='done'){ clearInterval(_dupPoll); await renderDupResult(); }
     else if(st.phase==='error'){
       clearInterval(_dupPoll);
-      list.innerHTML=`<div style="color:var(--red);padding:20px">Duplicate scan failed: ${st.error}</div>`;
+      setChildren(list, h('div',{style:'color:var(--red);padding:20px'},'Duplicate scan failed: '+st.error));
     }
   },500);
 }
@@ -2316,7 +2382,7 @@ let _dupPhotoById = {};
 async function renderDupResult(){
   const list=document.getElementById('dupList');
   const d=await (await fetch('/api/duplicates/result')).json();
-  if(d.error){ list.innerHTML=`<div style="color:var(--red);padding:20px">${d.error}</div>`; return; }
+  if(d.error){ setChildren(list, h('div',{style:'color:var(--red);padding:20px'},d.error)); return; }
   document.getElementById('dupSummary').textContent =
     `${d.total_groups} group${d.total_groups!==1?'s':''} across ${d.scanned} photos`;
   _dupMarks.clear(); _dupGroups={}; _dupPhotoById={};
@@ -2324,43 +2390,42 @@ async function renderDupResult(){
     list.innerHTML='<div style="color:var(--green);padding:20px">✓ No duplicates found.</div>';
     return;
   }
-  list.innerHTML='';
+  list.replaceChildren();
   let _dupGroupSeq=0;
   const renderGroup=(photos,label,color,note)=>{
     const groupKey='g'+(_dupGroupSeq++);
     _dupGroups[groupKey]=photos.map(p=>p.id);
     photos.forEach(p=>_dupPhotoById[p.id]=p);
-    const g=document.createElement('div'); g.className='dup-group';
-    g.innerHTML=`<div class="dup-group-header">
-        <span style="color:${color};font-weight:700">${label}</span>
-        <span style="color:var(--text-muted)">${photos.length} photos</span>
-        ${note?`<span style="color:var(--text-dim);font-size:11px">${note}</span>`:''}
-        <div class="toolbar-spacer"></div>
-        <button class="btn btn-ghost btn-sm" onclick="autoPickGroup('${groupKey}')">🪄 Auto-pick best</button>
-        <button class="btn btn-red btn-sm" onclick="resolveGroup('${groupKey}')">🗑️ Move marked</button>
-      </div>
-      <div class="dup-photos">${photos.map(renderDupCard).join('')}</div>`;
-    list.appendChild(g);
+    list.appendChild(h('div',{class:'dup-group'},
+      h('div',{class:'dup-group-header'},
+        h('span',{style:`color:${color};font-weight:700`},label),
+        h('span',{style:'color:var(--text-muted)'},`${photos.length} photos`),
+        note ? h('span',{style:'color:var(--text-dim);font-size:11px'},note) : null,
+        h('div',{class:'toolbar-spacer'}),
+        h('button',{class:'btn btn-ghost btn-sm', onclick:()=>autoPickGroup(groupKey)},'🪄 Auto-pick best'),
+        h('button',{class:'btn btn-red btn-sm', onclick:()=>resolveGroup(groupKey)},'🗑️ Move marked')),
+      h('div',{class:'dup-photos'}, photos.map(renderDupCard))));
   };
-  (d.exact_groups||[]).forEach(g=>renderGroup(g,'⧉ Identical files','var(--red)','byte-for-byte match'));
-  (d.phash_groups||[]).forEach(g=>renderGroup(g,'🔍 Visually similar','var(--purple)','resized / re-exported / edited'));
-  (d.fname_groups||[]).forEach(g=>renderGroup(g,'📄 Filename pattern','var(--gold)','e.g. name (1).jpg'));
+  // Identical = same size and same full-file SHA-256, verified on the
+  // server. "Visually similar" is only a perceptual-hash resemblance and
+  // never means the files are the same.
+  (d.exact_groups||[]).forEach(g=>renderGroup(g,'⧉ Identical files','var(--red)','identical contents (full-file SHA-256)'));
+  (d.phash_groups||[]).forEach(g=>renderGroup(g,'🔍 Visually similar','var(--purple)','look alike — not identical files; compare before moving'));
+  (d.fname_groups||[]).forEach(g=>renderGroup(g,'📄 Filename pattern','var(--gold)','e.g. name (1).jpg — names only, contents not compared'));
 }
 
 function renderDupCard(p){
-  const idAttr=p.id.replace(/'/g,"\\'");
-  return `<div class="dup-card" title="${escapeHtml(p.path)}" data-id="${escapeHtml(p.id)}">
-      <img src="/api/thumbnail?path=${encodeURIComponent(p.path)}&size=160" loading="lazy"
-           onerror="this.style.display='none'"/>
-      ${p.similarity?`<div class="sim-badge">${p.similarity}%</div>`:''}
-      <div class="dup-card-info">
-        <div class="dup-card-name">${escapeHtml(p.filename)}</div>
-        <div class="dup-card-meta">${p.size_kb}KB · ${escapeHtml(p.folder)||'root'}</div>
-        <label class="dup-card-mark">
-          <input type="checkbox" onchange="toggleDupMark(this,'${idAttr}')"/> Move to _duplicates
-        </label>
-      </div>
-    </div>`;
+  const img=h('img',{src:thumbUrl(p.id,160), loading:'lazy'});
+  img.addEventListener('error',()=>{ img.style.display='none'; },{once:true});
+  return h('div',{class:'dup-card', title:p.path, dataset:{id:p.id}},
+    img,
+    p.similarity ? h('div',{class:'sim-badge'},`${p.similarity}%`) : null,
+    h('div',{class:'dup-card-info'},
+      h('div',{class:'dup-card-name'},p.filename),
+      h('div',{class:'dup-card-meta'},`${p.size_kb}KB · ${p.folder||'root'}`),
+      h('label',{class:'dup-card-mark'},
+        h('input',{type:'checkbox', onchange:e=>toggleDupMark(e.target,p.id)}),
+        ' Move to _duplicates')));
 }
 
 function toggleDupMark(cb,id){
@@ -2476,10 +2541,8 @@ async function pollLogs(){
   const atBottom = view.scrollTop + view.clientHeight >= view.scrollHeight - 8;
   const frag=document.createDocumentFragment();
   d.lines.forEach(l=>{
-    const row=document.createElement('div');
-    row.className='log-line '+_LOG_LEVEL_CLASS(l.line);
-    row.innerHTML=`<span class="log-ts">${l.ts.replace('T',' ')}</span>${l.line.replace(/</g,'&lt;')}`;
-    frag.appendChild(row);
+    frag.appendChild(h('div',{class:'log-line '+_LOG_LEVEL_CLASS(l.line)},
+      h('span',{class:'log-ts'},String(l.ts).replace('T',' ')), l.line));
   });
   view.appendChild(frag);
   // Cap how much DOM we keep around — the buffer itself already caps at 2000 lines.
@@ -2586,12 +2649,21 @@ async function saveSettings(){
 }
 
 async function resetLibraryData(){
+  // The server issues a short-lived, single-use confirmation for this —
+  // the reset endpoint refuses without it, so it can't happen by accident
+  // or from a request this dialog didn't confirm.
+  const pr=await fetch('/api/reset_database/prepare',{method:'POST'});
+  const prep=await pr.json();
+  if(prep.error){ toast(prep.error,'error'); return; }
+  const c=prep.counts||{};
   const ok = await customConfirm(
-    'Wipe every scanned photo, pending change, session, duplicate result, rename log entry, and '+
-    'imported location history? Your actual photo files are never touched, but this cannot be undone.',
+    `Wipe ${c.photos||0} scanned photo record(s), ${c.pending_changes||0} pending change(s), `+
+    `${c.sessions||0} session(s), ${c.location_imports||0} location history import(s), plus duplicate results `+
+    'and the rename log? Your actual photo files are never touched, but this cannot be undone.',
     {danger:true, okText:'Reset everything', cancelText:'Cancel'});
   if(!ok) return;
-  const r=await fetch('/api/reset_database',{method:'POST'});
+  const r=await fetch('/api/reset_database',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({confirm_token:prep.confirm_token, confirm:prep.confirm_phrase})});
   const d=await r.json();
   if(d.error){ toast(d.error,'error'); return; }
   // Almost every piece of client state (currentScanRoot, allPhotos, open
@@ -2607,24 +2679,22 @@ async function loadHistoryImports(){
   document.getElementById('historyPointTotal').textContent=
     d.total_points ? `${d.total_points.toLocaleString()} points total` : '';
   const list=document.getElementById('historyImportList');
-  list.innerHTML='';
+  list.replaceChildren();
   if(!d.imports.length){
-    list.innerHTML='<div style="color:var(--text-dim);font-size:12px;padding:6px 2px">No location history imported yet.</div>';
+    list.appendChild(h('div',{style:'color:var(--text-dim);font-size:12px;padding:6px 2px'},'No location history imported yet.'));
     return;
   }
   d.imports.forEach(im=>{
-    const row=document.createElement('div');
-    row.className='hist-import-row status-'+im.status;
     const icon={google_takeout:'🌐',gpx:'🛰️'}[im.source_type]||'📄';
     const statusText = im.status==='importing' ? 'importing…'
       : im.status==='error' ? `error: ${im.error||'unknown'}`
-      : `${im.point_count.toLocaleString()} points`;
-    row.innerHTML=`
-      <span>${icon}</span>
-      <span class="hist-import-name" title="${escapeHtml(im.source_name)}">${escapeHtml(im.source_name)}</span>
-      <span class="hist-import-meta">${statusText}</span>
-      <button class="btn btn-ghost btn-sm" style="padding:2px 6px;font-size:10px" onclick="deleteHistoryImport(${im.id})">✕</button>`;
-    list.appendChild(row);
+      : `${(im.point_count||0).toLocaleString()} points`;
+    list.appendChild(h('div',{class:'hist-import-row status-'+String(im.status).replace(/[^a-z]/g,'')},
+      h('span',null,icon),
+      h('span',{class:'hist-import-name', title:im.source_name}, im.source_name),
+      h('span',{class:'hist-import-meta'}, statusText),
+      h('button',{class:'btn btn-ghost btn-sm', style:'padding:2px 6px;font-size:10px',
+                  onclick:()=>deleteHistoryImport(im.id)},'✕')));
   });
 }
 
@@ -2764,7 +2834,7 @@ function openMapPicker(target='detail'){
       if(_mapMarker) _map.removeLayer(_mapMarker);
       _mapMarker=L.marker([lat,lng]).addTo(_map);
       _mapPin={lat:parseFloat(lat.toFixed(6)),lon:parseFloat(lng.toFixed(6))};
-      document.getElementById('mapCoords').innerHTML=`Pin: <strong>${_mapPin.lat}, ${_mapPin.lon}</strong>`;
+      setMapCoordsLabel(_mapPin.lat,_mapPin.lon);
       document.getElementById('mapConfirmBtn').disabled=false;
     });
   }
@@ -2775,7 +2845,7 @@ function openMapPicker(target='detail'){
     if(_mapMarker) _map.removeLayer(_mapMarker);
     _mapMarker=L.marker([lat,lon]).addTo(_map);
     _mapPin={lat,lon};
-    document.getElementById('mapCoords').innerHTML=`Pin: <strong>${lat}, ${lon}</strong>`;
+    setMapCoordsLabel(lat,lon);
     document.getElementById('mapConfirmBtn').disabled=false;
   } else {
     _map.setView([20,0],2);
@@ -2783,6 +2853,10 @@ function openMapPicker(target='detail'){
     document.getElementById('mapConfirmBtn').disabled=true;
   }
   setTimeout(()=>_map.invalidateSize(),50);
+}
+function setMapCoordsLabel(lat,lon,name){
+  setChildren(document.getElementById('mapCoords'),
+    'Pin: ', h('strong',null,`${lat}, ${lon}`), name ? ' — '+name : null);
 }
 function closeMapModal(e){
   if(e&&e.target!==document.getElementById('mapModal'))return;
@@ -2804,10 +2878,10 @@ async function mapSearch(){
     if(d.error){toast('Search failed: '+d.error,'error'); resultsEl.style.display='none'; return;}
     _mapSearchResults=d.results||[];
     if(!_mapSearchResults.length){
-      resultsEl.innerHTML='<div class="map-search-result" style="cursor:default;color:var(--text-dim)">No matches</div>';
+      setChildren(resultsEl, h('div',{class:'map-search-result', style:'cursor:default;color:var(--text-dim)'},'No matches'));
     } else {
-      resultsEl.innerHTML=_mapSearchResults.map((res,i)=>
-        `<div class="map-search-result" onclick="selectMapSearchResult(${i})">${escapeHtml(res.name)}</div>`).join('');
+      setChildren(resultsEl, _mapSearchResults.map((res,i)=>
+        h('div',{class:'map-search-result', onclick:()=>selectMapSearchResult(i)}, res.name)));
     }
     resultsEl.style.display='block';
   }catch(err){
@@ -2825,8 +2899,7 @@ function selectMapSearchResult(i){
   if(_mapMarker) _map.removeLayer(_mapMarker);
   _mapMarker=L.marker([res.lat,res.lon]).addTo(_map);
   _mapPin={lat:res.lat,lon:res.lon};
-  document.getElementById('mapCoords').innerHTML=
-    `Pin: <strong>${res.lat}, ${res.lon}</strong> — ${escapeHtml(res.name)}`;
+  setMapCoordsLabel(res.lat,res.lon,res.name);
   document.getElementById('mapConfirmBtn').disabled=false;
 }
 
@@ -2957,9 +3030,9 @@ function renderSeedTabs(){
   // Only one real category (plus "All") — a filter row with nothing to
   // filter is just noise, so don't show it.
   bar.style.display = tabs.length>2 ? 'flex' : 'none';
-  bar.innerHTML=tabs.map(([key,label,count])=>
-    `<button class="seed-tab${_seedFilter===key?' active':''}" onclick="setSeedFilter('${key}')">${label} <span class="count">${count}</span></button>`
-  ).join('');
+  setChildren(bar, tabs.map(([key,label,count])=>
+    h('button',{class:'seed-tab'+(_seedFilter===key?' active':''), onclick:()=>setSeedFilter(key)},
+      label+' ', h('span',{class:'count'},count))));
 }
 
 function setSeedFilter(f){ _seedFilter=f; renderSeedTabs(); renderSeedGrid(); }
@@ -2970,10 +3043,10 @@ function seedVisibleTargets(){
 
 function renderSeedGrid(){
   const visible=seedVisibleTargets();
-  const list=document.getElementById('seedChecklist'); list.innerHTML='';
+  const list=document.getElementById('seedChecklist'); list.replaceChildren();
   hidePhotoPreview(); // a rebuild (tab switch) can remove the hovered node without a mouseleave ever firing on it
   if(!visible.length){
-    list.innerHTML='<div style="color:var(--text-dim);padding:20px;grid-column:1/-1">No photos in this category.</div>';
+    list.appendChild(h('div',{style:'color:var(--text-dim);padding:20px;grid-column:1/-1'},'No photos in this category.'));
   }
   const badgeClass={gps:'badge-gps',inferred:'badge-inferred',named:'badge-named',history:'badge-history',unknown:'badge-unknown'};
   const badgeLabel={gps:'GPS',inferred:'Inf',named:'Tagged',history:'Hist',unknown:'?'};
@@ -2987,17 +3060,20 @@ function renderSeedGrid(){
     const alreadyTagged=_seedMode==='date'
       ? (t.date_source==='exif'||t.date_source==='seeded')
       : t.status!=='unknown';
-    const badgeHTML=_seedMode==='date'
-      ? `<div class="status-badge ${t.date_source==='exif'?'badge-gps':(t.date_source==='seeded'?'badge-inferred':'badge-unknown')}">${t.date_source==='exif'?'DATE':(t.date_source==='seeded'?'Sugg':'?')}</div>`
-      : `<div class="status-badge ${badgeClass[t.status]||'badge-unknown'}">${badgeLabel[t.status]||t.status}</div>`;
-    const item=document.createElement('div'); item.className='seed-item'+(checked?' checked':''); item.dataset.id=t.id;
-    item.innerHTML=`<div class="seed-checkbox">${checked?'✓':''}</div>
-      <div class="seed-thumb">
-        <img src="/api/thumbnail?path=${encodeURIComponent(t.path)}&size=420" loading="lazy" onerror="this.style.display='none'"/>
-      </div>
-      ${badgeHTML}
-      <div class="seed-item-info"><div class="seed-item-name">${escapeHtml(t.filename)}</div>
-        <div class="seed-item-date">${dt}${alreadyTagged?' · <span style="color:var(--gold)">will overwrite</span>':''}</div></div>`;
+    const badge=_seedMode==='date'
+      ? h('div',{class:'status-badge '+(t.date_source==='exif'?'badge-gps':(t.date_source==='seeded'?'badge-inferred':'badge-unknown'))},
+          t.date_source==='exif'?'DATE':(t.date_source==='seeded'?'Sugg':'?'))
+      : h('div',{class:'status-badge '+(badgeClass[t.status]||'badge-unknown')}, badgeLabel[t.status]||t.status);
+    const img=h('img',{src:thumbUrl(t.id,420), loading:'lazy'});
+    img.addEventListener('error',()=>{ img.style.display='none'; },{once:true});
+    const item=h('div',{class:'seed-item'+(checked?' checked':''), dataset:{id:t.id}},
+      h('div',{class:'seed-checkbox'}, checked?'✓':''),
+      h('div',{class:'seed-thumb'}, img),
+      badge,
+      h('div',{class:'seed-item-info'},
+        h('div',{class:'seed-item-name'}, t.filename),
+        h('div',{class:'seed-item-date'}, dt,
+          alreadyTagged ? [' · ', h('span',{style:'color:var(--gold)'},'will overwrite')] : null)));
     item.onclick=()=>{
       if(_seedUnchecked.has(t.id)) _seedUnchecked.delete(t.id); else _seedUnchecked.add(t.id);
       const nowChecked=!_seedUnchecked.has(t.id);
@@ -3005,7 +3081,7 @@ function renderSeedGrid(){
       item.querySelector('.seed-checkbox').textContent=nowChecked?'✓':'';
       updateSeedBtn();
     };
-    item.onmouseenter=()=>{ cancelHidePhotoPreview(); showPhotoPreview(item,t.path); };
+    item.onmouseenter=()=>{ cancelHidePhotoPreview(); showPhotoPreview(item,t.id); };
     item.onmouseleave=scheduleHidePhotoPreview;
     list.appendChild(item);
   });
@@ -3022,10 +3098,10 @@ function renderSeedGrid(){
 // position is clamped to the viewport on every hover — guaranteed fully
 // visible, not just usually. Shared by the Propagate/Push-date checklist
 // and the pending-changes review list — pass whatever element the mouse
-// is over (for positioning) and the photo's own path (for the image).
-function showPhotoPreview(item,path){
+// is over (for positioning) and the photo's library id (for the image).
+function showPhotoPreview(item,photoId){
   const preview=document.getElementById('photoHoverPreview');
-  document.getElementById('photoHoverPreviewImg').src='/api/thumbnail?path='+encodeURIComponent(path)+'&size=800';
+  document.getElementById('photoHoverPreviewImg').src=thumbUrl(photoId,800);
   const pw=380, ph=285; // matches .photo-hover-preview's fixed width + 4:3 aspect ratio
   const r=item.getBoundingClientRect();
   const left=Math.max(8,Math.min(r.left+r.width/2-pw/2, window.innerWidth-pw-8));
@@ -3121,7 +3197,7 @@ async function applySeedSelection(){
   }
   for(const t of targets){
     const r=await fetch('/api/ai_infer_with_coords',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({photo:t,seed_lat:_seedLat,seed_lon:_seedLon,seed_location:_seedLocation})});
+      body:JSON.stringify({photo:{id:t.id,date_taken:t.date_taken},seed_lat:_seedLat,seed_lon:_seedLon,seed_location:_seedLocation})});
     const d=await r.json();
     t.inferred_lat=_seedLat; t.inferred_lon=_seedLon;
     t.location_name=(!d.limit_reached&&d.location_name)?d.location_name:_seedLocation;
@@ -3147,24 +3223,33 @@ async function openBrowser(){
 async function loadBrowser(path){
   const r=await fetch('/api/browse?path='+encodeURIComponent(path));
   const d=await r.json();
-  if(d.error){toast(d.error,'error');return;}
+  if(d.error){
+    toast(d.error,'error');
+    // Typed/saved a folder outside the allowed roots: start from the first root instead.
+    if(r.status===403 && d.roots && d.roots.length && path!==d.roots[0]) loadBrowser(d.roots[0]);
+    return;
+  }
   _browserPath=d.path;
+  _browserParent=d.parent;
   document.getElementById('browserPath').textContent=d.path;
   document.getElementById('browserUpBtn').disabled=!d.parent;
-  const list=document.getElementById('browserList'); list.innerHTML='';
+  const list=document.getElementById('browserList'); list.replaceChildren();
+  // At the top of one allowed root, the other configured roots are the
+  // only other places to go.
+  const otherRoots=(!d.parent && d.roots) ? d.roots.filter(rt=>rt!==d.path) : [];
+  otherRoots.forEach(rt=>list.appendChild(
+    h('div',{class:'browser-item', onclick:()=>loadBrowser(rt)}, '🗂️ '+rt)));
   if(!d.dirs.length){
-    list.innerHTML='<div style="color:var(--text-dim);padding:12px;font-size:12px">No subdirectories</div>';return;
+    if(!otherRoots.length) list.appendChild(h('div',{style:'color:var(--text-dim);padding:12px;font-size:12px'},'No subdirectories'));
+    return;
   }
   d.dirs.forEach(name=>{
-    const item=document.createElement('div'); item.className='browser-item';
-    item.innerHTML=`📁 ${escapeHtml(name)}`;
-    item.onclick=()=>loadBrowser(d.path+'/'+name);
-    list.appendChild(item);
+    list.appendChild(h('div',{class:'browser-item', onclick:()=>loadBrowser(d.path.replace(/\/+$/,'')+'/'+name)}, '📁 '+name));
   });
 }
+let _browserParent=null;
 function browserUp(){
-  const p=_browserPath.split('/').slice(0,-1).join('/')||'/';
-  loadBrowser(p);
+  if(_browserParent) loadBrowser(_browserParent);
 }
 function browserSelect(){
   document.getElementById('folderInput').value=_browserPath;
@@ -3297,7 +3382,7 @@ initGridMarquee();
       const pill=document.createElement('div');
       pill.id='aiUsagePill'; pill.className='stats-pill';
       pill.title=`AI Suggest usage: ${u.used} of ${u.limit} daily calls used (model: ${cfg.ai_model}). Resets at midnight.`;
-      pill.innerHTML=`<span>🤖 <span id="aiUsed">${u.used}</span>/${u.limit}</span>`;
+      setChildren(pill, h('span',null,'🤖 ', h('span',{id:'aiUsed'},u.used), '/'+u.limit));
       document.querySelector('.header-actions').prepend(pill);
     }
     if(!cfg.has_ai_key){

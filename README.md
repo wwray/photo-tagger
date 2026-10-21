@@ -139,13 +139,23 @@ ANTHROPIC_API_KEY=sk-ant-... docker compose up -d
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PUID` | `99` | User ID for file writes (99 = Unraid nobody) |
+| `PUID` | `99` | User ID for file writes (99 = Unraid nobody). Set both or neither — if set and the switch fails, the container **exits** instead of running as root |
 | `PGID` | `100` | Group ID for file writes (100 = Unraid users) |
 | `ANTHROPIC_API_KEY` | *(empty)* | Enables AI location suggestions (optional) |
 | `PHOTO_ROOT` | `/photos` | Container path pre-filled in the scan box |
+| `ALLOWED_ROOTS` | `/photos` (or `PHOTO_ROOT` if it's outside `/photos`) | Folders the app may read/write. Several are separated with `:` (e.g. `/photos:/photos2`). Anything outside — including via symlinks — is refused |
+| `HISTORY_IMPORT_ROOTS` | *(empty)* | Extra folders allowed for *server-side path* location-history imports (uploads don't need this) |
 | `AI_DAILY_LIMIT` | `50` | Max AI suggestion calls per day (cost control) |
 | `AI_MODEL` | `claude-haiku-4-5-20251001` | Anthropic model used for AI suggestions |
-| `SCAN_WORKERS` | `min(8, cpu_count*2)` | Concurrent threads reading EXIF/hashes during a scan. Lower this if scanning over a slow network share or spinning-disk NAS makes things *worse* (seek thrashing), not better |
+| `AI_MAX_CONCURRENT` | `2` | AI calls allowed in flight at once |
+| `AI_MAX_REQUEST_KB` / `AI_MAX_IMAGE_MB` / `AI_TIMEOUT_SECONDS` | `256` / `200` / `60` | Request size cap, largest file sent to vision, provider timeout |
+| `SCAN_WORKERS` | `min(8, cpu_count*2)` | Concurrent threads reading EXIF/hashes during a scan (1–32). Lower this if scanning over a slow network share or spinning-disk NAS makes things *worse* (seek thrashing), not better |
+| `MAX_UPLOAD_MB` | `4096` | Largest location-history upload |
+| `MAX_JSON_MB` | `32` | Largest JSON request (e.g. "Save all" on a big library) |
+| `THUMB_CACHE_MAX_MB` | `2048` | Thumbnail cache cap; oldest-served thumbnails are evicted beyond it (`0` = unlimited) |
+| `THUMB_WORKERS` | `4` | Thumbnails decoded at once |
+| `ALLOWED_HOSTS` | *(empty = any)* | Optional comma-separated `host:port` list the UI may be reached by (DNS-rebinding defense) — see Security model |
+| `TRUSTED_ORIGINS` | *(empty)* | Extra browser origins allowed to make changes, for a reverse proxy that rewrites `Host` |
 
 ---
 
@@ -236,6 +246,14 @@ fail-safe pattern the app uses for dry run and the AI model.
 | `.jpg` / `.jpeg` | EXIF `ImageDescription` (location) + GPS IFD + DateTimeOriginal |
 | `.cr2`, `.nef`, `.arw`, `.orf`, `.rw2`, `.dng` | XMP sidecar `.xmp` file (picked up by Lightroom, Capture One, etc.) |
 
+Writes are atomic (temp file + rename), so a crash or full disk leaves the
+original untouched. An existing XMP sidecar is **updated in place**: only
+the description, GPS and create-date properties being saved change; ratings,
+keywords, develop settings, other languages and namespaces are kept. A
+sidecar that isn't well-formed XMP is left alone and the save reports an
+error. GPS is written in the XMP spec's `DDD,MM.mmmmmmN` form. Renames and
+duplicate moves never overwrite an existing photo or `.xmp` at the destination.
+
 Rotation is JPEG-only: it physically re-encodes the pixels (any existing EXIF
 orientation flag is normalized first, so it isn't applied twice), which PIL
 can do for a JPEG but not for a RAW format — there's no RAW codec here to
@@ -249,10 +267,35 @@ honor anyway.
 
 - Nominatim geocoding is rate-limited to ~1 req/sec (OSM policy). Geocoding 500 photos takes ~10 min. A faster provider can be configured in Settings — see "Geocoding providers" above.
 - AI suggestions are optional — the app works fully without an API key, just without that one button.
-- Thumbnails are cached to disk on first request (keyed by path+size, self-invalidating on file changes), so only the very first view of a photo at a given size pays the decode cost.
-- Scanning reads EXIF and computes hashes for multiple photos concurrently (`SCAN_WORKERS`, default up to 8) instead of one file at a time.
+- Thumbnails are cached to disk on first request (keyed by path+size, self-invalidating on file changes), so only the very first view of a photo at a given size pays the decode cost. The cache is capped by `THUMB_CACHE_MAX_MB`.
+- Scanning reads EXIF and computes perceptual hashes for multiple photos concurrently (`SCAN_WORKERS`, default up to 8) instead of one file at a time.
+- **Duplicates:** "Identical files" means same size *and* same full-file SHA-256, computed on demand for files whose sizes collide (so the first duplicate check after upgrading may read more data than usual). "Visually similar" is a perceptual resemblance only — never proof two files are the same. Nothing is ever deleted; resolving moves files to `_duplicates/`.
 - **Always keep backups before writing metadata in bulk.**
 - Back up `data/phototagger.db` too — it holds your sessions, hash cache, and any pending (not-yet-committed) changes. Losing it doesn't touch your photos, but you'd lose that state and have to rescan.
+- The database also holds the **geocoder API key in plain text** (the Anthropic key stays in the environment). The file is created readable by the app user only, but anyone with your appdata share or a backup of it can read the key — treat those backups accordingly, and rotate the key with the provider if one leaks. Keys are redacted from logs and the in-app log viewer.
+
+---
+
+## Security model
+
+PhotoTagger is meant for a trusted home/LAN network and has **no login** —
+don't expose it to the internet. Within that, it protects against the
+things a LAN app realistically faces:
+
+- **Other websites in your browser.** Every change-making request must carry
+  a per-install token embedded in the page and must not come from a foreign
+  `Origin`, so a malicious page can't drive the API. Library reset also needs
+  a short-lived confirmation issued by the server. This is invisible in
+  normal use; if you see "page is out of date", just reload.
+- **Hostile filenames/metadata.** Everything shown in the UI is rendered as
+  text, never HTML, and a Content-Security-Policy limits what a page can load.
+- **Path tricks.** Photos are addressed by library id; every file operation is
+  confined to `ALLOWED_ROOTS` after resolving symlinks.
+- **DNS rebinding** (optional): set `ALLOWED_HOSTS` to the address(es) you use
+  to reach the app, e.g. `ALLOWED_HOSTS=192.168.1.10:5000,tower:5000`.
+
+Run the tests with `pip install -r requirements-dev.txt && pytest`; the browser
+rendering check is `npm install jsdom@24 && node tests/js/render_xss.test.cjs`.
 
 ---
 
@@ -265,6 +308,22 @@ honor anyway.
 ## Changelog
 
 ### Unreleased
+
+**Security hardening pass.** Exact duplicates now require an identical
+full-file SHA-256 (previously only the first 64KB was compared, so different
+photos could be reported "byte-for-byte" identical; old partial hashes are
+kept but marked unverified and recomputed on demand). XMP sidecars are
+updated in place instead of overwritten; all writes are atomic; renames and
+duplicate moves never overwrite existing files or sidecars. File operations
+are resolved from library ids and confined to `ALLOWED_ROOTS`. UI rendering
+no longer builds HTML from filenames/metadata. Change-making requests need a
+page token; reset needs a server-issued confirmation. API keys are redacted
+from logs. A configured `PUID`/`PGID` that can't be applied now stops the
+container instead of continuing as root. Uploads, thumbnails, the thumbnail
+cache and AI calls are bounded, and the AI daily limit can no longer be
+exceeded by simultaneous requests.
+**Upgrade note:** if you scan folders outside `/photos`, add them to
+`ALLOWED_ROOTS` — the startup log lists any saved folders that fall outside it.
 
 **Added: "🗑️ Reset library data" in Settings.** Wipes every scanned
 photo, pending unsaved change, session, duplicate result, rename log

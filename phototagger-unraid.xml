@@ -166,4 +166,14 @@
           Required="false"
           Mask="false">/photos</Config>
 
+  <Config Name="Allowed Photo Folders"
+          Target="ALLOWED_ROOTS"
+          Default=""
+          Mode=""
+          Description="Optional. Container folders PhotoTagger may read and write, separated by ':' (e.g. /photos:/photos2 if you map a second share). Empty means /photos."
+          Type="Variable"
+          Display="advanced"
+          Required="false"
+          Mask="false"></Config>
+
 </Container>

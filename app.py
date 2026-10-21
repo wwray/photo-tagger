@@ -1,23 +1,30 @@
+import io
 import os
 import re
 import sys
+import hmac
+import errno
+import stat
 import time
 import json
+import uuid
 import base64
 import bisect
 import shutil
+import secrets
 import calendar
 import hashlib
 import sqlite3
+import tempfile
 import threading
 import contextlib
 import xml.etree.ElementTree as ET
-from xml.sax.saxutils import escape as xml_escape
+import xml.dom.minidom as minidom
 from array import array
 from collections import deque
 from pathlib import Path
 from datetime import datetime
-from urllib.parse import quote as _url_quote
+from urllib.parse import quote as _url_quote, urlsplit
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import ijson
@@ -25,10 +32,52 @@ import exifread
 import piexif
 import imagehash
 import requests
-from flask import Flask, jsonify, request, send_file, render_template, g
+from flask import Flask, Request, jsonify, request, send_file, render_template, g
 from PIL import Image, ImageOps
 
+
+def _env_int(name, default, minimum=None, maximum=None):
+    """Integer env var with a clear startup error instead of a bare
+    ValueError traceback when someone types PUID=nobody or similar."""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        value = default
+    else:
+        try:
+            value = int(str(raw).strip())
+        except ValueError:
+            raise SystemExit(f"[startup] FATAL: {name}={raw!r} is not an integer")
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+class _PhotoTaggerRequest(Request):
+    """
+    Werkzeug spools file uploads bigger than ~500KB into the system temp dir
+    (/tmp, i.e. the container's writable layer — on Unraid, docker.img) and
+    upload.save() then copies them a second time. A multi-GB Takeout export
+    could fill docker.img that way. Spool straight into the data volume
+    instead, under a unique name, and remember every spool file so
+    _cleanup_upload_spools() can delete whatever a failed or rejected
+    upload left behind.
+    """
+    def _get_file_stream(self, total_content_length, content_type, filename=None,
+                         content_length=None):
+        UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        f = tempfile.NamedTemporaryFile("wb+", dir=UPLOAD_TMP_DIR, prefix="spool_",
+                                        suffix=".part", delete=False)
+        try:
+            g.setdefault("_upload_spools", []).append(f)
+        except RuntimeError:
+            pass  # no app context (never the case for a real request)
+        return f
+
+
 app = Flask(__name__)
+app.request_class = _PhotoTaggerRequest
 
 # ─── In-app log viewer ──────────────────────────────────────────────────────
 # Everything printed to stdout/stderr (our own `_log()` calls, init_db's
@@ -43,6 +92,43 @@ _log_buffer      = deque(maxlen=_LOG_BUFFER_MAX)
 _log_buffer_lock = threading.Lock()
 _log_seq         = 0
 
+# ─── Credential redaction ───────────────────────────────────────────────────
+# Geocoder keys travel as URL query parameters, and requests' HTTPError text
+# is "401 Client Error: ... for url: https://...?key=<the key>&lat=...". That
+# string used to go to the log verbatim (and from there to the in-app log
+# viewer). Redaction happens centrally — in the stdout/stderr tee below and
+# in _safe_error() for API responses — rather than at each call site, so a
+# new provider or a traceback can't bypass it.
+_SECRET_PARAM_RE = re.compile(
+    r"(?i)([?&;]\s*(?:key|api[_-]?key|access[_-]?token|token|apikey|secret|password|signature|sig)=)[^&\s#'\"]+")
+_SECRET_HEADER_RE = re.compile(r"(?i)((?:x-api-key|authorization|x-goog-api-key)['\"]?\s*[:=]\s*['\"]?)[^'\"\s,}]+")
+_ANTHROPIC_KEY_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
+_known_secrets = set()
+_known_secrets_lock = threading.Lock()
+
+def _register_secret(value):
+    """Remember a secret's literal value so it's scrubbed even where it
+    doesn't appear in key=value form (e.g. in a URL path)."""
+    if value and len(value) >= 6:
+        with _known_secrets_lock:
+            _known_secrets.add(value)
+
+def redact(text):
+    if not text:
+        return text
+    text = str(text)
+    text = _SECRET_PARAM_RE.sub(r"\1[REDACTED]", text)
+    text = _SECRET_HEADER_RE.sub(r"\1[REDACTED]", text)
+    text = _ANTHROPIC_KEY_RE.sub("[REDACTED]", text)
+    with _known_secrets_lock:
+        secrets_now = list(_known_secrets)
+    for s in secrets_now:
+        if s in text:
+            text = text.replace(s, "[REDACTED]")
+    return text
+
+_register_secret(os.environ.get("ANTHROPIC_API_KEY", ""))
+
 class _TeeStream:
     """Writes through to the real stream and also appends whole lines to
     the in-memory log buffer, so the UI can tail server output."""
@@ -53,6 +139,7 @@ class _TeeStream:
         self._partial_lock = threading.Lock()
 
     def write(self, data):
+        data = redact(data)
         self._real.write(data)
         global _log_seq
         # stdout/stderr are shared singletons written concurrently by the
@@ -95,12 +182,67 @@ _EPOCH = datetime(1970, 1, 1)  # fixed reference point for turning a naive date_
 # hammering a spinning-disk NAS at once can make each individual read
 # *slower* (seek thrashing) even though total throughput might rise on an
 # SSD — SCAN_WORKERS lets that be tuned per deployment instead of assumed.
-SCAN_WORKERS       = int(os.environ.get("SCAN_WORKERS", min(8, (os.cpu_count() or 4) * 2)))
+SCAN_WORKERS       = _env_int("SCAN_WORKERS", min(8, (os.cpu_count() or 4) * 2), 1, 32)
 THUMB_CACHE_DIR    = Path(os.environ.get("DB_PATH", "/app/data/phototagger.db")).parent / "thumb_cache"
 DEFAULT_PHOTO_ROOT = os.environ.get("PHOTO_ROOT", "/photos")
-AI_DAILY_LIMIT     = int(os.environ.get("AI_DAILY_LIMIT", "50"))
+AI_DAILY_LIMIT     = _env_int("AI_DAILY_LIMIT", 50, 0)
 AI_MODEL           = os.environ.get("AI_MODEL", "claude-haiku-4-5")
 DB_PATH            = os.environ.get("DB_PATH", "/app/data/phototagger.db")
+UPLOAD_TMP_DIR     = Path(DB_PATH).parent / "tmp_imports"
+
+# ─── Filesystem boundaries ────────────────────────────────────────────────
+# Every path the app reads or writes on behalf of a request — scan roots,
+# the folder browser, thumbnails, metadata writes, renames, duplicate moves,
+# server-side history imports, AI image loading — must resolve (symlinks
+# included) to somewhere under one of these roots. Several roots are fine
+# (several mounted shares); separate them with the OS path separator (":"
+# in the Linux container, like $PATH). Default: /photos when PHOTO_ROOT is
+# inside it (the normal container layout, even when PHOTO_ROOT is scoped to
+# a subfolder like /photos/2024), otherwise PHOTO_ROOT itself.
+def _default_allowed_roots():
+    root = os.path.abspath(DEFAULT_PHOTO_ROOT)
+    container = os.path.abspath("/photos")
+    try:
+        if os.path.commonpath([root, container]) == container:
+            return [container]
+    except ValueError:
+        pass  # different drives on Windows
+    return [root]
+
+ALLOWED_ROOTS = [p for p in (s.strip() for s in os.environ.get("ALLOWED_ROOTS", "").split(os.pathsep)) if p] \
+                or _default_allowed_roots()
+# Server-side location-history imports may additionally read from these
+# (e.g. a Takeout folder mounted outside the photo library). Uploads from
+# the browser don't need this — they land in the data volume.
+HISTORY_IMPORT_ROOTS = [p for p in (s.strip() for s in os.environ.get("HISTORY_IMPORT_ROOTS", "").split(os.pathsep)) if p]
+
+# ─── Resource limits ──────────────────────────────────────────────────────
+# Uploads are location-history files; a multi-year Takeout Records.json can
+# be well over 1GB, so the default is generous. Everything else the UI sends
+# is JSON — the biggest legitimate body is "Save all" on a large library.
+MAX_UPLOAD_MB        = _env_int("MAX_UPLOAD_MB", 4096, 1)
+MAX_JSON_MB          = _env_int("MAX_JSON_MB", 32, 1)
+THUMB_CACHE_MAX_MB   = _env_int("THUMB_CACHE_MAX_MB", 2048, 0)   # 0 = unlimited
+THUMB_WORKERS        = _env_int("THUMB_WORKERS", 4, 1, 32)
+# Sizes the UI actually requests (grid densities, dup cards, previews,
+# detail view). Anything else is rejected so the cache can't be filled
+# with one file per arbitrary ?size= value.
+THUMB_SIZES          = {160, 220, 280, 420, 800, 1400}
+AI_MAX_CONCURRENT    = _env_int("AI_MAX_CONCURRENT", 2, 1, 16)
+AI_MAX_REQUEST_KB    = _env_int("AI_MAX_REQUEST_KB", 256, 1)
+AI_MAX_IMAGE_MB      = _env_int("AI_MAX_IMAGE_MB", 200, 1)
+AI_TIMEOUT_SECONDS   = _env_int("AI_TIMEOUT_SECONDS", 60, 5)
+app.config["MAX_CONTENT_LENGTH"] = MAX_UPLOAD_MB * 1024 * 1024
+
+# ─── Request-forgery protection (not authentication) ──────────────────────
+# Optional comma-separated Host allow-list (e.g. "192.168.1.10:5000,tower:5000").
+# Empty = any Host, which is the long-standing behavior. Setting it is the
+# defense against DNS-rebinding; see README "Security model".
+ALLOWED_HOSTS   = {h.strip().lower() for h in os.environ.get("ALLOWED_HOSTS", "").split(",") if h.strip()}
+# Extra browser origins allowed to make changes, for a reverse proxy that
+# rewrites Host (e.g. "https://photos.home.lan").
+TRUSTED_ORIGINS = {o.strip().lower().rstrip("/") for o in os.environ.get("TRUSTED_ORIGINS", "").split(",") if o.strip()}
+CSRF_HEADER     = "X-PhotoTagger-CSRF"
 # Baked into the image at build time (docker-publish.yml passes --build-arg
 # GIT_SHA=<commit>, the Dockerfile turns that into this env var) so the
 # running app can show which build is actually live in its own UI — see
@@ -113,43 +255,103 @@ _last_geocode = 0.0
 _ai_lock      = threading.Lock()
 
 # PUID/PGID for Unraid.
-# The container now starts as root (see Dockerfile) specifically so this can
+# The container starts as root (see Dockerfile) specifically so this can
 # work: we create/own the data dir as root, then drop to the requested
 # uid/gid before Flask ever touches a file. /photos is a host bind mount —
 # its ownership is the host's responsibility, so it's deliberately not
 # chowned here (that could take a long time and rewrite a whole library).
-_puid = int(os.environ.get("PUID", 0))
-_pgid = int(os.environ.get("PGID", 0))
-if _puid and _pgid and hasattr(os, "geteuid") and os.geteuid() == 0:
-    try:
-        data_dir = Path(os.environ.get("DB_PATH", "/app/data/phototagger.db")).parent
-        data_dir.mkdir(parents=True, exist_ok=True)
+#
+# A configured identity is a promise: if PUID/PGID are set and the drop
+# doesn't fully succeed, the process exits rather than quietly carrying on
+# as root with write access to the whole library. Unset PUID/PGID keeps the
+# old behavior (run as whoever started us) but says so loudly; PUID=0 and
+# PGID=0 is an explicit, logged request to stay root.
+def _drop_privileges(puid_raw, pgid_raw, data_dir, _os=os):
+    def fatal(msg):
+        print(f"[startup] FATAL: {msg}", flush=True)
+        raise SystemExit(1)
 
+    if not hasattr(_os, "geteuid"):
+        if puid_raw or pgid_raw:
+            print("[startup] PUID/PGID ignored: this platform has no POSIX user ids", flush=True)
+        return None
+
+    if not puid_raw and not pgid_raw:
+        if _os.geteuid() == 0:
+            print("[startup] WARNING: running as root — PUID/PGID are not set. Set them "
+                  "(e.g. 99/100 on Unraid) so files are written as that user.", flush=True)
+        return None
+    if not puid_raw or not pgid_raw:
+        fatal("set both PUID and PGID, or neither")
+    try:
+        puid, pgid = int(puid_raw), int(pgid_raw)
+    except ValueError:
+        fatal(f"PUID/PGID must be integers (got {puid_raw!r}/{pgid_raw!r})")
+    if puid < 0 or pgid < 0:
+        fatal("PUID/PGID must not be negative")
+
+    if puid == 0 or pgid == 0:
+        if puid != 0 or pgid != 0:
+            fatal("PUID and PGID must both be 0 to run as root deliberately")
+        print("[startup] PUID=0/PGID=0 — running as root by explicit configuration", flush=True)
+        return (0, 0)
+
+    if _os.geteuid() != 0:
+        # Already unprivileged (e.g. `docker run --user`): fine only if we're
+        # already exactly who was asked for.
+        if _os.getuid() == puid and _os.geteuid() == puid and _os.getgid() == pgid and _os.getegid() == pgid:
+            print(f"[startup] Already running as uid={puid} gid={pgid}", flush=True)
+            return (puid, pgid)
+        fatal(f"PUID/PGID request uid={puid} gid={pgid}, but the process is uid={_os.geteuid()} "
+              f"gid={_os.getegid()} and is not root, so it cannot switch")
+
+    try:
+        data_dir = Path(data_dir)
+        data_dir.mkdir(parents=True, exist_ok=True)
         before = data_dir.stat()
         print(f"[startup] {data_dir} currently owned by uid={before.st_uid} "
-              f"gid={before.st_gid} — target is uid={_puid} gid={_pgid}", flush=True)
+              f"gid={before.st_gid} — target is uid={puid} gid={pgid}", flush=True)
+        # Re-own the data directory AND anything already in it (a db file
+        # left over from a previous PUID/PGID otherwise gives "attempt to
+        # write a readonly database"). Only the data dir — never the photo
+        # library — and without following symlinks, so a link planted in
+        # the data dir can't redirect a chown elsewhere.
+        _os.chown(str(data_dir), puid, pgid)
+        count = 0
+        for dirpath, dirnames, filenames in _os.walk(str(data_dir), followlinks=False):
+            for name in dirnames + filenames:
+                _os.chown(_os.path.join(dirpath, name), puid, pgid, follow_symlinks=False)
+                count += 1
+        print(f"[startup] {data_dir} and {count} existing entr(y/ies) now owned by "
+              f"uid={puid} gid={pgid}", flush=True)
 
-        # Re-own the directory AND anything already in it (e.g. a db file
-        # left over from a previous PUID/PGID, or from before this uid/gid
-        # drop existed at all) — chowning just the directory entry leaves
-        # existing files owned by whoever created them, and the dropped-
-        # privilege process then can't write to them ("attempt to write a
-        # readonly database" from sqlite is the classic symptom of that).
-        os.chown(data_dir, _puid, _pgid)
-        children = list(data_dir.rglob("*"))
-        for child in children:
-            os.chown(child, _puid, _pgid)
-
-        after = data_dir.stat()
-        print(f"[startup] {data_dir} and {len(children)} existing file(s) now "
-              f"owned by uid={after.st_uid} gid={after.st_gid}", flush=True)
-
-        os.setgid(_pgid)
-        os.setuid(_puid)
-        print(f"[startup] Dropped privileges to uid={_puid} gid={_pgid}", flush=True)
+        # Order matters: supplementary groups and gid can only be changed
+        # while still root.
+        _os.setgroups([])
+        _os.setgid(pgid)
+        _os.setuid(puid)
     except (OSError, AttributeError) as e:
-        print(f"[startup] WARNING: could not drop privileges to "
-              f"{_puid}:{_pgid}: {e} — continuing as current user", flush=True)
+        fatal(f"could not drop privileges to {puid}:{pgid}: {e}")
+
+    # Verify instead of assuming.
+    ids = (_os.getuid(), _os.geteuid(), _os.getgid(), _os.getegid())
+    if ids != (puid, puid, pgid, pgid):
+        fatal(f"privilege drop did not take effect (uid/euid/gid/egid = {ids})")
+    extra_groups = set(_os.getgroups()) - {pgid}
+    if extra_groups:
+        fatal(f"supplementary groups still present after drop: {sorted(extra_groups)}")
+    try:
+        _os.setuid(0)
+    except (OSError, PermissionError):
+        pass
+    else:
+        fatal("was able to regain root after dropping privileges")
+    print(f"[startup] Dropped privileges to uid={puid} gid={pgid} (supplementary groups cleared)",
+          flush=True)
+    return (puid, pgid)
+
+_drop_privileges(os.environ.get("PUID", "").strip(), os.environ.get("PGID", "").strip(),
+                 Path(DB_PATH).parent)
 
 # ─── Database ─────────────────────────────────────────────────────────────────
 
@@ -238,7 +440,7 @@ def init_db():
             status          TEXT DEFAULT 'unknown',
             phash           TEXT,               -- perceptual hash (DCT-based)
             dhash           TEXT,               -- difference hash (structure/gradient-based)
-            file_hash       TEXT,               -- md5 of first 64KB (fast)
+            file_hash       TEXT,               -- see file_hash_algo: only 'sha256' is a full-content hash
             inferred_lat    REAL,
             inferred_lon    REAL,
             inferred_from   TEXT,
@@ -319,12 +521,43 @@ def init_db():
                       ("history_lat", "REAL"), ("history_lon", "REAL"),
                       ("history_delta_min", "INTEGER"), ("history_import_id", "INTEGER"),
                       ("camera", "TEXT"), ("lens", "TEXT"), ("aperture", "TEXT"),
-                      ("shutter", "TEXT"), ("iso", "TEXT"), ("focal_length", "TEXT")]:
+                      ("shutter", "TEXT"), ("iso", "TEXT"), ("focal_length", "TEXT"),
+                      # Exact-duplicate provenance: which algorithm produced
+                      # file_hash, and the size/mtime of the file it was
+                      # computed from, so a later edit makes it stale
+                      # instead of silently wrong.
+                      ("file_hash_algo", "TEXT"), ("file_size", "INTEGER"),
+                      ("hash_mtime", "REAL")]:
         if col not in existing:
             conn.execute(f"ALTER TABLE photos ADD COLUMN {col} {ddl}")
             print(f"[db] Migrated: added photos.{col}", flush=True)
+    # Before file_hash_algo existed, file_hash was an MD5 of only the first
+    # 64KB — two different photos sharing a header hashed identically, yet
+    # were reported as byte-for-byte duplicates. Label those rows (data is
+    # kept, not deleted) so exact-duplicate detection ignores them and
+    # recomputes a full SHA-256 where it matters.
+    relabeled = conn.execute("""UPDATE photos SET file_hash_algo='md5-64k-legacy'
+                                WHERE file_hash IS NOT NULL AND file_hash_algo IS NULL""").rowcount
+    if relabeled:
+        print(f"[db] Migrated: marked {relabeled} legacy partial hash(es) as unverified", flush=True)
+    # Self-heal formerly done on every GET /api/pending: keep only the most
+    # recent uncommitted row per (photo_id, field). Committed rows are history.
+    conn.execute("""
+        DELETE FROM pending_changes
+        WHERE committed=0 AND id NOT IN (
+            SELECT MAX(id) FROM pending_changes WHERE committed=0
+            GROUP BY photo_id, field
+        )
+    """)
     conn.commit()
     conn.close()
+    # The settings table holds the geocoder API key in plain text; keep the
+    # database readable by the app user only. SQLite gives -wal/-shm files
+    # the same mode as the database file.
+    if os.name == "posix":
+        for suffix in ("", "-wal", "-shm"):
+            with contextlib.suppress(OSError):
+                os.chmod(DB_PATH + suffix, 0o600)
     print(f"[db] Initialised at {DB_PATH}", flush=True)
 
 init_db()
@@ -336,13 +569,15 @@ def db_upsert_photo(conn, photo: dict):
         INSERT INTO photos (
             id, path, filename, folder, size_kb, file_mtime,
             date_taken, lat, lon, location_name, has_gps, status,
-            phash, dhash, file_hash, inferred_lat, inferred_lon,
+            phash, dhash, file_hash, file_hash_algo, file_size, hash_mtime,
+            inferred_lat, inferred_lon,
             inferred_from, inferred_delta_min, scan_root, last_scanned, date_source,
             camera, lens, aperture, shutter, iso, focal_length
         ) VALUES (
             :id,:path,:filename,:folder,:size_kb,:file_mtime,
             :date_taken,:lat,:lon,:location_name,:has_gps,:status,
-            :phash,:dhash,:file_hash,:inferred_lat,:inferred_lon,
+            :phash,:dhash,:file_hash,:file_hash_algo,:file_size,:hash_mtime,
+            :inferred_lat,:inferred_lon,
             :inferred_from,:inferred_delta_min,:scan_root,:last_scanned,:date_source,
             :camera,:lens,:aperture,:shutter,:iso,:focal_length
         )
@@ -369,7 +604,12 @@ def db_upsert_photo(conn, photo: dict):
             status=CASE WHEN photos.status IN ('named','gps','history') AND excluded.status='unknown'
                              AND NOT (photos.status='named' AND is_junk_desc(photos.location_name))
                         THEN photos.status ELSE excluded.status END,
-            phash=excluded.phash, dhash=excluded.dhash, file_hash=excluded.file_hash,
+            phash=excluded.phash, dhash=excluded.dhash,
+            -- A (re)scan only reaches here for a new or changed file, so any
+            -- previous content hash no longer describes it. The exact-duplicate
+            -- job recomputes a full SHA-256 on demand.
+            file_hash=excluded.file_hash, file_hash_algo=excluded.file_hash_algo,
+            file_size=excluded.file_size, hash_mtime=excluded.hash_mtime,
             date_source=excluded.date_source,
             inferred_lat=excluded.inferred_lat, inferred_lon=excluded.inferred_lon,
             inferred_from=excluded.inferred_from,
@@ -381,7 +621,8 @@ def db_upsert_photo(conn, photo: dict):
         "id":None,"path":None,"filename":None,"folder":None,"size_kb":None,
         "file_mtime":None,"date_taken":None,"lat":None,"lon":None,
         "location_name":None,"has_gps":0,"status":"unknown",
-        "phash":None,"dhash":None,"file_hash":None,"date_source":None,
+        "phash":None,"dhash":None,"file_hash":None,"file_hash_algo":None,
+        "file_size":None,"hash_mtime":None,"date_source":None,
         "inferred_lat":None,"inferred_lon":None,
         "inferred_from":None,"inferred_delta_min":None,
         "scan_root":None,"last_scanned":None,
@@ -468,30 +709,283 @@ def get_ai_model():
 def _ai_load_usage():
     """(date, count) for today, from persisted storage. A stored date that
     isn't today reads as 0 without writing anything — the row only actually
-    rolls over on the next _ai_increment()."""
-    today = datetime.now().date().isoformat()
+    rolls over on the next _ai_reserve()."""
+    today = _ai_today()
     stored_date = get_setting("ai_usage_date")
     if stored_date != today:
         return today, 0
     return today, int(get_setting("ai_usage_count", "0") or 0)
 
-def _ai_allowed():
-    with _ai_lock:
-        _, count = _ai_load_usage()
-        if count >= AI_DAILY_LIMIT:
-            return False, f"Daily AI limit of {AI_DAILY_LIMIT} reached."
-        return True, ""
+def _ai_today():
+    return datetime.now().date().isoformat()
 
-def _ai_increment():
+def _ai_reserve():
+    """
+    Atomically claim one unit of today's allowance BEFORE contacting the
+    provider. This used to be check-now, increment-after-success as two
+    separate steps, so N simultaneous requests could all pass the check
+    and blow straight through AI_DAILY_LIMIT. The check and the increment
+    are now one BEGIN IMMEDIATE transaction (serialized against every other
+    writer, in any thread or process) under the process lock.
+    Returns the reservation's date, or None if the limit is reached.
+    """
+    today = _ai_today()
     with _ai_lock:
-        today, count = _ai_load_usage()
-        set_setting("ai_usage_date", today)
-        set_setting("ai_usage_count", str(count + 1))
+        conn = _connect_db()
+        try:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                rows = dict(conn.execute(
+                    "SELECT key, value FROM settings WHERE key IN ('ai_usage_date','ai_usage_count')").fetchall())
+                count = int(rows.get("ai_usage_count") or 0) if rows.get("ai_usage_date") == today else 0
+                if count >= AI_DAILY_LIMIT:
+                    conn.execute("ROLLBACK")
+                    return None
+                for key, value in (("ai_usage_date", today), ("ai_usage_count", str(count + 1))):
+                    conn.execute("""INSERT INTO settings (key,value,updated_at) VALUES (?,?,datetime('now'))
+                                    ON CONFLICT(key) DO UPDATE SET value=excluded.value,
+                                    updated_at=excluded.updated_at""", (key, value))
+                conn.execute("COMMIT")
+                return today
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+        finally:
+            conn.close()
+
+def _ai_release(reserved_date):
+    """Give back a reservation whose call never reached (or was rejected
+    by) the provider. A reservation made before midnight is NOT refunded
+    against the new day's counter — that counter never included it."""
+    with _ai_lock:
+        conn = _connect_db()
+        try:
+            conn.isolation_level = None
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute("""UPDATE settings SET value=CAST(MAX(0, CAST(value AS INTEGER) - 1) AS TEXT)
+                            WHERE key='ai_usage_count'
+                              AND (SELECT value FROM settings WHERE key='ai_usage_date')=?""",
+                         (reserved_date,))
+            conn.execute("COMMIT")
+        finally:
+            conn.close()
+
+_ai_semaphore = threading.BoundedSemaphore(AI_MAX_CONCURRENT)
 
 def _ai_usage_info():
     with _ai_lock:
         _, count = _ai_load_usage()
         return {"used":count,"limit":AI_DAILY_LIMIT,"remaining":max(0,AI_DAILY_LIMIT-count)}
+
+# ─── Filesystem safety ────────────────────────────────────────────────────────
+# Requests name photos by library id; the server looks up the path it
+# recorded at scan time and re-validates it here before touching the file.
+# Paths a client does send (scan folder, browse, server-side history import)
+# go through the same check: absolute, no NUL, and — after resolving every
+# symlink — inside one of ALLOWED_ROOTS.
+
+class PathNotAllowed(ValueError):
+    """A path fell outside the allowed roots or isn't a supported file."""
+
+class PhotoNotFound(Exception):
+    """No library row for the requested photo id."""
+
+def _norm_real(path):
+    return os.path.normcase(os.path.realpath(os.path.abspath(path)))
+
+def _allowed_root_reals(extra_roots=()):
+    return [_norm_real(r) for r in list(ALLOWED_ROOTS) + list(extra_roots)]
+
+def _is_within(real, root_real):
+    try:
+        return os.path.commonpath([real, root_real]) == root_real
+    except ValueError:
+        return False  # different drives (Windows)
+
+def path_is_allowed(path, extra_roots=()):
+    try:
+        real = _norm_real(path)
+    except (OSError, ValueError, TypeError):
+        return False
+    return any(_is_within(real, r) for r in _allowed_root_reals(extra_roots))
+
+def resolve_allowed_path(path, kind="any", extra_roots=()):
+    """Validate a path and return its fully-resolved real path. kind is
+    'file', 'dir' or 'any' (must exist either way)."""
+    if not isinstance(path, str) or not path.strip():
+        raise PathNotAllowed("No path given")
+    if "\x00" in path:
+        raise PathNotAllowed("Invalid path")
+    if not os.path.isabs(path):
+        raise PathNotAllowed(f"Path must be absolute: {path}")
+    real = os.path.realpath(os.path.abspath(path))
+    if not path_is_allowed(real, extra_roots):
+        raise PathNotAllowed(f"{path} is outside the allowed photo folders "
+                             f"({os.pathsep.join(ALLOWED_ROOTS)})")
+    if kind == "file" and not os.path.isfile(real):
+        raise FileNotFoundError(f"File not found: {path}")
+    if kind == "dir" and not os.path.isdir(real):
+        raise FileNotFoundError(f"Not a directory: {path}")
+    if kind == "any" and not os.path.exists(real):
+        raise FileNotFoundError(f"Not found: {path}")
+    return real
+
+def photo_real_path(row):
+    """The validated real path of a library row's original file."""
+    real = resolve_allowed_path(row["path"], kind="file")
+    for name in (row["path"], real):
+        if Path(name).suffix.lower() not in PHOTO_EXTENSIONS:
+            raise PathNotAllowed(f"Unsupported file type: {Path(name).name}")
+    return real
+
+def get_photo(db, photo_id, client_path=None):
+    """
+    Resolve a photo from a server-owned library id. A client-supplied path,
+    if any, is only ever used as a consistency check — a mismatch is
+    rejected rather than silently preferring either one.
+    Returns (row, real_path).
+    """
+    if not isinstance(photo_id, str) or not photo_id:
+        raise PhotoNotFound("A library photo id is required")
+    row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
+    if not row:
+        raise PhotoNotFound(f"Unknown photo id: {photo_id}")
+    if client_path is not None and client_path != row["path"]:
+        raise PathNotAllowed("Photo id and path do not match")
+    return row, photo_real_path(row)
+
+def sidecar_path_for(photo_path):
+    """The XMP sidecar next to a photo, refusing a symlinked sidecar (a
+    link could point a write at any file the app user can modify)."""
+    sidecar = Path(photo_path).with_suffix(".xmp")
+    if sidecar.is_symlink():
+        raise PathNotAllowed(f"Refusing to use symlinked sidecar {sidecar.name}")
+    if not path_is_allowed(str(sidecar.parent)):
+        raise PathNotAllowed(f"{sidecar} is outside the allowed photo folders")
+    return sidecar
+
+def _default_file_mode():
+    old = os.umask(0)
+    os.umask(old)
+    return 0o666 & ~old
+
+_DEFAULT_FILE_MODE = _default_file_mode()
+
+def atomic_write_bytes(target, data):
+    """
+    Write a file so readers only ever see the old or the new contents: a
+    temp file in the same directory, fsync'd, then os.replace(). A crash or
+    full disk mid-write leaves the original untouched instead of a
+    truncated photo or sidecar. The original's permission bits are kept.
+    """
+    target = Path(target)
+    fd, tmp = tempfile.mkstemp(dir=str(target.parent), prefix=f".{target.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if target.exists():
+            with contextlib.suppress(OSError):
+                shutil.copymode(str(target), tmp)
+        else:
+            with contextlib.suppress(OSError):
+                os.chmod(tmp, _DEFAULT_FILE_MODE)
+        os.replace(tmp, str(target))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+def move_no_clobber(src, dst):
+    """
+    Move a file, never overwriting an existing destination. A hard link is
+    the atomic way to claim a name (it fails if the name exists); where the
+    filesystem can't hard-link, fall back to check-then-rename (Windows'
+    rename never overwrites; on POSIX that leaves a tiny race window) and,
+    across devices, an exclusive-create copy.
+    """
+    src, dst = str(src), str(dst)
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        raise FileExistsError(errno.EEXIST, "Destination already exists", dst)
+    except OSError:
+        if os.path.lexists(dst):
+            raise FileExistsError(errno.EEXIST, "Destination already exists", dst)
+        try:
+            os.rename(src, dst)
+        except OSError as e:
+            if e.errno != errno.EXDEV:
+                raise
+            with open(src, "rb") as fsrc, open(dst, "xb") as fdst:
+                shutil.copyfileobj(fsrc, fdst, _HASH_CHUNK)
+            shutil.copystat(src, dst)
+            os.unlink(src)
+        return
+    try:
+        os.unlink(src)
+    except OSError:
+        with contextlib.suppress(OSError):
+            os.unlink(dst)
+        raise
+
+# ─── Input validation ─────────────────────────────────────────────────────────
+
+class BadInput(ValueError):
+    pass
+
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
+
+def clean_text(value, field, max_len=500):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise BadInput(f"{field} must be text")
+    if len(value) > max_len:
+        raise BadInput(f"{field} is too long (max {max_len} characters)")
+    return _CONTROL_CHARS_RE.sub("", value)
+
+def clean_coord(value, field, limit):
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        raise BadInput(f"{field} must be a number")
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        raise BadInput(f"{field} must be a number")
+    if not (-limit <= v <= limit):
+        raise BadInput(f"{field} must be between -{limit} and {limit}")
+    return v
+
+def clean_date(value):
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or len(value) > 40:
+        raise BadInput("date_taken must be an ISO date/time")
+    try:
+        datetime.fromisoformat(value)
+    except ValueError:
+        raise BadInput("date_taken must be an ISO date/time")
+    return value
+
+def clean_rotation(value):
+    if value in (None, "", 0, "0"):
+        return 0
+    try:
+        deg = int(value)
+    except (TypeError, ValueError):
+        raise BadInput("rotate_degrees must be 90, 180 or 270")
+    if deg % 360 not in (0, 90, 180, 270):
+        raise BadInput("rotate_degrees must be 90, 180 or 270")
+    return deg % 360
+
+def safe_error(e, limit=500):
+    """An exception message fit for an API response or a stored error:
+    credentials redacted, length bounded."""
+    return redact(str(e))[:limit]
 
 # ─── EXIF helpers ─────────────────────────────────────────────────────────────
 
@@ -597,26 +1091,68 @@ def read_exif(filepath):
 
     return result
 
-def compute_hashes(filepath):
+def compute_perceptual_hashes(filepath):
     """
-    Return (file_hash, phash_str, dhash_str).
+    Return (phash_str, dhash_str) — visual-similarity fingerprints only,
+    never evidence that two files are identical.
     Two perceptual hashes are computed because they fail in different ways:
     phash (DCT) is strong on general perceptual similarity but weak on
     high-frequency/noisy images; dhash (gradient) is strong on structure and
     robust to brightness and resize. Matching on either catches far more
     real-world duplicates than one alone.
     """
-    file_hash = phash_str = dhash_str = None
+    phash_str = dhash_str = None
     try:
-        with open(filepath,"rb") as f:
-            file_hash = hashlib.md5(f.read(65536)).hexdigest()
+        with Image.open(filepath) as img:
+            phash_str = str(imagehash.phash(img))
+            dhash_str = str(imagehash.dhash(img))
     except Exception: pass
-    try:
-        img = Image.open(filepath)
-        phash_str = str(imagehash.phash(img))
-        dhash_str = str(imagehash.dhash(img))
-    except Exception: pass
-    return file_hash, phash_str, dhash_str
+    return phash_str, dhash_str
+
+FILE_HASH_ALGO = "sha256"
+_HASH_CHUNK = 1024 * 1024
+
+class FileUnstableError(OSError):
+    """The file changed while it was being hashed."""
+
+def compute_file_sha256(filepath, attempts=3):
+    """
+    Full-content SHA-256 of a file, returned as (hexdigest, size, mtime).
+    The hash only counts if the file is demonstrably the same file, unchanged,
+    from before the first byte to after the last: size and mtime (ns) are
+    compared on the open handle before and after, and the number of bytes
+    read must equal the size. A file being copied in or edited mid-hash is
+    retried, then reported as unstable rather than given a hash that
+    describes no version of it.
+    """
+    for _ in range(attempts):
+        with open(filepath, "rb") as f:
+            before = os.fstat(f.fileno())
+            h = hashlib.sha256()
+            nread = 0
+            while True:
+                chunk = f.read(_HASH_CHUNK)
+                if not chunk:
+                    break
+                h.update(chunk)
+                nread += len(chunk)
+            after = os.fstat(f.fileno())
+        try:
+            on_disk = os.stat(filepath)
+        except OSError:
+            on_disk = None
+        stable = (nread == before.st_size == after.st_size
+                  and before.st_mtime_ns == after.st_mtime_ns
+                  and on_disk is not None
+                  and on_disk.st_size == after.st_size
+                  and on_disk.st_mtime_ns == after.st_mtime_ns
+                  # Same file still at that path (not replaced mid-hash).
+                  # Skipped where a platform doesn't report inode numbers.
+                  and (not on_disk.st_ino or not after.st_ino or on_disk.st_ino == after.st_ino))
+        if stable:
+            return h.hexdigest(), after.st_size, after.st_mtime
+        time.sleep(0.05)
+    raise FileUnstableError(f"{filepath} kept changing while it was being hashed")
 
 # ─── Geocoder providers ────────────────────────────────────────────────────
 # Nominatim is the zero-config default (free, no key, ~1 req/sec usage
@@ -646,7 +1182,36 @@ def get_geocoder_provider():
     return p if p in GEOCODER_PROVIDERS else "nominatim"
 
 def get_geocoder_api_key():
-    return get_setting("geocoder_api_key", "") or ""
+    key = get_setting("geocoder_api_key", "") or ""
+    _register_secret(key)
+    return key
+
+def _geocode_failure(provider, op, e):
+    """Log a geocoder failure with enough to diagnose it (provider, HTTP
+    status, endpoint) and nothing that can leak the key — redact() also
+    runs on every log line, this just avoids handing it the raw URL."""
+    detail = type(e).__name__
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        detail += f" HTTP {resp.status_code}"
+        with contextlib.suppress(Exception):
+            parts = urlsplit(resp.url)
+            detail += f" from {parts.scheme}://{parts.netloc}{parts.path}"
+    elif str(e):
+        detail += f": {e}"
+    _log(f"[geocode] {provider} {op} failed: {redact(detail)}")
+
+def _clean_geocode_results(results):
+    """Provider JSON is untrusted: keep only well-formed numeric coords."""
+    out = []
+    for r in results or []:
+        try:
+            lat, lon = float(r["lat"]), float(r["lon"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if -90 <= lat <= 90 and -180 <= lon <= 180:
+            out.append({"name": str(r.get("name") or "")[:300], "lat": lat, "lon": lon})
+    return out
 
 def _active_geocoder():
     """Resolve (provider, key) for the next call. Fails safe: a provider
@@ -744,12 +1309,13 @@ def reverse_geocode(lat, lon):
     provider, key = _active_geocoder()
     _geocode_throttle(provider)
     try:
-        return _REVERSE_GEOCODERS[provider](lat, lon, key)
+        name = _REVERSE_GEOCODERS[provider](lat, lon, key)
+        return str(name)[:300] if name else None
     except Exception as e:
         # Logged (visible in the in-app 🪵 Logs viewer) rather than swallowed
         # silently — a bad/expired key or wrong endpoint for the selected
         # provider used to come back indistinguishable from "found nothing."
-        _log(f"[geocode] {provider} reverse_geocode failed: {e}")
+        _geocode_failure(provider, "reverse_geocode", e)
         return None
 
 def _forward_nominatim(query, limit, key):
@@ -813,12 +1379,13 @@ def forward_geocode_search(query, limit=5):
     provider, key = _active_geocoder()
     _geocode_throttle(provider)
     try:
-        return _FORWARD_GEOCODERS[provider](query, limit, key)
+        return _clean_geocode_results(_FORWARD_GEOCODERS[provider](query, limit, key))
     except Exception as e:
-        _log(f"[geocode] {provider} forward_geocode_search failed: {e}")
+        _geocode_failure(provider, "forward_geocode_search", e)
         return None
 
 def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str=None):
+    """filepath must already be validated (see get_photo/photo_real_path)."""
     ext = Path(filepath).suffix.lower()
     if ext in (".jpg",".jpeg"):
         _write_jpeg_exif(filepath, location_name, lat, lon, date_str)
@@ -832,8 +1399,9 @@ def _write_jpeg_exif(filepath, location_name, lat=None, lon=None, date_str=None)
     # start from an empty dict and wipe every existing EXIF field (camera,
     # lens, exposure...) on this "safe" write. Refuse instead, so the save
     # surfaces as an error the user can see rather than quietly losing data.
+    original = Path(filepath).read_bytes()
     try:
-        exif_dict = piexif.load(filepath)
+        exif_dict = piexif.load(original)
     except Exception as e:
         _log(f"[exif] Refusing to write {filepath}: existing EXIF could not be "
              f"parsed ({e}) — writing anyway would discard it")
@@ -856,34 +1424,191 @@ def _write_jpeg_exif(filepath, location_name, lat=None, lon=None, date_str=None)
             exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = exif_date
             exif_dict["0th"][piexif.ImageIFD.DateTime] = exif_date
         except ValueError: pass
-    piexif.insert(piexif.dump(exif_dict), filepath)
+    out = io.BytesIO()
+    piexif.insert(piexif.dump(exif_dict), original, out)
+    atomic_write_bytes(filepath, out.getvalue())
+
+# ── XMP sidecars ──────────────────────────────────────────────────────────
+# A sidecar is often shared with Lightroom/Capture One/darktable and can
+# hold ratings, keywords, develop settings and more. Writing one used to
+# replace the whole file with a four-field template, destroying all of that.
+# Now an existing sidecar is parsed and only the properties being saved are
+# changed, in whichever form they already appear (attribute or element);
+# everything else — other properties, namespaces and their prefixes, other
+# languages of dc:description, the xpacket wrapper — is kept. A sidecar
+# that can't be parsed is left untouched and the save fails visibly.
+NS_RDF   = "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+NS_DC    = "http://purl.org/dc/elements/1.1/"
+NS_EXIF  = "http://ns.adobe.com/exif/1.0/"
+NS_XMP   = "http://ns.adobe.com/xap/1.0/"
+NS_XML   = "http://www.w3.org/XML/1998/namespace"
+NS_XMLNS = "http://www.w3.org/2000/xmlns/"
+_XMP_PREFERRED_PREFIX = {NS_DC: "dc", NS_EXIF: "exif", NS_XMP: "xmp"}
+_XMP_MAX_BYTES = 16 * 1024 * 1024
+_NEW_SIDECAR = ("<?xpacket begin='﻿' id='W5M0MpCehiHzreSzNTczkc9d'?>\n"
+                "<x:xmpmeta xmlns:x='adobe:ns:meta/'>"
+                "<rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>"
+                "<rdf:Description rdf:about=''/>"
+                "</rdf:RDF></x:xmpmeta>\n<?xpacket end='w'?>")
+
+class SidecarError(ValueError):
+    """An existing sidecar can't be safely updated."""
+
+def _xmp_gps(value, pos_ref, neg_ref):
+    """XMP GPSCoordinate form "DDD,MM.mmmmmmK" (XMP spec part 2 / EXIF
+    schema) — what Lightroom and exiftool read for exif:GPSLatitude."""
+    ref = pos_ref if value >= 0 else neg_ref
+    v = abs(value)
+    d = int(v)
+    m = round((v - d) * 60, 6)
+    if m >= 60:
+        d, m = d + 1, 0.0
+    return f"{d},{m:.6f}{ref}"
+
+def _xmp_ns_scope(el):
+    chain = []
+    n = el
+    while n is not None and n.nodeType == n.ELEMENT_NODE:
+        chain.append(n)
+        n = n.parentNode
+    scope = {}
+    for n in reversed(chain):
+        for i in range(n.attributes.length):
+            a = n.attributes.item(i)
+            if a.name.startswith("xmlns:"):
+                scope[a.name[6:]] = a.value
+            elif a.name == "xmlns":
+                scope[""] = a.value
+    return scope
+
+def _xmp_prefix(el, ns):
+    """A prefix bound to ns where el is, declaring one on el if needed."""
+    scope = _xmp_ns_scope(el)
+    for p, uri in scope.items():
+        if p and uri == ns:
+            return p
+    base = _XMP_PREFERRED_PREFIX.get(ns, "ns")
+    p, i = base, 1
+    while p in scope:
+        p, i = f"{base}{i}", i + 1
+    el.setAttributeNS(NS_XMLNS, f"xmlns:{p}", ns)
+    return p
+
+def _xmp_children(el, ns, local):
+    return [c for c in el.childNodes
+            if c.nodeType == c.ELEMENT_NODE and c.namespaceURI == ns and c.localName == local]
+
+def _xmp_set_text(el, text):
+    while el.firstChild:
+        el.removeChild(el.firstChild)
+    el.appendChild(el.ownerDocument.createTextNode(text))
+
+def _xmp_set_simple(doc, descs, ns, local, value):
+    for d in descs:
+        attr = d.getAttributeNodeNS(ns, local)
+        if attr is not None:
+            attr.value = value
+            return
+    for d in descs:
+        existing = _xmp_children(d, ns, local)
+        if existing:
+            _xmp_set_text(existing[0], value)
+            return
+    target = descs[0]
+    el = doc.createElementNS(ns, f"{_xmp_prefix(target, ns)}:{local}")
+    el.appendChild(doc.createTextNode(value))
+    target.appendChild(el)
+
+def _xmp_set_lang_alt(doc, descs, ns, local, value):
+    """Set the x-default entry of a language alternative (dc:description),
+    leaving any other languages alone."""
+    for d in descs:
+        attr = d.getAttributeNodeNS(ns, local)
+        if attr is not None:
+            attr.value = value
+            return
+    prop = None
+    for d in descs:
+        found = _xmp_children(d, ns, local)
+        if found:
+            prop = found[0]
+            break
+    if prop is None:
+        target = descs[0]
+        prop = doc.createElementNS(ns, f"{_xmp_prefix(target, ns)}:{local}")
+        target.appendChild(prop)
+    alts = _xmp_children(prop, NS_RDF, "Alt")
+    rdf_p = _xmp_prefix(prop, NS_RDF)
+    if alts:
+        alt = alts[0]
+    else:
+        if any(c.nodeType == c.ELEMENT_NODE for c in prop.childNodes):
+            raise SidecarError(f"{local} has an unexpected structure; not modifying it")
+        alt = doc.createElementNS(NS_RDF, f"{rdf_p}:Alt")
+        while prop.firstChild:  # plain-text value: becomes the x-default entry below
+            prop.removeChild(prop.firstChild)
+        prop.appendChild(alt)
+    for li in _xmp_children(alt, NS_RDF, "li"):
+        if li.getAttributeNS(NS_XML, "lang") == "x-default":
+            _xmp_set_text(li, value)
+            return
+    li = doc.createElementNS(NS_RDF, f"{rdf_p}:li")
+    li.setAttributeNS(NS_XML, "xml:lang", "x-default")
+    li.appendChild(doc.createTextNode(value))
+    alt.insertBefore(li, alt.firstChild)
+
+def update_xmp_packet(xml_bytes, location_name=None, lat=None, lon=None, date_str=None):
+    """Return new sidecar bytes with only the given fields changed."""
+    if len(xml_bytes) > _XMP_MAX_BYTES:
+        raise SidecarError("Sidecar is unexpectedly large; not modifying it")
+    try:
+        doc = minidom.parseString(xml_bytes)
+    except Exception as e:
+        raise SidecarError(f"Existing sidecar is not well-formed XML ({e}); not modifying it")
+    if doc.doctype is not None:
+        raise SidecarError("Existing sidecar contains a DTD; not modifying it")
+    rdfs = doc.getElementsByTagNameNS(NS_RDF, "RDF")
+    if len(rdfs) != 1:
+        raise SidecarError("Existing sidecar has no single rdf:RDF element; not modifying it")
+    rdf = rdfs[0]
+    descs = _xmp_children(rdf, NS_RDF, "Description")
+    if not descs:
+        p = _xmp_prefix(rdf, NS_RDF)
+        d = doc.createElementNS(NS_RDF, f"{p}:Description")
+        d.setAttributeNS(NS_RDF, f"{p}:about", "")
+        rdf.appendChild(d)
+        descs = [d]
+    if location_name:
+        _xmp_set_lang_alt(doc, descs, NS_DC, "description", location_name)
+    if lat is not None and lon is not None:
+        _xmp_set_simple(doc, descs, NS_EXIF, "GPSLatitude", _xmp_gps(lat, "N", "S"))
+        _xmp_set_simple(doc, descs, NS_EXIF, "GPSLongitude", _xmp_gps(lon, "E", "W"))
+    if date_str:
+        _xmp_set_simple(doc, descs, NS_XMP, "CreateDate", date_str)
+    had_decl = xml_bytes.lstrip(b"\xef\xbb\xbf").lstrip().startswith(b"<?xml")
+    body = "\n".join(n.toxml() for n in doc.childNodes)
+    if had_decl:
+        body = '<?xml version="1.0" encoding="UTF-8"?>\n' + body
+    return body.encode("utf-8")
 
 def _write_xmp_sidecar(filepath, location_name, lat=None, lon=None, date_str=None):
-    sidecar = Path(filepath).with_suffix(".xmp")
-    lat_s = f"{abs(lat):.6f}" if lat is not None else ""
-    lon_s = f"{abs(lon):.6f}" if lon is not None else ""
-    lat_r = ("N" if lat>=0 else "S") if lat is not None else ""
-    lon_r = ("E" if lon>=0 else "W") if lon is not None else ""
-    # location_name/date_str are free text (user-typed or AI-suggested) —
-    # unescaped, a name containing & < or > (e.g. "Smith & Sons Farm")
-    # produces invalid XML that Lightroom/Capture One silently fail to read.
-    location_esc = xml_escape(location_name) if location_name else ""
-    date_esc = xml_escape(date_str) if date_str else ""
-    sidecar.write_text(f"""<?xpacket begin='' id='W5M0MpCehiHzreSzNTczkc9d'?>
-<x:xmpmeta xmlns:x='adobe:ns:meta/'>
-  <rdf:RDF xmlns:rdf='http://www.w3.org/1999/02/22-rdf-syntax-ns#'>
-    <rdf:Description rdf:about=''
-      xmlns:dc='http://purl.org/dc/elements/1.1/'
-      xmlns:exif='http://ns.adobe.com/exif/1.0/'
-      xmlns:xmp='http://ns.adobe.com/xap/1.0/'>
-      <dc:description><rdf:Alt><rdf:li xml:lang='x-default'>{location_esc}</rdf:li></rdf:Alt></dc:description>
-      <exif:GPSLatitude>{lat_s}{lat_r}</exif:GPSLatitude>
-      <exif:GPSLongitude>{lon_s}{lon_r}</exif:GPSLongitude>
-      <xmp:CreateDate>{date_esc}</xmp:CreateDate>
-    </rdf:Description>
-  </rdf:RDF>
-</x:xmpmeta>
-<?xpacket end='w'?>""", encoding="utf-8")
+    sidecar = sidecar_path_for(filepath)
+    for _ in range(3):
+        if sidecar.exists():
+            st = sidecar.stat()
+            if not stat.S_ISREG(st.st_mode):
+                raise SidecarError(f"{sidecar.name} is not a regular file")
+            original = sidecar.read_bytes()
+        else:
+            st, original = None, _NEW_SIDECAR.encode("utf-8")
+        new = update_xmp_packet(original, location_name, lat, lon, date_str)
+        # Don't clobber an edit another program made while we were working.
+        now = sidecar.stat() if sidecar.exists() else None
+        if (st is None) != (now is None) or (st and (st.st_mtime_ns, st.st_size) != (now.st_mtime_ns, now.st_size)):
+            continue
+        atomic_write_bytes(sidecar, new)
+        return
+    raise SidecarError(f"{sidecar.name} kept changing while being updated; try again")
 
 # JPEG only: PIL can decode/re-encode a JPEG's pixels, but not a RAW format,
 # so there's no way to physically rotate a CR2/NEF/etc. without a RAW codec
@@ -910,26 +1635,29 @@ def rotate_image_file(filepath, degrees):
         raise ValueError("Rotation is only supported for JPEG files")
     # Same reasoning as _write_jpeg_exif: an unparseable EXIF segment is a
     # reason to refuse, not to silently start from empty and drop it all.
+    original = Path(filepath).read_bytes()
     try:
-        exif_dict = piexif.load(filepath)
+        exif_dict = piexif.load(original)
     except Exception as e:
         _log(f"[exif] Refusing to rotate {filepath}: existing EXIF could not be "
              f"parsed ({e}) — rotating anyway would discard it")
         raise
-    img = Image.open(filepath)
-    # Captured before convert()/rotate() — an embedded Adobe RGB/ProPhoto
-    # profile isn't guaranteed to survive those, and save() silently drops
-    # it if it's not passed back explicitly, causing a visible color shift
-    # in other viewers afterward.
-    icc_profile = img.info.get("icc_profile")
-    img = ImageOps.exif_transpose(img)
-    # PIL's rotate() is counter-clockwise; the UI's ⟳ is clockwise, so negate.
-    img = img.rotate(-degrees, expand=True)
+    with Image.open(io.BytesIO(original)) as img:
+        # Captured before convert()/rotate() — an embedded Adobe RGB/ProPhoto
+        # profile isn't guaranteed to survive those, and save() silently drops
+        # it if it's not passed back explicitly, causing a visible color shift
+        # in other viewers afterward.
+        icc_profile = img.info.get("icc_profile")
+        img = ImageOps.exif_transpose(img)
+        # PIL's rotate() is counter-clockwise; the UI's ⟳ is clockwise, so negate.
+        img = img.rotate(-degrees, expand=True)
     exif_dict["0th"][piexif.ImageIFD.Orientation] = 1
     save_kwargs = {"quality": 92, "exif": piexif.dump(exif_dict)}
     if icc_profile:
         save_kwargs["icc_profile"] = icc_profile
-    img.convert("RGB").save(filepath, "jpeg", **save_kwargs)
+    out = io.BytesIO()
+    img.convert("RGB").save(out, "jpeg", **save_kwargs)
+    atomic_write_bytes(filepath, out.getvalue())
 
 # ─── Rename ────────────────────────────────────────────────────────────────────────────────────────
 # Batch rename by pattern (tokens: {date} {time} {location} {seq} {orig} {ext}).
@@ -991,6 +1719,38 @@ def _build_rename_filename(pattern, photo, seq_counters):
         name += ext
     return name or (orig_path.stem + ext)
 
+_WINDOWS_RESERVED_NAMES = {"con", "prn", "aux", "nul", *(f"com{i}" for i in range(1, 10)),
+                           *(f"lpt{i}" for i in range(1, 10))}
+
+def validate_new_filename(new_filename, old_path):
+    """A bare filename (no directory parts) that keeps the photo's own
+    extension — a rename must not change what kind of file it is or where
+    it lives."""
+    name = (new_filename or "").strip() if isinstance(new_filename, str) else ""
+    if (not name or name in (".", "..") or "/" in name or "\\" in name or "\x00" in name
+            or _CONTROL_CHARS_RE.search(name) or len(name.encode("utf-8")) > 255
+            or name.startswith(".") or Path(name).stem.lower() in _WINDOWS_RESERVED_NAMES):
+        raise BadInput(f"Invalid filename: {new_filename!r}")
+    if Path(name).suffix.lower() != Path(old_path).suffix.lower():
+        raise BadInput(f"A rename must keep the {Path(old_path).suffix} extension")
+    return name
+
+def _sidecar_shared(photo_path):
+    """True if another photo file uses the same IMG.xmp sidecar name (e.g.
+    IMG.CR2 + IMG.JPG) — then the sidecar can't be assumed to belong to
+    the file being moved."""
+    p = Path(photo_path)
+    for ext in PHOTO_EXTENSIONS:
+        for variant in {ext, ext.upper()}:
+            if variant == p.suffix:
+                continue
+            sib = p.with_suffix(variant)
+            # samefile: on a case-insensitive filesystem IMG.jpg and IMG.JPG are one file
+            with contextlib.suppress(OSError):
+                if sib.exists() and not os.path.samefile(sib, p):
+                    return True
+    return False
+
 def _apply_rename(db, row, new_filename):
     """
     Physically rename a photo file — and its XMP sidecar, if any, since a
@@ -1001,19 +1761,30 @@ def _apply_rename(db, row, new_filename):
     name this photo ever had (COALESCE — a second rename must not overwrite
     it with the first rename's *result*).
     """
+    photo_real_path(row)  # the recorded original must still be a valid, allowed photo
     old_path = Path(row["path"])
-    if not old_path.is_file():
-        raise FileNotFoundError(f"{old_path} no longer exists")
-    new_filename = (new_filename or "").strip()
-    if not new_filename or "/" in new_filename or "\\" in new_filename:
-        raise ValueError(f"Invalid filename: {new_filename!r}")
+    if old_path.is_symlink():
+        raise PathNotAllowed(f"Refusing to rename a symlink: {old_path.name}")
+    new_filename = validate_new_filename(new_filename, old_path)
     new_path = old_path.parent / new_filename
-    if new_path.exists():
+    if os.path.lexists(new_path):
         raise FileExistsError(f"{new_filename} already exists in {old_path.parent}")
-    os.rename(old_path, new_path)
-    old_sidecar = old_path.with_suffix(".xmp")
-    if old_sidecar.exists():
-        os.rename(old_sidecar, new_path.with_suffix(".xmp"))
+    # Sidecar collisions are checked before anything moves, so a refusal
+    # never leaves the photo renamed but its sidecar behind — and an
+    # unrelated .xmp already sitting at the new name is never overwritten.
+    old_sidecar = sidecar_path_for(old_path)
+    move_sidecar = old_sidecar.exists() and not _sidecar_shared(old_path)
+    new_sidecar = new_path.with_suffix(".xmp")
+    if move_sidecar and os.path.lexists(new_sidecar):
+        raise FileExistsError(f"{new_sidecar.name} already exists in {old_path.parent}; "
+                              f"not renaming so its metadata isn't overwritten")
+    move_no_clobber(old_path, new_path)
+    if move_sidecar:
+        try:
+            move_no_clobber(old_sidecar, new_sidecar)
+        except OSError:
+            move_no_clobber(new_path, old_path)  # put the photo back; keep the pair together
+            raise
     new_id = str(new_path.relative_to(Path(row["scan_root"])))
     db.execute("""UPDATE photos SET id=?, path=?, filename=?,
                   original_filename=COALESCE(original_filename,?) WHERE id=?""",
@@ -1024,9 +1795,11 @@ def _apply_rename(db, row, new_filename):
 
 @app.route("/api/rename_preview", methods=["POST"])
 def api_rename_preview():
-    data = request.json or {}
+    data = _json_body()
     ids = data.get("ids", [])
-    pattern = (data.get("pattern") or "").strip() or "{date}_{location}_{seq}{ext}"
+    if not isinstance(ids, list):
+        return jsonify({"error": "ids must be a list"}), 400
+    pattern = clean_text(data.get("pattern") or "", "pattern", 200).strip() or "{date}_{location}_{seq}{ext}"
     db = _get_db()
     seq_counters = {}
     preview = []
@@ -1048,19 +1821,29 @@ def api_rename_batch():
     pending changes" modal for free — only /api/pending/commit needs to
     know 'rename' isn't an EXIF field.
     """
-    data = request.json or {}
+    data = _json_body()
     items = data.get("items", [])
+    if not isinstance(items, list):
+        return jsonify({"error": "items must be a list"}), 400
     dry_run = effective_dry_run(data.get("dry_run", False))
     db = _get_db()
     results = []
     for item in items:
-        pid = item.get("id")
-        new_filename = (item.get("new_filename") or "").strip()
-        row = db.execute("SELECT * FROM photos WHERE id=?", (pid,)).fetchone()
-        if not row:
+        pid = item.get("id") if isinstance(item, dict) else None
+        new_filename = item.get("new_filename") if isinstance(item, dict) else None
+        new_filename = new_filename.strip() if isinstance(new_filename, str) else ""
+        try:
+            row, _ = get_photo(db, pid)
+        except PhotoNotFound:
             results.append({"id": pid, "ok": False, "error": "not found"}); continue
+        except (PathNotAllowed, OSError) as e:
+            results.append({"id": pid, "ok": False, "error": safe_error(e)}); continue
         if not new_filename or new_filename == row["filename"]:
             results.append({"id": pid, "ok": True, "skipped": True}); continue
+        try:
+            validate_new_filename(new_filename, row["path"])
+        except BadInput as e:
+            results.append({"id": pid, "ok": False, "error": safe_error(e)}); continue
         if dry_run:
             db_save_pending(db, pid, "rename", row["filename"], new_filename)
             results.append({"id": pid, "ok": True, "dry_run": True})
@@ -1069,7 +1852,7 @@ def api_rename_batch():
             new_id = _apply_rename(db, row, new_filename)
             results.append({"id": pid, "ok": True, "new_id": new_id})
         except Exception as e:
-            results.append({"id": pid, "ok": False, "error": str(e)})
+            results.append({"id": pid, "ok": False, "error": safe_error(e)})
     db.commit()
     return jsonify({"results": results, "dry_run": dry_run})
 
@@ -1195,7 +1978,7 @@ def _infer_locations(conn, folder):
 def _scan_read_one(p):
     """
     Pure per-photo I/O + CPU work for one scan entry — read_exif,
-    compute_hashes, and a stat() — with no DB access at all, so it's safe
+    compute_perceptual_hashes, and a stat() — with no DB access at all, so it's safe
     to run many of these concurrently (see SCAN_WORKERS). Exceptions are
     caught and returned rather than raised so one unreadable/removed file
     (a real possibility mid-scan on a live library) can't abort the whole
@@ -1203,11 +1986,38 @@ def _scan_read_one(p):
     """
     try:
         exif = read_exif(str(p))
-        file_hash, phash_str, dhash_str = compute_hashes(str(p))
+        phash_str, dhash_str = compute_perceptual_hashes(str(p))
         st = p.stat()
-        return p, exif, file_hash, phash_str, dhash_str, st.st_mtime, round(st.st_size/1024), None
+        return p, exif, phash_str, dhash_str, st, None
     except Exception as e:
-        return p, None, None, None, None, None, None, str(e)
+        return p, None, None, None, None, str(e)
+
+def _list_photo_files(base):
+    """
+    Every supported photo under base, without following directory symlinks
+    (a link to / would otherwise pull the whole container into the library)
+    and skipping file symlinks that resolve outside the allowed roots.
+    _duplicates/ is where duplicate-resolution moves files (see
+    _move_to_duplicates_folder) — it lives inside the scan root for
+    simplicity, so it must be excluded here or a rescan would just
+    re-import everything just moved out of the library as "new" photos.
+    """
+    found = []
+    for dirpath, dirnames, filenames in os.walk(str(base), followlinks=False):
+        # Also prune by resolved location: not every redirecting directory
+        # is a symlink (Windows junctions, for one), and os.walk would
+        # otherwise descend into it.
+        dirnames[:] = [d for d in dirnames
+                       if d != "_duplicates" and path_is_allowed(os.path.join(dirpath, d))]
+        for name in filenames:
+            if Path(name).suffix.lower() not in PHOTO_EXTENSIONS:
+                continue
+            full = os.path.join(dirpath, name)
+            if os.path.islink(full) and not path_is_allowed(full):
+                _log(f"[scan] Skipping {full}: symlink points outside the allowed folders")
+                continue
+            found.append(Path(full))
+    return sorted(found)
 
 def _run_scan(folder, rescan=False):
     base = Path(folder)
@@ -1218,13 +2028,7 @@ def _run_scan(folder, rescan=False):
         with _scan_lock:
             _scan_state.update(phase="counting",message="Counting photo files…",
                                current=0,total=0,scan_root=folder)
-        # _duplicates/ is where duplicate-resolution moves files (see
-        # _move_to_duplicates_folder) — it lives inside the scan root for
-        # simplicity, so it must be excluded here or a rescan would just
-        # re-import everything just moved out of the library as "new" photos.
-        all_paths = sorted([p for p in base.rglob("*")
-                            if p.suffix.lower() in PHOTO_EXTENSIONS
-                            and "_duplicates" not in p.relative_to(base).parts])
+        all_paths = _list_photo_files(base)
         total = len(all_paths)
         _log(f"[scan] Found {total} photos in {folder}")
 
@@ -1256,7 +2060,7 @@ def _run_scan(folder, rescan=False):
         # the sqlite writes, commits, and progress updates below all stay on
         # this one thread (db_upsert_photo/conn are never touched from a
         # worker), so nothing about the DB access here becomes concurrent —
-        # only the pure read_exif/compute_hashes work does.
+        # only the pure read_exif/compute_perceptual_hashes work does.
         conn = _connect_db()
         total_paths = len(all_paths)
         done = 0
@@ -1264,7 +2068,7 @@ def _run_scan(folder, rescan=False):
         with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
             futures = {pool.submit(_scan_read_one, p): p for p in all_paths}
             for fut in as_completed(futures):
-                p, exif, file_hash, phash_str, dhash_str, mtime, size_kb, err = fut.result()
+                p, exif, phash_str, dhash_str, st, err = fut.result()
                 done += 1
                 if err is not None:
                     _log(f"[scan] Skipping {p.name}: {err}")
@@ -1274,8 +2078,9 @@ def _run_scan(folder, rescan=False):
                         "path":         str(p),
                         "filename":     p.name,
                         "folder":       str(p.parent.relative_to(base)),
-                        "size_kb":      size_kb,
-                        "file_mtime":   mtime,
+                        "size_kb":      round(st.st_size/1024),
+                        "file_size":    st.st_size,
+                        "file_mtime":   st.st_mtime,
                         "date_taken":   exif["date_taken"],
                         "lat":          exif["lat"],
                         "lon":          exif["lon"],
@@ -1290,7 +2095,11 @@ def _run_scan(folder, rescan=False):
                         "focal_length": exif.get("focal_length"),
                         "phash":        phash_str,
                         "dhash":        dhash_str,
-                        "file_hash":    file_hash,
+                        # Content hashes are computed lazily, and in full,
+                        # by the duplicate job — see _verified_exact_groups.
+                        "file_hash":    None,
+                        "file_hash_algo": None,
+                        "hash_mtime":   None,
                         "inferred_lat": None,"inferred_lon":None,
                         "inferred_from":None,"inferred_delta_min":None,
                         "scan_root":    folder,
@@ -1375,10 +2184,171 @@ def _run_scan(folder, rescan=False):
             _scan_state.update(running=False, phase="error",
                                error=str(e), message=f"Error: {e}")
 
+# ─── Request guards ───────────────────────────────────────────────────────────
+# There is deliberately no login (trusted LAN app). What these stop is a
+# *different* website open in the same browser silently driving this API —
+# e.g. an auto-submitting form POSTing /api/reset_database. Every state-
+# changing request must carry a token that only a page served by this app
+# can read (same-origin policy), and must not come from a foreign Origin.
+# The page's fetch() wrapper adds the token automatically, so normal use
+# never sees any of this.
+
+_SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
+# Endpoints whose bodies are uploads, bounded by MAX_UPLOAD_MB instead of
+# MAX_JSON_MB.
+_UPLOAD_ENDPOINTS = {"api_history_import"}
+_AI_ENDPOINTS = {"api_ai_infer", "api_ai_infer_with_coords"}
+
+_csrf_cache = (None, None)
+
+def _csrf_token():
+    """Per-install random token, persisted so a container restart doesn't
+    invalidate open tabs. Created with INSERT OR IGNORE so two first
+    requests racing each other can't each store a different token."""
+    global _csrf_cache
+    db_path, token = _csrf_cache
+    if db_path == DB_PATH and token:
+        return token
+    token = get_setting("csrf_token")
+    if not token:
+        conn = _connect_db()
+        try:
+            conn.execute("INSERT OR IGNORE INTO settings (key, value) VALUES ('csrf_token', ?)",
+                         (secrets.token_urlsafe(32),))
+            conn.commit()
+        finally:
+            conn.close()
+        token = get_setting("csrf_token")
+    _csrf_cache = (DB_PATH, token)
+    return token
+
+def _forbidden(code, message):
+    resp = jsonify({"error": message, "code": code})
+    resp.status_code = 403
+    return resp
+
+def _origin_ok():
+    """True unless the request names a foreign origin. Origin is sent by
+    every modern browser on fetch() POSTs; Referer is the fallback."""
+    origin = request.headers.get("Origin")
+    if origin is None:
+        ref = request.headers.get("Referer")
+        if not ref:
+            return True  # non-browser client; the token check still applies
+        parts = urlsplit(ref)
+        origin = f"{parts.scheme}://{parts.netloc}"
+    origin = origin.strip().lower().rstrip("/")
+    if origin == "null":
+        return False
+    if origin in TRUSTED_ORIGINS:
+        return True
+    return urlsplit(origin).netloc == request.host.lower()
+
+@app.before_request
+def _request_guards():
+    if ALLOWED_HOSTS and request.host.lower() not in ALLOWED_HOSTS:
+        return _forbidden("host", f"Host {request.host!r} is not in ALLOWED_HOSTS")
+    if request.method in _SAFE_METHODS:
+        return None
+    # Body limits. The upload endpoint relies on MAX_CONTENT_LENGTH.
+    if request.endpoint not in _UPLOAD_ENDPOINTS:
+        limit = (AI_MAX_REQUEST_KB * 1024 if request.endpoint in _AI_ENDPOINTS
+                 else MAX_JSON_MB * 1024 * 1024)
+        if request.content_length is None and request.headers.get("Transfer-Encoding"):
+            return jsonify({"error": "Chunked request bodies are not accepted"}), 411
+        if (request.content_length or 0) > limit:
+            return jsonify({"error": f"Request too large (limit {limit // 1024} KB)"}), 413
+    if not _origin_ok():
+        return _forbidden("origin", "Cross-site request refused")
+    sent = request.headers.get(CSRF_HEADER, "")
+    if not sent or not hmac.compare_digest(sent, _csrf_token()):
+        return _forbidden("csrf", "Missing or stale page token — reload the page and try again")
+    return None
+
+@app.after_request
+def _security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "same-origin")
+    resp.headers.setdefault("Content-Security-Policy",
+        "default-src 'self'; "
+        "script-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com; "
+        "style-src 'self' 'unsafe-inline' https://cdnjs.cloudflare.com https://fonts.googleapis.com; "
+        "font-src 'self' data: https://fonts.gstatic.com; "
+        "img-src 'self' data: blob: https://cdnjs.cloudflare.com "
+        "https://*.tile.openstreetmap.org https://server.arcgisonline.com; "
+        "connect-src 'self'; object-src 'none'; base-uri 'none'; "
+        "frame-ancestors 'none'; form-action 'self'")
+    return resp
+
+@app.teardown_request
+def _cleanup_upload_spools(exc=None):
+    """Delete upload spool files nobody claimed (a rejected, failed or
+    abandoned upload). A successful import renames its spool away first."""
+    for f in g.pop("_upload_spools", []):
+        with contextlib.suppress(Exception):
+            f.close()
+        with contextlib.suppress(OSError):
+            os.unlink(f.name)
+
+@app.errorhandler(BadInput)
+def _bad_input(e):
+    return jsonify({"error": safe_error(e)}), 400
+
+@app.errorhandler(PathNotAllowed)
+def _path_not_allowed(e):
+    return jsonify({"error": safe_error(e)}), 403
+
+@app.errorhandler(PhotoNotFound)
+def _photo_not_found(e):
+    return jsonify({"error": safe_error(e)}), 404
+
+@app.errorhandler(FileNotFoundError)
+def _file_not_found(e):
+    return jsonify({"error": safe_error(e)}), 404
+
+@app.errorhandler(413)
+def _too_large(e):
+    return jsonify({"error": f"Upload too large (limit {MAX_UPLOAD_MB} MB, see MAX_UPLOAD_MB)"}), 413
+
+def _json_body():
+    data = request.get_json(silent=True)
+    return data if isinstance(data, dict) else {}
+
+def _clear_stale_upload_spools():
+    """Nothing can be mid-upload at startup, so anything left in the upload
+    dir is debris from a crash or an interrupted upload."""
+    if UPLOAD_TMP_DIR.is_dir():
+        for p in UPLOAD_TMP_DIR.iterdir():
+            if p.is_file() and (p.name.startswith("spool_") or p.name.startswith("upload_")):
+                with contextlib.suppress(OSError):
+                    p.unlink()
+
+_clear_stale_upload_spools()
+
+def _warn_scan_roots_outside_allowed():
+    """Upgrade aid: sessions/scans recorded before ALLOWED_ROOTS existed may
+    point somewhere that's now refused — say so once, at startup."""
+    with contextlib.suppress(Exception):
+        conn = _connect_db()
+        try:
+            roots = {r[0] for r in conn.execute(
+                "SELECT DISTINCT scan_root FROM photos UNION SELECT DISTINCT scan_root FROM sessions") if r[0]}
+        finally:
+            conn.close()
+        outside = sorted(r for r in roots if not path_is_allowed(r))
+        if outside:
+            _log(f"[startup] WARNING: these saved folders are outside ALLOWED_ROOTS "
+                 f"({os.pathsep.join(ALLOWED_ROOTS)}) and can't be scanned or written until it "
+                 f"includes them: {', '.join(outside)}")
+
+_warn_scan_roots_outside_allowed()
+_log(f"[startup] Allowed photo folders: {os.pathsep.join(ALLOWED_ROOTS)}")
+
 # ─── Routes ───────────────────────────────────────────────────────────────────
 
 @app.route("/")
-def index(): return render_template("index.html", version=APP_VERSION)
+def index(): return render_template("index.html", version=APP_VERSION, csrf_token=_csrf_token())
 
 @app.route("/api/version")
 def api_version(): return jsonify({"version": APP_VERSION})
@@ -1399,6 +2369,8 @@ def api_config():
         "geocoder_provider": get_geocoder_provider(),
         "has_geocoder_key": bool(get_geocoder_api_key()),
         "geocoder_providers": [{"id": pid, **meta} for pid, meta in GEOCODER_PROVIDERS.items()],
+        "allowed_roots": ALLOWED_ROOTS,
+        "max_upload_mb": MAX_UPLOAD_MB,
     })
 
 @app.route("/api/settings", methods=["GET", "POST"])
@@ -1407,13 +2379,15 @@ def api_settings():
     their own endpoint (c.f. /api/dry_run, which is deliberately separate
     and more defensive). Add keys here as the settings surface grows."""
     if request.method == "POST":
-        data = request.json or {}
+        data = _json_body()
         if "ai_model" in data:
-            model = (data.get("ai_model") or "").strip()
+            model = (clean_text(data.get("ai_model") or "", "ai_model", 100)).strip()
+            if model and not re.fullmatch(r"[A-Za-z0-9._:@/\-]+", model):
+                raise BadInput("ai_model contains unexpected characters")
             set_setting("ai_model", model or AI_MODEL)
             _log(f"[settings] AI model set to {model or AI_MODEL}")
         if "geocoder_provider" in data:
-            provider = (data.get("geocoder_provider") or "").strip()
+            provider = (data.get("geocoder_provider") or "").strip() if isinstance(data.get("geocoder_provider"), str) else ""
             if provider in GEOCODER_PROVIDERS:
                 set_setting("geocoder_provider", provider)
                 _log(f"[settings] Geocoder provider set to {provider}")
@@ -1425,7 +2399,11 @@ def api_settings():
         # the real value (see api_settings GET / has_geocoder_key below),
         # so a blank submit here means "unchanged", not "clear the key".
         elif data.get("geocoder_api_key"):
-            set_setting("geocoder_api_key", data["geocoder_api_key"].strip())
+            key = clean_text(data["geocoder_api_key"], "geocoder_api_key", 512).strip()
+            if not re.fullmatch(r"[\x21-\x7e]+", key):
+                raise BadInput("API key must be printable ASCII without spaces")
+            _register_secret(key)
+            set_setting("geocoder_api_key", key)
             _log("[settings] Geocoder API key updated")
     return jsonify({
         "ai_model": get_ai_model(),
@@ -1442,7 +2420,7 @@ def api_logs():
     `limit` lines. Cheap: it's just filtering an in-memory deque.
     """
     since = request.args.get("since", 0, type=int)
-    limit = request.args.get("limit", 500, type=int)
+    limit = max(1, min(_LOG_BUFFER_MAX, request.args.get("limit", 500, type=int)))
     with _log_buffer_lock:
         lines = [l for l in _log_buffer if l["id"] > since]
         if since <= 0:
@@ -1454,8 +2432,8 @@ def api_logs():
 def api_dry_run():
     """Read or set the server-side dry run flag. Survives scans and navigation."""
     if request.method == "POST":
-        data = request.json or {}
-        val = bool(data.get("dry_run", True))
+        data = _json_body()
+        val = data.get("dry_run", True) is not False  # only an explicit false turns it off
         set_setting("dry_run", "true" if val else "false")
         _log(f"[safety] Dry run set to {'ON' if val else 'OFF'}")
     return jsonify({"dry_run": get_dry_run()})
@@ -1463,15 +2441,20 @@ def api_dry_run():
 # ── Folder browser ────────────────────────────────────────────────
 @app.route("/api/browse")
 def api_browse():
-    path = request.args.get("path", DEFAULT_PHOTO_ROOT)
+    path = request.args.get("path") or DEFAULT_PHOTO_ROOT
     try:
-        p = Path(path)
-        if not p.exists() or not p.is_dir():
-            return jsonify({"error": f"Not a directory: {path}"}), 400
+        resolve_allowed_path(path, kind="dir")
+        p = Path(os.path.abspath(path))
+        # Directory symlinks that lead outside the allowed folders aren't
+        # offered — choosing one would only be refused by /api/scan.
         dirs = sorted([str(d.name) for d in p.iterdir()
-                       if d.is_dir() and not d.name.startswith(".")])
-        parent = str(p.parent) if str(p.parent) != str(p) else None
-        return jsonify({"path": str(p), "parent": parent, "dirs": dirs})
+                       if d.is_dir() and not d.name.startswith(".") and path_is_allowed(str(d))])
+        parent = str(p.parent) if str(p.parent) != str(p) and path_is_allowed(str(p.parent)) else None
+        return jsonify({"path": str(p), "parent": parent, "dirs": dirs, "roots": ALLOWED_ROOTS})
+    except PathNotAllowed as e:
+        return jsonify({"error": safe_error(e), "roots": ALLOWED_ROOTS}), 403
+    except FileNotFoundError as e:
+        return jsonify({"error": safe_error(e), "roots": ALLOWED_ROOTS}), 400
     except PermissionError:
         return jsonify({"error": "Permission denied"}), 403
 
@@ -1484,11 +2467,12 @@ def api_sessions():
 
 @app.route("/api/sessions", methods=["POST"])
 def api_create_session():
-    data = request.json or {}
-    name = data.get("name","").strip()
-    root = data.get("scan_root","").strip()
+    data = _json_body()
+    name = (clean_text(data.get("name") or "", "name", 200) or "").strip()
+    root = (clean_text(data.get("scan_root") or "", "scan_root", 4096) or "").strip()
     if not name or not root:
         return jsonify({"error":"name and scan_root required"}), 400
+    resolve_allowed_path(root, kind="dir")
     db = _get_db()
     cur = db.execute("INSERT INTO sessions (name,scan_root) VALUES (?,?)", (name,root))
     db.commit()
@@ -1542,6 +2526,37 @@ def _reset_library_data():
     if THUMB_CACHE_DIR.is_dir():
         shutil.rmtree(THUMB_CACHE_DIR, ignore_errors=True)
 
+# The reset confirmation lives on the server, not just in the browser's
+# dialog: /prepare issues a single-use token (valid briefly) together with
+# what would be deleted; the reset itself only proceeds with that token
+# echoed back plus the literal confirmation phrase. A stray or scripted
+# POST can't wipe the library on its own.
+RESET_CONFIRM_PHRASE = "RESET LIBRARY DATA"
+_RESET_TOKEN_TTL = 120
+_reset_tokens = {}
+_reset_tokens_lock = threading.Lock()
+
+@app.route("/api/reset_database/prepare", methods=["POST"])
+def api_reset_database_prepare():
+    db = _get_db()
+    counts = {t: db.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+              for t in ("photos", "pending_changes", "sessions", "location_imports")}
+    token = secrets.token_urlsafe(24)
+    now = time.time()
+    with _reset_tokens_lock:
+        for k in [k for k, exp in _reset_tokens.items() if exp < now]:
+            del _reset_tokens[k]
+        _reset_tokens[token] = now + _RESET_TOKEN_TTL
+    return jsonify({"confirm_token": token, "confirm_phrase": RESET_CONFIRM_PHRASE,
+                    "expires_in": _RESET_TOKEN_TTL, "counts": counts})
+
+def _consume_reset_token(token):
+    if not isinstance(token, str) or not token:
+        return False
+    with _reset_tokens_lock:
+        exp = _reset_tokens.pop(token, None)  # single use, valid or not
+    return exp is not None and exp >= time.time()
+
 @app.route("/api/reset_database", methods=["POST"])
 def api_reset_database():
     """
@@ -1551,6 +2566,11 @@ def api_reset_database():
     scan/dup-scan/history job would corrupt its state or crash it, not
     just get skipped cleanly.
     """
+    data = _json_body()
+    token_ok = _consume_reset_token(data.get("confirm_token"))  # spent by any attempt
+    if not token_ok or data.get("confirm") != RESET_CONFIRM_PHRASE:
+        return jsonify({"error": "Reset not confirmed (missing, expired or reused confirmation)",
+                        "code": "confirm"}), 400
     with _scan_lock:
         if _scan_state["running"]:
             return jsonify({"error": "A scan is running — wait for it to finish first"}), 409
@@ -1588,10 +2608,15 @@ def api_reset_database():
 # ── Scan ──────────────────────────────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
 def api_scan():
-    data = request.json or {}
-    folder  = data.get("folder","").strip()
-    rescan  = data.get("rescan", False)
-    if not folder or not os.path.isdir(folder):
+    data = _json_body()
+    folder  = data.get("folder") if isinstance(data.get("folder"), str) else ""
+    folder  = folder.strip()
+    rescan  = data.get("rescan", False) is True
+    if not folder:
+        return jsonify({"error": "Folder not found: (empty)"}), 400
+    try:
+        resolve_allowed_path(folder, kind="dir")
+    except FileNotFoundError:
         return jsonify({"error": f"Folder not found: {folder}"}), 400
     with _scan_lock:
         if _scan_state["running"]:
@@ -1632,21 +2657,8 @@ def api_scan_result():
 def api_pending():
     folder = request.args.get("folder","")
     db = _get_db()
-    # Self-heal: db_save_pending() now supersedes an existing uncommitted
-    # row for the same photo+field instead of stacking another one, but
-    # this cleans up anything left over from before that fix — a photo
-    # edited/re-staged repeatedly (while testing a feature, adjusting a
-    # pin, etc.) could otherwise show the same field pending several times
-    # over. Keeps only the most recent uncommitted row per (photo_id,
-    # field); committed rows (history) are untouched.
-    db.execute("""
-        DELETE FROM pending_changes
-        WHERE committed=0 AND id NOT IN (
-            SELECT MAX(id) FROM pending_changes WHERE committed=0
-            GROUP BY photo_id, field
-        )
-    """)
-    db.commit()
+    # (The duplicate-row self-heal that used to run here, on a GET, now
+    # runs once in init_db(); db_save_pending() prevents new duplicates.)
     rows = db.execute("""
         SELECT pc.id, pc.photo_id, pc.field, pc.old_value, pc.new_value,
                pc.created_at, p.filename, p.folder, p.path
@@ -1684,66 +2696,67 @@ def api_pending():
 @app.route("/api/pending/commit", methods=["POST"])
 def api_commit_pending():
     """Write all pending dry-run changes to actual files."""
-    data = request.json or {}
+    data = _json_body()
     ids  = data.get("ids")   # optional list of specific pending IDs
+    if ids is not None and (not isinstance(ids, list) or not all(isinstance(i, int) for i in ids)):
+        return jsonify({"error": "ids must be a list of integers"}), 400
     db   = _get_db()
-    q = "SELECT pc.*,p.path FROM pending_changes pc JOIN photos p ON p.id=pc.photo_id WHERE pc.committed=0"
+    q = "SELECT pc.* FROM pending_changes pc JOIN photos p ON p.id=pc.photo_id WHERE pc.committed=0"
     rows = db.execute(q + (" AND pc.id IN ({})".format(",".join("?"*len(ids))) if ids else ""),
                       ids or []).fetchall()
     results = []
     by_photo = {}
     for r in rows:
-        by_photo.setdefault(r["photo_id"], {"path":r["path"],"fields":{}})
-        by_photo[r["photo_id"]]["fields"][r["field"]] = r["new_value"]
+        by_photo.setdefault(r["photo_id"], {})[r["field"]] = r["new_value"]
 
-    for photo_id, info in by_photo.items():
+    for photo_id, fields in by_photo.items():
         try:
-            fields = info["fields"]
+            # Resolved from the library row and re-validated at commit time:
+            # the staged values were recorded earlier and the filesystem may
+            # have changed since.
+            row, real_path = get_photo(db, photo_id)
             # A photo marked for duplicate cleanup is leaving the library —
             # any other pending field for it (a location edit made before it
             # was flagged as a dup, say) is moot, so skip straight to the
             # move and mark everything for this photo committed together.
             if fields.get("move_to_duplicates"):
-                row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
-                if row:
-                    _move_to_duplicates_folder(db, row)
+                _move_to_duplicates_folder(db, row)
                 db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
                            (photo_id,))
                 results.append({"photo_id":photo_id,"ok":True})
                 continue
+            location_name = clean_text(fields.get("location_name"), "location_name", 1000)
+            lat = clean_coord(fields.get("lat"), "lat", 90)
+            lon = clean_coord(fields.get("lon"), "lon", 180)
+            date_taken = clean_date(fields.get("date_taken"))
+            rotation = clean_rotation(fields.get("rotate_degrees"))
             # write_location_to_exif unconditionally reloads+resaves the EXIF
             # segment even when nothing changed — fine for a real edit, but
             # a rename-only or rotate-only pending change would otherwise
             # re-encode the file for no reason.
-            if any(fields.get(k) for k in ("location_name","lat","lon","date_taken")):
-                write_location_to_exif(
-                    info["path"],
-                    fields.get("location_name"),
-                    float(fields["lat"]) if fields.get("lat") else None,
-                    float(fields["lon"]) if fields.get("lon") else None,
-                    fields.get("date_taken"),
-                )
-            if fields.get("rotate_degrees"):
-                rotate_image_file(info["path"], int(fields["rotate_degrees"]))
+            if location_name or lat is not None or lon is not None or date_taken:
+                write_location_to_exif(real_path, location_name, lat, lon, date_taken)
+            if rotation:
+                rotate_image_file(real_path, rotation)
             # Renamed last: every write above already targeted the
-            # pre-rename path captured in info["path"], so doing this last
-            # means order here doesn't matter for any of them.
+            # pre-rename path, so doing this last means order here doesn't
+            # matter for any of them.
             if fields.get("rename"):
-                row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
-                if row:
-                    _apply_rename(db, row, fields["rename"])
+                _apply_rename(db, row, fields["rename"])
             db.execute("UPDATE pending_changes SET committed=1 WHERE photo_id=? AND committed=0",
                        (photo_id,))
             results.append({"photo_id":photo_id,"ok":True})
         except Exception as e:
-            results.append({"photo_id":photo_id,"ok":False,"error":str(e)})
+            results.append({"photo_id":photo_id,"ok":False,"error":safe_error(e)})
     db.commit()
     return jsonify({"results":results,"committed":sum(1 for r in results if r["ok"])})
 
 @app.route("/api/pending/discard", methods=["POST"])
 def api_discard_pending():
-    data = request.json or {}
+    data = _json_body()
     ids  = data.get("ids")
+    if ids is not None and (not isinstance(ids, list) or not all(isinstance(i, int) for i in ids)):
+        return jsonify({"error": "ids must be a list of integers"}), 400
     db   = _get_db()
     if ids:
         db.execute("DELETE FROM pending_changes WHERE id IN ({})".format(",".join("?"*len(ids))), ids)
@@ -1755,8 +2768,9 @@ def api_discard_pending():
 # ── Geocode ───────────────────────────────────────────────────────
 @app.route("/api/geocode", methods=["POST"])
 def api_geocode():
-    data = request.json or {}
-    lat,lon = data.get("lat"), data.get("lon")
+    data = _json_body()
+    lat = clean_coord(data.get("lat"), "lat", 90)
+    lon = clean_coord(data.get("lon"), "lon", 180)
     if lat is None or lon is None:
         return jsonify({"error":"lat/lon required"}), 400
     return jsonify({"location_name": reverse_geocode(lat,lon)})
@@ -1766,6 +2780,7 @@ def api_geocode_search():
     q = (request.args.get("q") or "").strip()
     if not q:
         return jsonify({"results":[]})
+    q = clean_text(q, "q", 300)
     results = forward_geocode_search(q)
     if results is None:
         return jsonify({"error":"Search failed","results":[]}), 502
@@ -1808,8 +2823,10 @@ def api_saved_locations():
 
 @app.route("/api/saved_locations", methods=["POST"])
 def api_saved_locations_add():
-    data = request.json or {}
-    name, lat, lon = data.get("name"), data.get("lat"), data.get("lon")
+    data = _json_body()
+    name = clean_text(data.get("name"), "name", 300)
+    lat = clean_coord(data.get("lat"), "lat", 90)
+    lon = clean_coord(data.get("lon"), "lon", 180)
     if not name or lat is None or lon is None:
         return jsonify({"error":"name, lat, lon required"}), 400
     locs = _get_saved_locations()
@@ -1821,7 +2838,7 @@ def api_saved_locations_add():
 
 @app.route("/api/saved_locations/delete", methods=["POST"])
 def api_saved_locations_delete():
-    data = request.json or {}
+    data = _json_body()
     idx = data.get("index")
     locs = _get_saved_locations()
     if not isinstance(idx,int) or not (0 <= idx < len(locs)):
@@ -1833,89 +2850,95 @@ def api_saved_locations_delete():
 # ── Save ──────────────────────────────────────────────────────────
 @app.route("/api/save", methods=["POST"])
 def api_save():
-    data          = request.json or {}
-    filepath      = data.get("path")
-    location_name = data.get("location_name")
-    lat           = data.get("lat")
-    lon           = data.get("lon")
-    date_str      = data.get("date_taken")
-    rotate_deg    = data.get("rotate_degrees") or 0
+    data          = _json_body()
+    location_name = clean_text(data.get("location_name"), "location_name", 1000)
+    lat           = clean_coord(data.get("lat"), "lat", 90)
+    lon           = clean_coord(data.get("lon"), "lon", 180)
+    date_str      = clean_date(data.get("date_taken"))
+    rotate_deg    = clean_rotation(data.get("rotate_degrees"))
     dry_run       = effective_dry_run(data.get("dry_run", False))
-    photo_id      = data.get("id")
-
-    if not filepath or not os.path.isfile(filepath):
-        return jsonify({"error":"File not found"}), 400
+    client_path   = data.get("path") if isinstance(data.get("path"), str) else None
 
     db = _get_db()
+    # The photo is identified by its library id; the file path always comes
+    # from the library row (a supplied path must match it).
+    row, filepath = get_photo(db, data.get("id"), client_path)
+    photo_id = row["id"]
 
     if dry_run:
         _log(f"[dry-run] Would write: {filepath}")
-        if photo_id:
-            # Get old values for undo
-            row = db.execute("SELECT * FROM photos WHERE id=?", (photo_id,)).fetchone()
-            if row:
-                for field, new_val in [("location_name",location_name),
-                                        ("lat",lat),("lon",lon),("date_taken",date_str),
-                                        ("rotate_degrees", rotate_deg or None)]:
-                    if new_val is not None:
-                        # rotate_degrees has no photos.* column of its own (it's an
-                        # action, not a stored field) — row[field] would KeyError.
-                        old_val = row[field] if field in row.keys() else None
-                        db_save_pending(db, photo_id, field, old_val, new_val)
-            db.commit()
+        for field, new_val in [("location_name",location_name),
+                                ("lat",lat),("lon",lon),("date_taken",date_str),
+                                ("rotate_degrees", rotate_deg or None)]:
+            if new_val is not None:
+                # rotate_degrees has no photos.* column of its own (it's an
+                # action, not a stored field) — row[field] would KeyError.
+                old_val = row[field] if field in row.keys() else None
+                db_save_pending(db, photo_id, field, old_val, new_val)
+        db.commit()
         return jsonify({"ok":True,"dry_run":True})
 
     try:
         write_location_to_exif(filepath, location_name, lat, lon, date_str)
         if rotate_deg:
             rotate_image_file(filepath, rotate_deg)
-        # Update DB
-        if photo_id:
-            db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,date_taken=?,
-                          has_gps=?,status=? WHERE id=?""",
-                       (location_name, lat, lon, date_str,
-                        1 if (lat and lon) else 0,
-                        "gps" if (lat and lon) else ("named" if location_name else "unknown"),
-                        photo_id))
-            db.commit()
+        db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,date_taken=?,
+                      has_gps=?,status=? WHERE id=?""",
+                   (location_name, lat, lon, date_str,
+                    1 if (lat is not None and lon is not None) else 0,
+                    "gps" if (lat is not None and lon is not None) else ("named" if location_name else "unknown"),
+                    photo_id))
+        db.commit()
         return jsonify({"ok":True})
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return jsonify({"error":safe_error(e)}), 500
 
 @app.route("/api/save_batch", methods=["POST"])
 def api_save_batch():
-    data    = request.json or {}
+    data    = _json_body()
     photos  = data.get("photos",[])
+    if not isinstance(photos, list):
+        return jsonify({"error": "photos must be a list"}), 400
     dry_run = effective_dry_run(data.get("dry_run", False))
     db      = _get_db()
     results = []
     for p in photos:
+        if not isinstance(p, dict):
+            results.append({"id":None,"ok":False,"error":"invalid entry"})
+            continue
+        pid = p.get("id")
+        try:
+            # Every entry must name an existing library photo; its file path
+            # comes from the library, never from the request.
+            row, filepath = get_photo(db, pid, p.get("path") if isinstance(p.get("path"), str) else None)
+            location_name = clean_text(p.get("location_name"), "location_name", 1000)
+            lat = clean_coord(p.get("lat"), "lat", 90)
+            lon = clean_coord(p.get("lon"), "lon", 180)
+            date_taken = clean_date(p.get("date_taken"))
+        except (PhotoNotFound, PathNotAllowed, BadInput, OSError) as e:
+            results.append({"id":pid,"ok":False,"error":safe_error(e)})
+            continue
         if dry_run:
-            _log(f"[dry-run] Would write: {p.get('path')}")
-            if p.get("id"):
-                row = db.execute("SELECT * FROM photos WHERE id=?", (p["id"],)).fetchone()
-                if row:
-                    for field, new_val in [("location_name",p.get("location_name")),
-                                            ("lat",p.get("lat")),("lon",p.get("lon")),
-                                            ("date_taken",p.get("date_taken"))]:
-                        if new_val is not None:
-                            db_save_pending(db, p["id"], field, row[field], new_val)
-            results.append({"id":p.get("id"),"ok":True,"dry_run":True})
+            _log(f"[dry-run] Would write: {filepath}")
+            for field, new_val in [("location_name",location_name),
+                                    ("lat",lat),("lon",lon),
+                                    ("date_taken",date_taken)]:
+                if new_val is not None:
+                    db_save_pending(db, pid, field, row[field], new_val)
+            results.append({"id":pid,"ok":True,"dry_run":True})
         else:
             try:
-                write_location_to_exif(p["path"],p.get("location_name"),
-                                        p.get("lat"),p.get("lon"),p.get("date_taken"))
-                if p.get("id"):
-                    db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,
-                                  has_gps=?,status=? WHERE id=?""",
-                               (p.get("location_name"),p.get("lat"),p.get("lon"),
-                                1 if (p.get("lat") and p.get("lon")) else 0,
-                                "gps" if (p.get("lat") and p.get("lon"))
-                                else ("named" if p.get("location_name") else "unknown"),
-                                p["id"]))
-                results.append({"id":p.get("id"),"ok":True})
+                write_location_to_exif(filepath, location_name, lat, lon, date_taken)
+                db.execute("""UPDATE photos SET location_name=?,lat=?,lon=?,
+                              has_gps=?,status=? WHERE id=?""",
+                           (location_name, lat, lon,
+                            1 if (lat is not None and lon is not None) else 0,
+                            "gps" if (lat is not None and lon is not None)
+                            else ("named" if location_name else "unknown"),
+                            pid))
+                results.append({"id":pid,"ok":True})
             except Exception as e:
-                results.append({"id":p.get("id"),"ok":False,"error":str(e)})
+                results.append({"id":pid,"ok":False,"error":safe_error(e)})
     db.commit()
     return jsonify({"results":results,"dry_run":dry_run})
 
@@ -1937,38 +2960,115 @@ def api_thumbnail():
     times a photo has ever been touched. Freshness is just "is the cached
     file newer than the source file" — no separate metadata store needed.
     """
-    filepath = request.args.get("path","")
-    if not filepath or not os.path.isfile(filepath):
-        return "",404
-    size = int(request.args.get("size",280))
+    photo_id = request.args.get("id", "")
     try:
+        size = int(request.args.get("size", 280))
+    except ValueError:
+        size = None
+    if size not in THUMB_SIZES:
+        return jsonify({"error": f"size must be one of {sorted(THUMB_SIZES)}"}), 400
+    try:
+        _, filepath = get_photo(_get_db(), photo_id)
         src_mtime = os.path.getmtime(filepath)
+    except PhotoNotFound:
+        return "", 404
+    except (PathNotAllowed, FileNotFoundError):
+        return "", 404
     except OSError as e:
-        return str(e),500
+        return safe_error(e), 500
 
     cache_key = hashlib.md5(f"{filepath}|{size}".encode("utf-8")).hexdigest()
     cache_path = THUMB_CACHE_DIR / f"{cache_key}.jpg"
     try:
         if cache_path.is_file() and cache_path.stat().st_mtime >= src_mtime:
+            # Bump mtime so eviction (oldest first) approximates LRU. Still
+            # >= src_mtime, so the freshness check above is unaffected.
+            with contextlib.suppress(OSError):
+                os.utime(cache_path)
             return send_file(cache_path, mimetype="image/jpeg",
                               max_age=31536000, conditional=True)
     except OSError:
         pass  # cache file vanished between the is_file() and stat() checks — fall through and regenerate
 
+    # Full-size decodes are the expensive, memory-hungry part; a fast scroll
+    # through a big grid used to start one per visible card all at once.
+    if not _thumb_semaphore.acquire(timeout=30):
+        return jsonify({"error": "Thumbnail generator busy"}), 503
+    THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    # Write to a per-request unique temp name and rename into place: two
+    # requests for the same never-before-cached thumbnail racing each
+    # other must not let one see the other's half-written file.
+    tmp_path = cache_path.with_name(f"{cache_key}.{uuid.uuid4().hex}.tmp")
     try:
-        img = Image.open(filepath)
-        img.thumbnail((size,size), Image.LANCZOS)
-        THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        # Write to a per-request temp name and rename into place: two
-        # requests for the same never-before-cached thumbnail racing each
-        # other must not let one see the other's half-written file.
-        tmp_path = cache_path.with_name(f"{cache_key}.{os.getpid()}.{threading.get_ident()}.tmp")
-        img.convert("RGB").save(tmp_path, "JPEG", quality=75)
+        with Image.open(filepath) as img:
+            img.draft("RGB", (size, size))  # JPEG: decode at reduced scale, much cheaper
+            img.thumbnail((size,size), Image.LANCZOS)
+            img.convert("RGB").save(tmp_path, "JPEG", quality=75)
         os.replace(tmp_path, cache_path)
+        _thumb_cache_note_write(cache_path)
         return send_file(cache_path, mimetype="image/jpeg",
                           max_age=31536000, conditional=True)
     except Exception as e:
-        return str(e),500
+        with contextlib.suppress(OSError):
+            os.unlink(tmp_path)
+        return safe_error(e), 500
+    finally:
+        _thumb_semaphore.release()
+
+_thumb_semaphore = threading.BoundedSemaphore(THUMB_WORKERS)
+_thumb_cache_lock = threading.Lock()
+_thumb_cache_bytes = None   # running estimate; None until the first full count
+_thumb_evicting = threading.Lock()
+
+def _thumb_cache_note_write(path):
+    global _thumb_cache_bytes
+    if THUMB_CACHE_MAX_MB <= 0:
+        return
+    with contextlib.suppress(OSError):
+        n = path.stat().st_size
+        with _thumb_cache_lock:
+            if _thumb_cache_bytes is not None:
+                _thumb_cache_bytes += n
+            over = _thumb_cache_bytes is None or _thumb_cache_bytes > THUMB_CACHE_MAX_MB * 1024 * 1024
+        if over:
+            evict_thumb_cache()
+
+def evict_thumb_cache():
+    """Trim the thumbnail cache to 80% of THUMB_CACHE_MAX_MB, oldest
+    (least recently served) first. Also clears temp files orphaned by a
+    crash. Single-flight: concurrent callers just skip."""
+    global _thumb_cache_bytes
+    if THUMB_CACHE_MAX_MB <= 0 or not _thumb_evicting.acquire(blocking=False):
+        return
+    try:
+        cap = THUMB_CACHE_MAX_MB * 1024 * 1024
+        entries, total, now = [], 0, time.time()
+        if THUMB_CACHE_DIR.is_dir():
+            for e in os.scandir(THUMB_CACHE_DIR):
+                with contextlib.suppress(OSError):
+                    st = e.stat()
+                    if e.name.endswith(".tmp"):
+                        if now - st.st_mtime > 3600:
+                            os.unlink(e.path)
+                        continue
+                    entries.append((st.st_mtime, st.st_size, e.path))
+                    total += st.st_size
+        if total > cap:
+            target = int(cap * 0.8)
+            entries.sort()
+            removed = 0
+            for _mtime, size, path in entries:
+                if total <= target:
+                    break
+                with contextlib.suppress(OSError):
+                    os.unlink(path)
+                    total -= size
+                    removed += 1
+            _log(f"[thumbs] Cache over {THUMB_CACHE_MAX_MB} MB — evicted {removed} thumbnail(s)")
+        with _thumb_cache_lock:
+            _thumb_cache_bytes = total
+    finally:
+        _thumb_evicting.release()
 
 # ── Duplicates ────────────────────────────────────────────────────
 # ── Duplicates (background job) ───────────────────────────────────
@@ -1983,6 +3083,80 @@ _dup_lock  = threading.Lock()
 PHASH_THRESHOLD = 10  # max hamming distance out of 64 bits (DCT hash)
 DHASH_THRESHOLD = 8   # max hamming distance out of 64 bits (gradient hash)
 
+def _verified_exact_groups(rows):
+    """
+    Groups of files with identical contents. Files are only compared when
+    their current on-disk sizes are equal, and only by a full-content
+    SHA-256 (compute_file_sha256). A stored hash is reused only if it's a
+    full SHA-256 computed from a file with exactly the current size and
+    mtime; legacy partial hashes, or hashes of a file that has since been
+    edited, are recomputed. Files that are missing, outside the allowed
+    folders or changing while being read are left out rather than guessed.
+    Mutates each grouped row's file_hash fields and persists new hashes.
+    """
+    from collections import defaultdict
+    by_size = defaultdict(list)
+    for r in rows:
+        try:
+            real = photo_real_path(r)
+            st = os.stat(real)
+        except (PathNotAllowed, OSError):
+            continue
+        r["_real"], r["_st"] = real, st
+        by_size[st.st_size].append(r)
+    candidates = [r for group in by_size.values() if len(group) > 1 for r in group]
+
+    def need_hash(r):
+        st = r["_st"]
+        return not (r.get("file_hash_algo") == FILE_HASH_ALGO and r.get("file_hash")
+                    and r.get("file_size") == st.st_size
+                    and r.get("hash_mtime") is not None and abs(r["hash_mtime"] - st.st_mtime) < 1e-6)
+
+    to_hash = [r for r in candidates if need_hash(r)]
+    if to_hash:
+        _log(f"[dup] Hashing {len(to_hash)} same-size file(s) in full (SHA-256)…")
+        with _dup_lock:
+            _dup_state.update(message=f"Verifying {len(to_hash)} same-size files (full SHA-256)…",
+                              current=0, total=len(to_hash))
+
+        def work(r):
+            try:
+                return r, compute_file_sha256(r["_real"]), None
+            except OSError as e:
+                return r, None, e
+        conn = _connect_db()
+        try:
+            done = 0
+            with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as pool:
+                for r, result, err in pool.map(work, to_hash):
+                    done += 1
+                    if err is not None:
+                        _log(f"[dup] Not comparing {r['filename']}: {safe_error(err)}")
+                        r["file_hash"] = None
+                    else:
+                        digest, size, mtime = result
+                        r.update(file_hash=digest, file_hash_algo=FILE_HASH_ALGO,
+                                 file_size=size, hash_mtime=mtime)
+                        conn.execute("""UPDATE photos SET file_hash=?, file_hash_algo=?,
+                                        file_size=?, hash_mtime=? WHERE id=?""",
+                                     (digest, FILE_HASH_ALGO, size, mtime, r["id"]))
+                    if done % 50 == 0:
+                        conn.commit()
+                        with _dup_lock:
+                            _dup_state.update(current=done)
+            conn.commit()
+        finally:
+            conn.close()
+
+    exact = defaultdict(list)
+    for r in candidates:
+        if r.get("file_hash_algo") == FILE_HASH_ALGO and r.get("file_hash"):
+            exact[(r["file_size"], r["file_hash"])].append(r)
+    for r in rows:
+        r.pop("_real", None)
+        r.pop("_st", None)
+    return [list(group) for group in exact.values() if len(group) > 1]
+
 def _run_dup_scan(folder):
     from collections import defaultdict
     try:
@@ -1993,21 +3167,18 @@ def _run_dup_scan(folder):
         conn = _connect_db()
         rows = rows_to_dicts(conn.execute(
             "SELECT id,path,filename,folder,size_kb,date_taken,phash,dhash,file_hash,"
-            "status,location_name FROM photos WHERE scan_root=?", (folder,)).fetchall())
+            "file_hash_algo,file_size,hash_mtime,status,location_name "
+            "FROM photos WHERE scan_root=?", (folder,)).fetchall())
         conn.close()
 
         n = len(rows)
         _log(f"[dup] Loaded {n} photos for duplicate analysis")
 
-        # ── 1. Exact byte-level duplicates (instant, dict-based) ──────
+        # ── 1. Exact duplicates: verified full-content SHA-256 ────────
         with _dup_lock:
-            _dup_state.update(phase="exact", message="Finding exact duplicates…", total=n)
-        exact = defaultdict(list)
-        for r in rows:
-            if r.get("file_hash"):
-                exact[r["file_hash"]].append(r)
-        exact_groups = [v for v in exact.values() if len(v) > 1]
-        _log(f"[dup] {len(exact_groups)} exact-duplicate groups")
+            _dup_state.update(phase="exact", message="Finding identical files…", total=n)
+        exact_groups = _verified_exact_groups(rows)
+        _log(f"[dup] {len(exact_groups)} exact-duplicate groups (full SHA-256, equal size)")
 
         # ── 2. Filename-pattern duplicates: IMG_4502 vs IMG_4502 (1) ──
         with _dup_lock:
@@ -2097,9 +3268,10 @@ def _run_dup_scan(folder):
 
 @app.route("/api/duplicates/start", methods=["POST"])
 def api_duplicates_start():
-    data = request.json or {}
-    folder = data.get("folder", "").strip()
-    force  = data.get("force", False)
+    data = _json_body()
+    folder = data.get("folder") if isinstance(data.get("folder"), str) else ""
+    folder = folder.strip()
+    force  = data.get("force", False) is True
     if not folder:
         return jsonify({"error": "folder required"}), 400
     with _dup_lock:
@@ -2138,20 +3310,40 @@ def _move_to_duplicates_folder(db, row):
     they're duplicates); a numeric suffix covers the rest, e.g. resolving
     the same group twice.
     """
+    photo_real_path(row)
     src = Path(row["path"])
-    if not src.is_file():
-        raise FileNotFoundError(f"{src} no longer exists")
-    dest_dir = Path(row["scan_root"]) / "_duplicates" / (row["folder"] or "")
+    if src.is_symlink():
+        raise PathNotAllowed(f"Refusing to move a symlink: {src.name}")
+    scan_root = resolve_allowed_path(row["scan_root"], kind="dir")
+    dup_root = Path(scan_root) / "_duplicates"
+    folder = row["folder"] or ""
+    if folder in (".", ""):
+        folder = ""
+    if os.path.isabs(folder) or ".." in Path(folder).parts:
+        raise PathNotAllowed(f"Unexpected folder value {folder!r}")
+    dest_dir = dup_root / folder
     dest_dir.mkdir(parents=True, exist_ok=True)
+    # mkdir follows symlinks; make sure we're still inside _duplicates/.
+    if not _is_within(_norm_real(dest_dir), _norm_real(dup_root)):
+        raise PathNotAllowed(f"{dest_dir} resolves outside {dup_root}")
+    sidecar = sidecar_path_for(src)
+    move_sidecar = sidecar.exists() and not _sidecar_shared(src)
+    # Pick a name free for BOTH the photo and (if it has one) its sidecar,
+    # so an unrelated .xmp already in _duplicates/ is never overwritten.
     dest = dest_dir / src.name
     n = 1
-    while dest.exists():
+    while os.path.lexists(dest) or (move_sidecar and os.path.lexists(dest.with_suffix(".xmp"))):
         dest = dest_dir / f"{src.stem} ({n}){src.suffix}"
         n += 1
-    shutil.move(str(src), str(dest))
-    sidecar = src.with_suffix(".xmp")
-    if sidecar.exists():
-        shutil.move(str(sidecar), str(dest.with_suffix(".xmp")))
+        if n > 10000:
+            raise FileExistsError(f"No free name for {src.name} in {dest_dir}")
+    move_no_clobber(src, dest)
+    if move_sidecar:
+        try:
+            move_no_clobber(sidecar, dest.with_suffix(".xmp"))
+        except OSError:
+            move_no_clobber(dest, src)  # keep photo and sidecar together
+            raise
     db.execute("DELETE FROM photos WHERE id=?", (row["id"],))
     db.execute("DELETE FROM pending_changes WHERE photo_id=?", (row["id"],))
 
@@ -2164,17 +3356,20 @@ def api_duplicates_resolve():
     write: with dry run on, each id is staged as a field='move_to_duplicates'
     pending change instead (reviewed and committed the normal way).
     """
-    data = request.json or {}
+    data = _json_body()
     move_ids = data.get("move_ids", [])
     dry_run = effective_dry_run(data.get("dry_run", False))
-    if not move_ids:
+    if not move_ids or not isinstance(move_ids, list):
         return jsonify({"error": "move_ids required"}), 400
     db = _get_db()
     results = []
     for pid in move_ids:
-        row = db.execute("SELECT * FROM photos WHERE id=?", (pid,)).fetchone()
-        if not row:
+        try:
+            row, _ = get_photo(db, pid)
+        except PhotoNotFound:
             results.append({"id": pid, "ok": False, "error": "not found"}); continue
+        except (PathNotAllowed, OSError) as e:
+            results.append({"id": pid, "ok": False, "error": safe_error(e)}); continue
         if dry_run:
             db_save_pending(db, pid, "move_to_duplicates", None, "1")
             results.append({"id": pid, "ok": True, "dry_run": True})
@@ -2183,7 +3378,7 @@ def api_duplicates_resolve():
             _move_to_duplicates_folder(db, row)
             results.append({"id": pid, "ok": True})
         except Exception as e:
-            results.append({"id": pid, "ok": False, "error": str(e)})
+            results.append({"id": pid, "ok": False, "error": safe_error(e)})
     db.commit()
     return jsonify({"results": results, "dry_run": dry_run})
 
@@ -2233,6 +3428,12 @@ def _parse_gpx(filepath):
     recorded fix. Streamed with iterparse + per-point clearing so a large
     track doesn't build the whole XML tree in memory.
     """
+    # GPX never needs a DTD; refusing one up front rules out entity-
+    # expansion tricks regardless of the XML parser's own protections.
+    with open(filepath, "rb") as f:
+        head = f.read(64 * 1024)
+    if re.search(rb"<!(DOCTYPE|ENTITY)", head, re.IGNORECASE):
+        raise ValueError("GPX files with a DOCTYPE/ENTITY declaration are not accepted")
     for _event, elem in ET.iterparse(filepath, events=("end",)):
         tag = elem.tag.rsplit("}", 1)[-1]  # strip the GPX XML namespace
         if tag != "trkpt":
@@ -2341,12 +3542,13 @@ def _run_history_import(import_id, filepath, ext, cleanup_path=None):
                                        message=f"Imported {count:,} location points")
     except Exception as e:
         import traceback; traceback.print_exc()
+        err = safe_error(e)
         conn.execute("UPDATE location_imports SET status='error', error=? WHERE id=?",
-                     (str(e), import_id))
+                     (err, import_id))
         conn.commit()
-        _log(f"[history] Import #{import_id} FAILED: {e}")
+        _log(f"[history] Import #{import_id} FAILED: {err}")
         with _hist_import_lock:
-            _hist_import_state.update(running=False, phase="error", error=str(e), message=f"Error: {e}")
+            _hist_import_state.update(running=False, phase="error", error=err, message=f"Error: {err}")
     finally:
         conn.close()
         if cleanup_path:
@@ -2428,49 +3630,85 @@ def api_history_imports():
     total_points = db.execute("SELECT COUNT(*) c FROM location_points").fetchone()["c"]
     return jsonify({"imports": rows_to_dicts(rows), "total_points": total_points})
 
+def _prepare_history_source():
+    """Returns (filepath, ext, source_name, cleanup_path) or raises
+    BadInput / PathNotAllowed / FileNotFoundError."""
+    upload = request.files.get("file")
+    if upload and upload.filename:
+        source_name = clean_text(Path(upload.filename).name, "filename", 255) or "upload"
+        ext = Path(source_name).suffix.lower()
+        if ext not in LOCATION_PARSERS:
+            raise BadInput(f"Unsupported file type: {ext or '(none)'}")
+        UPLOAD_TMP_DIR.mkdir(parents=True, exist_ok=True)
+        # Unique per upload — two uploads in the same second used to share
+        # one upload_<seconds>.<ext> name and overwrite each other.
+        filepath = str(UPLOAD_TMP_DIR / f"upload_{uuid.uuid4().hex}{ext}")
+        spool = upload.stream
+        spool_name = getattr(spool, "name", None)
+        spools = g.get("_upload_spools", [])
+        if isinstance(spool_name, str) and any(f is spool for f in spools):
+            # Already on disk in the data volume (see _PhotoTaggerRequest):
+            # claim it by renaming instead of copying it a second time.
+            spool.close()
+            os.replace(spool_name, filepath)
+            spools.remove(spool)
+        else:
+            try:
+                upload.save(filepath)
+            except BaseException:
+                with contextlib.suppress(OSError):
+                    os.unlink(filepath)
+                raise
+        return filepath, ext, source_name, filepath
+    data = request.form or request.get_json(silent=True) or {}
+    path = data.get("path") if isinstance(data.get("path"), str) else ""
+    path = path.strip()
+    if not path:
+        raise BadInput("Provide a file upload or a server-side path")
+    ext = Path(path).suffix.lower()
+    if ext not in LOCATION_PARSERS:
+        raise BadInput(f"Unsupported file type: {ext or '(none)'}")
+    real = resolve_allowed_path(path, kind="file", extra_roots=HISTORY_IMPORT_ROOTS)
+    if Path(real).suffix.lower() != ext:
+        raise BadInput("Unsupported file type")
+    return real, ext, Path(path).name, None
+
 @app.route("/api/history/import", methods=["POST"])
 def api_history_import():
+    # Reserve the single import slot BEFORE reading the (possibly huge)
+    # request body. Previously the check and the "running" flag were set
+    # minutes apart (around the upload), so two concurrent uploads could
+    # both pass the check and run at once.
     with _hist_import_lock:
         if _hist_import_state["running"]:
             return jsonify({"error": "An import is already running"}), 409
-
-    upload = request.files.get("file")
+        _hist_import_state.update(running=True, phase="uploading", current=0, total=0,
+                                   message="Receiving file…", error=None, import_id=None)
     cleanup_path = None
-    if upload and upload.filename:
-        ext = Path(upload.filename).suffix.lower()
-        if ext not in LOCATION_PARSERS:
-            return jsonify({"error": f"Unsupported file type: {ext or '(none)'}"}), 400
-        tmp_dir = Path(DB_PATH).parent / "tmp_imports"
-        tmp_dir.mkdir(parents=True, exist_ok=True)
-        source_name = upload.filename
-        filepath = str(tmp_dir / f"upload_{int(time.time())}{ext}")
-        upload.save(filepath)  # Werkzeug streams this to disk in chunks, not buffered in memory
-        cleanup_path = filepath
-    else:
-        data = request.form or request.get_json(silent=True) or {}
-        path = (data.get("path") or "").strip()
-        if not path:
-            return jsonify({"error": "Provide a file upload or a server-side path"}), 400
-        ext = Path(path).suffix.lower()
-        if ext not in LOCATION_PARSERS:
-            return jsonify({"error": f"Unsupported file type: {ext or '(none)'}"}), 400
-        if not os.path.isfile(path):
-            return jsonify({"error": f"File not found: {path}"}), 400
-        filepath = path
-        source_name = Path(path).name
-
-    db = _get_db()
-    cur = db.execute("INSERT INTO location_imports (source_name, source_type, status) VALUES (?,?,'importing')",
-                      (source_name, LOCATION_SOURCE_LABEL[ext]))
-    db.commit()
-    import_id = cur.lastrowid
-
-    with _hist_import_lock:
-        _hist_import_state.update(running=True, phase="starting", current=0, total=0,
-                                   message="Starting import…", error=None, import_id=import_id)
-    threading.Thread(target=_run_history_import,
-                      args=(import_id, filepath, ext, cleanup_path), daemon=True).start()
-    return jsonify({"started": True, "import_id": import_id})
+    try:
+        filepath, ext, source_name, cleanup_path = _prepare_history_source()
+        db = _get_db()
+        cur = db.execute("INSERT INTO location_imports (source_name, source_type, status) VALUES (?,?,'importing')",
+                          (source_name, LOCATION_SOURCE_LABEL[ext]))
+        db.commit()
+        import_id = cur.lastrowid
+        with _hist_import_lock:
+            _hist_import_state.update(phase="starting", message="Starting import…", import_id=import_id)
+        threading.Thread(target=_run_history_import,
+                          args=(import_id, filepath, ext, cleanup_path), daemon=True).start()
+        return jsonify({"started": True, "import_id": import_id})
+    except BaseException as e:
+        # Anything short of a started job releases the slot and removes
+        # whatever was written for this upload.
+        if cleanup_path:
+            with contextlib.suppress(OSError):
+                os.unlink(cleanup_path)
+        with _hist_import_lock:
+            _hist_import_state.update(running=False, phase="", message="", error=None)
+        if isinstance(e, (BadInput, PathNotAllowed, FileNotFoundError)):
+            status = 403 if isinstance(e, PathNotAllowed) else 400
+            return jsonify({"error": safe_error(e)}), status
+        raise
 
 @app.route("/api/history/import_progress")
 def api_history_import_progress():
@@ -2493,10 +3731,11 @@ def api_delete_history_import(import_id):
 
 @app.route("/api/history/match", methods=["POST"])
 def api_history_match():
-    data = request.json or {}
-    folder = data.get("folder", "").strip()
+    data = _json_body()
+    folder = data.get("folder") if isinstance(data.get("folder"), str) else ""
+    folder = folder.strip()
     try:
-        tolerance = max(1, int(data.get("tolerance_minutes", 60)))
+        tolerance = min(7 * 24 * 60, max(1, int(data.get("tolerance_minutes", 60))))
     except (TypeError, ValueError):
         tolerance = 60
     if not folder:
@@ -2517,9 +3756,9 @@ def api_history_match_progress():
 # ── On-demand nearest-in-time infer ────────────────────────────────
 @app.route("/api/infer_nearby", methods=["POST"])
 def api_infer_nearby():
-    data   = request.json or {}
+    data   = _json_body()
     folder = data.get("scan_root")
-    if not folder:
+    if not folder or not isinstance(folder, str):
         return jsonify({"error":"scan_root required"}), 400
     db = _get_db()
     # Snapshot statuses before the pass so the response can report only
@@ -2548,13 +3787,17 @@ def api_infer_nearby():
 # formats aren't Pillow-native — same limitation /api/thumbnail already
 # has) rather than failing the request outright.
 def _encode_photo_for_ai(path, max_dim=1024):
-    from io import BytesIO
+    """path must already be validated (get_photo)."""
     try:
-        img = Image.open(path)
-        img = ImageOps.exif_transpose(img)  # a sideways-looking photo is a bad look-at-the-image clue
-        img.thumbnail((max_dim, max_dim), Image.LANCZOS)
-        buf = BytesIO()
-        img.convert("RGB").save(buf, "JPEG", quality=85)
+        if os.path.getsize(path) > AI_MAX_IMAGE_MB * 1024 * 1024:
+            _log(f"[ai] {Path(path).name} is larger than AI_MAX_IMAGE_MB — sending text only")
+            return None
+        with Image.open(path) as img:
+            img.draft("RGB", (max_dim, max_dim))
+            img = ImageOps.exif_transpose(img)  # a sideways-looking photo is a bad look-at-the-image clue
+            img.thumbnail((max_dim, max_dim), Image.LANCZOS)
+            buf = io.BytesIO()
+            img.convert("RGB").save(buf, "JPEG", quality=85)
         return base64.standard_b64encode(buf.getvalue()).decode("ascii")
     except Exception as e:
         _log(f"[ai] Could not decode {path} for vision, falling back to text-only: {e}")
@@ -2563,24 +3806,86 @@ def _encode_photo_for_ai(path, max_dim=1024):
 def _ai_image_block(b64):
     return {"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":b64}}
 
+def _ai_text(value, limit=200):
+    """Client-supplied context for a prompt: plain, short, single-line."""
+    if value is None:
+        return ""
+    return _CONTROL_CHARS_RE.sub("", str(value)).replace("\n", " ")[:limit]
+
+class _AiBusy(Exception):
+    pass
+
+class _AiLimit(Exception):
+    pass
+
+def _ai_call(content):
+    """
+    One provider call under the cost controls: a concurrency slot first,
+    then a quota unit reserved atomically, then the request. The unit is
+    given back only when the provider demonstrably didn't do the work (it
+    returned an error status, or we never reached it); a timeout or other
+    ambiguous failure keeps it counted, since it may still be billed.
+    """
+    import anthropic
+    if not _ai_semaphore.acquire(timeout=20):
+        raise _AiBusy()
+    try:
+        # Built before reserving: a missing/invalid key configuration fails
+        # here without consuming any of today's allowance.
+        client = anthropic.Anthropic(timeout=AI_TIMEOUT_SECONDS, max_retries=1)
+        reserved = _ai_reserve()
+        if reserved is None:
+            raise _AiLimit()
+        try:
+            msg = client.messages.create(
+                model=get_ai_model(), max_tokens=30,
+                messages=[{"role":"user","content":content}])
+        except anthropic.APIStatusError:
+            _ai_release(reserved)
+            raise
+        except anthropic.APITimeoutError:
+            raise
+        except anthropic.APIConnectionError:
+            _ai_release(reserved)
+            raise
+        return msg.content[0].text.strip()
+    finally:
+        _ai_semaphore.release()
+
+def _ai_error_response(e):
+    if isinstance(e, _AiBusy):
+        return jsonify({"error": "Too many AI requests at once — try again in a moment", "busy": True}), 429
+    if isinstance(e, _AiLimit):
+        return jsonify({"error": f"Daily AI limit of {AI_DAILY_LIMIT} reached.", "limit_reached": True}), 429
+    _log(f"[ai] Request failed: {type(e).__name__}: {safe_error(e)}")
+    return jsonify({"error": safe_error(e)}), 502
+
+def _ai_photo(db, photo):
+    """The photo the AI is asked about, resolved from its library id. The
+    image is loaded from the library's own path — never one the client
+    named. The date may be a not-yet-saved suggestion, so it's taken from
+    the request (as text)."""
+    if not isinstance(photo, dict):
+        raise BadInput("photo must be an object")
+    row, real_path = get_photo(db, photo.get("id"))
+    return row, real_path, _ai_text(photo.get("date_taken") or row["date_taken"], 40)
+
 @app.route("/api/ai_infer", methods=["POST"])
 def api_ai_infer():
-    import anthropic
-    allowed, reason = _ai_allowed()
-    if not allowed:
-        return jsonify({"error":reason,"limit_reached":True}), 429
-    data      = request.json or {}
-    photo     = data.get("photo",{})
-    neighbors = data.get("neighbors",[])
+    data      = _json_body()
+    row, real_path, date_taken = _ai_photo(_get_db(), data.get("photo"))
+    neighbors = data.get("neighbors") if isinstance(data.get("neighbors"), list) else []
     lines = []
-    if photo.get("date_taken"): lines.append(f"Photo taken: {photo['date_taken']}")
-    if photo.get("folder"):     lines.append(f"Folder: {photo['folder']}")
-    if photo.get("filename"):   lines.append(f"Filename: {photo['filename']}")
+    if date_taken:      lines.append(f"Photo taken: {date_taken}")
+    if row["folder"]:   lines.append(f"Folder: {_ai_text(row['folder'])}")
+    if row["filename"]: lines.append(f"Filename: {_ai_text(row['filename'])}")
+    neighbors = [n for n in neighbors if isinstance(n, dict)][:6]
     if neighbors:
         lines.append("\nNearby photos with known locations:")
-        for n in neighbors[:6]:
-            lines.append(f"  - {n.get('filename')}: {n.get('location_name')} ({n.get('date_taken')})")
-    b64 = _encode_photo_for_ai(photo.get("path")) if photo.get("path") else None
+        for n in neighbors:
+            lines.append(f"  - {_ai_text(n.get('filename'))}: {_ai_text(n.get('location_name'))} "
+                         f"({_ai_text(n.get('date_taken'), 40)})")
+    b64 = _encode_photo_for_ai(real_path)
     if b64:
         prompt = (
             "Look at this photo and suggest where it was most likely taken. Use whatever's "
@@ -2611,36 +3916,28 @@ def api_ai_infer():
         )
         content = prompt
     try:
-        msg = anthropic.Anthropic().messages.create(
-            model=get_ai_model(), max_tokens=30,
-            messages=[{"role":"user","content":content}])
-        _ai_increment()
-        suggestion = msg.content[0].text.strip()
-        usage = _ai_usage_info()
-        _log(f"[ai] {photo.get('filename')} → {suggestion} ({usage['used']}/{usage['limit']})")
-        return jsonify({"suggestion":suggestion,"ai_usage":usage})
+        suggestion = _ai_call(content)[:300]
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return _ai_error_response(e)
+    usage = _ai_usage_info()
+    _log(f"[ai] {row['filename']} → {suggestion} ({usage['used']}/{usage['limit']})")
+    return jsonify({"suggestion":suggestion,"ai_usage":usage})
 
 @app.route("/api/ai_infer_with_coords", methods=["POST"])
 def api_ai_infer_with_coords():
-    import anthropic
-    allowed, reason = _ai_allowed()
-    if not allowed:
-        return jsonify({"error":reason,"limit_reached":True}), 429
-    data          = request.json or {}
-    photo         = data.get("photo",{})
-    seed_lat      = data.get("seed_lat")
-    seed_lon      = data.get("seed_lon")
-    seed_location = data.get("seed_location","")
+    data          = _json_body()
+    row, real_path, date_taken = _ai_photo(_get_db(), data.get("photo"))
+    seed_lat      = clean_coord(data.get("seed_lat"), "seed_lat", 90)
+    seed_lon      = clean_coord(data.get("seed_lon"), "seed_lon", 180)
+    seed_location = _ai_text(data.get("seed_location"), 300)
     lines = [
         f"Seed location (manually pinned by user): {seed_location} (GPS: {seed_lat}, {seed_lon})",
-        f"Photo filename: {photo.get('filename','unknown')}",
-        f"Folder: {photo.get('folder','unknown')}",
+        f"Photo filename: {_ai_text(row['filename']) or 'unknown'}",
+        f"Folder: {_ai_text(row['folder']) or 'unknown'}",
     ]
-    if photo.get("date_taken"):
-        lines.append(f"Date taken: {photo['date_taken']}")
-    b64 = _encode_photo_for_ai(photo.get("path")) if photo.get("path") else None
+    if date_taken:
+        lines.append(f"Date taken: {date_taken}")
+    b64 = _encode_photo_for_ai(real_path)
     if b64:
         prompt = (
             "A user manually pinned a location on a map for one photo in a folder, and wants "
@@ -2671,20 +3968,16 @@ def api_ai_infer_with_coords():
         )
         content = prompt
     try:
-        msg = anthropic.Anthropic().messages.create(
-            model=get_ai_model(), max_tokens=30,
-            messages=[{"role":"user","content":content}])
-        _ai_increment()
-        location_name = msg.content[0].text.strip()
-        # Reject any response that sounds like an apology/explanation
-        if len(location_name) > 60 or any(w in location_name.lower() for w in
-                ("i don't","i cannot","i'm unable","no access","image file","photo file")):
-            location_name = seed_location  # fall back to seed
-        usage = _ai_usage_info()
-        _log(f"[ai-seed] {photo.get('filename')} → {location_name}")
-        return jsonify({"location_name":location_name,"ai_usage":usage})
+        location_name = _ai_call(content)
     except Exception as e:
-        return jsonify({"error":str(e)}), 500
+        return _ai_error_response(e)
+    # Reject any response that sounds like an apology/explanation
+    if len(location_name) > 60 or any(w in location_name.lower() for w in
+            ("i don't","i cannot","i'm unable","no access","image file","photo file")):
+        location_name = seed_location  # fall back to seed
+    usage = _ai_usage_info()
+    _log(f"[ai-seed] {row['filename']} → {location_name}")
+    return jsonify({"location_name":location_name,"ai_usage":usage})
 
 @app.route("/api/ai_usage")
 def api_ai_usage():
