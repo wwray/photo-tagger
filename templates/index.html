@@ -834,7 +834,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     </div>
     <div id="seedFilterTabs" class="seed-tabs" style="display:none"></div>
     <div style="padding:10px 16px 0;font-size:11px;color:var(--text-dim)" id="seedModalInstructions">Photos already tagged with GPS or a name start unchecked — check one to deliberately overwrite it.</div>
-    <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;max-height:min(72vh,720px);padding:16px"></div>
+    <div id="seedChecklist" class="seed-grid" style="overflow-y:auto;overscroll-behavior:contain;max-height:min(72vh,720px);padding:16px"></div>
     <div class="map-footer" style="gap:8px">
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(true)" title="Checks only the photos in the current tab">Check shown</button>
       <button class="btn btn-ghost btn-sm" onclick="seedCheckAll(false)" title="Unchecks only the photos in the current tab">Uncheck shown</button>
@@ -880,7 +880,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <span class="map-hint" id="pendingModalHint"></span>
       <button class="close-btn" onclick="closePendingModal()">✕</button>
     </div>
-    <div id="pendingModalList" style="overflow-y:auto;max-height:460px;padding:12px 16px;display:flex;flex-direction:column;gap:8px"></div>
+    <div id="pendingModalList" style="overflow-y:auto;overscroll-behavior:contain;max-height:460px;padding:12px 16px;display:flex;flex-direction:column;gap:8px"></div>
     <div class="map-footer" style="gap:8px">
       <span style="font-size:12px;color:var(--text-muted)">These changes will be written to the actual files on disk.</span>
       <div style="flex:1"></div>
@@ -3109,6 +3109,7 @@ function showPhotoPreview(item,photoId){
   preview.style.left=left+'px';
   preview.style.top=top+'px';
   preview.style.display='block';
+  _photoPreviewScrollHost=item.closest('#seedChecklist, #pendingModalList');
 
   // Propagate/Push-date cards are individually checkable — surface that
   // state on the preview too, and let clicking the preview toggle it
@@ -3153,10 +3154,26 @@ function scheduleHidePhotoPreview(){
   clearTimeout(_photoPreviewHideTimer);
   _photoPreviewHideTimer=setTimeout(hidePhotoPreview,150);
 }
+// The preview lives at the top of <body> (see the CSS note above), so a
+// wheel over it would scroll the page behind the modal rather than the list
+// the hovered card belongs to. Send the scroll to that list instead, and
+// drop the preview — after scrolling, a different card is under the cursor,
+// and the next mouse move previews that one.
+let _photoPreviewScrollHost=null;
 (function(){
   const preview=document.getElementById('photoHoverPreview');
   preview.onmouseenter=cancelHidePhotoPreview;
   preview.onmouseleave=scheduleHidePhotoPreview;
+  preview.addEventListener('wheel', e=>{
+    e.preventDefault();
+    const host=_photoPreviewScrollHost;
+    if(host && host.isConnected){
+      // deltaMode: 0 = pixels, 1 = lines, 2 = pages
+      const unit=e.deltaMode===1 ? 16 : e.deltaMode===2 ? host.clientHeight : 1;
+      host.scrollBy(e.deltaX*unit, e.deltaY*unit);
+    }
+    hidePhotoPreview();
+  }, {passive:false});
 })();
 
 function updateSeedBtn(){
