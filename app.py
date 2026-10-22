@@ -1201,6 +1201,74 @@ def _geocode_failure(provider, op, e):
         detail += f": {e}"
     _log(f"[geocode] {provider} {op} failed: {redact(detail)}")
 
+# ── Stop on a refused key ──────────────────────────────────────────────
+# A wrong, restricted or billing-disabled key fails identically for every
+# request, so a scan used to log the same refusal once per photo (87 times
+# for one real library). The first such refusal now stops lookups for that
+# provider+key until something could have changed: the settings are saved,
+# a new scan starts, or GEOCODER_RETRY_SECONDS pass (restrictions edited in
+# the provider's console take effect without changing the key). Transient
+# failures — timeouts, 5xx, rate limiting — never trigger this.
+GEOCODER_RETRY_SECONDS = 600
+_GOOGLE_FATAL_STATUSES = {"REQUEST_DENIED", "OVER_DAILY_LIMIT"}
+
+class GeocoderRefused(RuntimeError):
+    """The provider rejected the key or account configuration."""
+
+def _raise_google_status(data):
+    """Google's /geocode/json answers HTTP 200 even when the key is refused;
+    the real outcome is in "status"."""
+    status = data.get("status")
+    if status in ("OK", "ZERO_RESULTS"):
+        return
+    msg = f"Google geocode error: {status} — {data.get('error_message','')}"
+    raise (GeocoderRefused if status in _GOOGLE_FATAL_STATUSES else RuntimeError)(msg)
+
+_geocoder_block = None   # {"provider", "key_id", "reason", "until"}
+_geocoder_block_lock = threading.Lock()
+
+def _key_id(key):
+    return hashlib.sha256((key or "").encode("utf-8")).hexdigest()[:16]
+
+def _maybe_block_geocoder(provider, key, e):
+    global _geocoder_block
+    resp = getattr(e, "response", None)
+    refused = isinstance(e, GeocoderRefused) or (resp is not None and resp.status_code in (401, 403))
+    if not refused:
+        return
+    if isinstance(e, GeocoderRefused):
+        reason = str(e)
+    else:
+        reason = f"{provider} answered HTTP {resp.status_code}"
+    reason = redact(reason)[:300]
+    with _geocoder_block_lock:
+        _geocoder_block = {"provider": provider, "key_id": _key_id(key), "reason": reason,
+                           "until": time.time() + GEOCODER_RETRY_SECONDS}
+    _log(f"[geocode] Stopping {provider} lookups: the API key or account setup was refused ({reason}). "
+         f"Fix the key's restrictions or pick another provider in Settings — saving Settings or "
+         f"starting a scan retries, otherwise retrying in {GEOCODER_RETRY_SECONDS // 60} min.")
+
+def geocoder_blocked_reason(provider=None, key=None):
+    """Why lookups for this (or the active) provider+key are paused, or None."""
+    global _geocoder_block
+    if provider is None:
+        provider, key = _active_geocoder()
+    with _geocoder_block_lock:
+        b = _geocoder_block
+        if not b:
+            return None
+        if time.time() >= b["until"]:
+            _geocoder_block = None
+            return None
+        if b["provider"] != provider or b["key_id"] != _key_id(key):
+            return None
+        return b["reason"]
+
+def clear_geocoder_block():
+    global _geocoder_block
+    with _geocoder_block_lock:
+        _geocoder_block = None
+
 def _clean_geocode_results(results):
     """Provider JSON is untrusted: keep only well-formed numeric coords."""
     out = []
@@ -1288,8 +1356,7 @@ def _reverse_google(lat, lon, key):
     # in the "status" field (REQUEST_DENIED, OVER_QUERY_LIMIT, ...), so
     # raise_for_status() alone would miss it and this would silently read as
     # zero results, same as the bug this whole change is fixing.
-    if data.get("status") not in ("OK", "ZERO_RESULTS"):
-        raise RuntimeError(f"Google geocode error: {data.get('status')} — {data.get('error_message','')}")
+    _raise_google_status(data)
     results = data.get("results", [])
     if not results: return None
     by_type = {}
@@ -1307,6 +1374,8 @@ _REVERSE_GEOCODERS = {"nominatim":_reverse_nominatim, "locationiq":_reverse_loca
 
 def reverse_geocode(lat, lon):
     provider, key = _active_geocoder()
+    if geocoder_blocked_reason(provider, key):
+        return None  # already known to be refused — don't hammer the provider
     _geocode_throttle(provider)
     try:
         name = _REVERSE_GEOCODERS[provider](lat, lon, key)
@@ -1316,6 +1385,7 @@ def reverse_geocode(lat, lon):
         # silently — a bad/expired key or wrong endpoint for the selected
         # provider used to come back indistinguishable from "found nothing."
         _geocode_failure(provider, "reverse_geocode", e)
+        _maybe_block_geocoder(provider, key, e)
         return None
 
 def _forward_nominatim(query, limit, key):
@@ -1360,8 +1430,7 @@ def _forward_google(query, limit, key):
         params={"address":query,"key":key}, timeout=10)
     r.raise_for_status()
     data = r.json()
-    if data.get("status") not in ("OK", "ZERO_RESULTS"):
-        raise RuntimeError(f"Google geocode error: {data.get('status')} — {data.get('error_message','')}")
+    _raise_google_status(data)
     out = []
     for x in data.get("results", [])[:limit]:
         loc = x.get("geometry", {}).get("location", {})
@@ -1377,11 +1446,14 @@ def forward_geocode_search(query, limit=5):
     picker's search box. Each provider's free-text "search" endpoint, not
     the reverse one reverse_geocode() uses."""
     provider, key = _active_geocoder()
+    if geocoder_blocked_reason(provider, key):
+        return None
     _geocode_throttle(provider)
     try:
         return _clean_geocode_results(_FORWARD_GEOCODERS[provider](query, limit, key))
     except Exception as e:
         _geocode_failure(provider, "forward_geocode_search", e)
+        _maybe_block_geocoder(provider, key, e)
         return None
 
 def write_location_to_exif(filepath, location_name, lat=None, lon=None, date_str=None):
@@ -1858,7 +1930,7 @@ def api_rename_batch():
 
 # ─── Scan (background thread) ─────────────────────────────────────────────────
 
-_scan_state = {"running":False,"phase":"","current":0,"total":0,
+_scan_state = {"running":False,"phase":"","current":0,"total":0,"geocode_warning":None,
                "message":"","error":None,"scan_root":None}
 _scan_lock  = threading.Lock()
 
@@ -2150,7 +2222,17 @@ def _run_scan(folder, rescan=False):
             """SELECT * FROM photos WHERE scan_root=? AND has_gps=1
                AND (location_name IS NULL OR location_name='')""", (folder,)).fetchall())
         _log(f"[scan] Geocoding {len(needs_geo)} GPS photos…")
+        geocode_warning = None
         for i, photo in enumerate(needs_geo):
+            refused = geocoder_blocked_reason()
+            if refused:
+                # Every remaining lookup would be refused the same way; the
+                # photos stay un-named and are picked up by the next scan.
+                geocode_warning = (f"Geocoding stopped after {i} of {len(needs_geo)} photos — the "
+                                   f"provider refused the API key ({refused}). Fix it in the provider's "
+                                   f"console or choose another provider in ⚙️ Settings, then rescan.")
+                _log(f"[scan] {geocode_warning}")
+                break
             with _scan_lock:
                 _scan_state.update(phase="geocoding", current=i+1, total=len(needs_geo),
                     message=f"Geocoding: {i+1}/{len(needs_geo)}  ({photo['filename']})")
@@ -2175,7 +2257,7 @@ def _run_scan(folder, rescan=False):
         with _scan_lock:
             _scan_state.update(running=False, phase="done",
                 message=f"Done! {total} photos in library.",
-                current=total, total=total)
+                current=total, total=total, geocode_warning=geocode_warning)
 
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -2380,6 +2462,7 @@ def api_settings():
     and more defensive). Add keys here as the settings surface grows."""
     if request.method == "POST":
         data = _json_body()
+        clear_geocoder_block()  # whatever was refused may be fixed now
         if "ai_model" in data:
             model = (clean_text(data.get("ai_model") or "", "ai_model", 100)).strip()
             if model and not re.fullmatch(r"[A-Za-z0-9._:@/\-]+", model):
@@ -2591,7 +2674,7 @@ def api_reset_database():
     # import_id that no longer has a single row behind it.
     with _scan_lock:
         _scan_state.update(running=False, phase="", current=0, total=0,
-                            message="", error=None, scan_root=None)
+                            message="", error=None, scan_root=None, geocode_warning=None)
     with _dup_lock:
         _dup_state.update(running=False, phase="", current=0, total=0,
                            message="", error=None, folder=None, result=None)
@@ -2622,7 +2705,9 @@ def api_scan():
         if _scan_state["running"]:
             return jsonify({"error":"Scan already in progress"}), 409
         _scan_state.update(running=True, phase="counting", current=0, total=0,
-                           message="Starting…", error=None, scan_root=folder)
+                           message="Starting…", error=None, scan_root=folder,
+                           geocode_warning=None)
+    clear_geocoder_block()  # a new scan gives a fixed key a fresh chance
     threading.Thread(target=_run_scan, args=(folder, rescan), daemon=True).start()
     return jsonify({"started": True})
 
@@ -2773,7 +2858,12 @@ def api_geocode():
     lon = clean_coord(data.get("lon"), "lon", 180)
     if lat is None or lon is None:
         return jsonify({"error":"lat/lon required"}), 400
-    return jsonify({"location_name": reverse_geocode(lat,lon)})
+    name = reverse_geocode(lat, lon)
+    refused = None if name else geocoder_blocked_reason()
+    if refused:
+        return jsonify({"location_name": None, "geocoder_refused": True,
+                        "error": f"Geocoding provider refused the API key: {refused}"})
+    return jsonify({"location_name": name})
 
 @app.route("/api/geocode_search")
 def api_geocode_search():
@@ -2783,6 +2873,10 @@ def api_geocode_search():
     q = clean_text(q, "q", 300)
     results = forward_geocode_search(q)
     if results is None:
+        refused = geocoder_blocked_reason()
+        if refused:
+            return jsonify({"error": f"Geocoding provider refused the API key: {refused}",
+                            "geocoder_refused": True, "results": []}), 502
         return jsonify({"error":"Search failed","results":[]}), 502
     return jsonify({"results":results})
 

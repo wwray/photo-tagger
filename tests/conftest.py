@@ -115,7 +115,9 @@ def env(tmp_path, monkeypatch):
             state.update(running=False, phase="", error=None)
     with app_module._thumb_cache_lock:
         app_module._thumb_cache_bytes = None
+    app_module.clear_geocoder_block()
     yield e
+    app_module.clear_geocoder_block()
     shutil.rmtree(e.data / "thumb_cache", ignore_errors=True)
 
 

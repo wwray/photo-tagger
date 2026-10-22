@@ -1291,7 +1291,10 @@ async function pollProgress() {
   const labels={counting:'Counting',reading:'Reading EXIF',inferring:'Inferring',geocoding:'Geocoding',done:'Done',error:'Error'};
   const msg = s.message || labels[s.phase] || s.phase;
   reportScanProgress(msg, s.current, s.total||1);
-  if (s.phase==='done') { clearInterval(_pollInterval); hideScanStatusBar(); await loadResult(); }
+  if (s.phase==='done') {
+    clearInterval(_pollInterval); hideScanStatusBar(); await loadResult();
+    if (s.geocode_warning) toast(s.geocode_warning,'error');
+  }
   else if (s.phase==='error') {
     clearInterval(_pollInterval);
     const btn=document.getElementById('scanBtn'); btn.disabled=false; btn.textContent='Scan';
@@ -1973,7 +1976,7 @@ async function geocodeCoordsInto(latId,lonId,locationId,btn){
   const d=await r.json();
   let ok=false;
   if(d.location_name){document.getElementById(locationId).value=d.location_name;toast('📍 '+d.location_name,'success');ok=true;}
-  else toast('Could not geocode','error');
+  else toast(d.error||'Could not geocode','error');
   if(btn){btn.disabled=false;btn.textContent=label;}
   return ok;
 }
@@ -2210,6 +2213,12 @@ async function batchGeocode(){
     for(const p of need){
       const r=await fetch('/api/geocode',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({lat:p.lat,lon:p.lon})});
       const d=await r.json();
+      if(d.geocoder_refused){
+        // Every remaining photo would be refused the same way.
+        updateStats();renderGrid();
+        toast(`${d.error} — stopped after ${done} of ${need.length}. Fix the key or change provider in ⚙️ Settings.`,'error');
+        return;
+      }
       if(d.location_name){p.location_name=d.location_name;p.status='gps';}
       done++; if(done%10===0){updateStats();renderGrid();toast(`Geocoded ${done}/${need.length}…`);}
     }
