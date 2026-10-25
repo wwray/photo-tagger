@@ -8,19 +8,36 @@
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css"/>
 <link rel="preconnect" href="https://fonts.googleapis.com"/>
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+<link href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet"/>
 <style>
+/* ── Theme: holographic film ─────────────────────────────────────
+   Dark violet glass with one iridescent "foil" — the thin-film sheen of
+   holographic photo stock. The foil is spent in exactly three places:
+   the wordmark, the primary Scan button, and the border of selected
+   photos (where it carries meaning: this one is selected). Everything
+   else is quiet glass. */
 :root {
-  --bg:#0f1117; --surface:#181c27; --surface2:#1e2334; --border:#2a3148;
-  --accent:#4f8ef7; --accent-dim:#1e3a6e; --gold:#f0b429; --gold-dim:#4a3500;
-  --green:#3ecf8e; --green-dim:#0d3d28; --red:#f47373; --red-dim:#4a1010;
-  --purple:#a78bfa; --purple-dim:#2e1a5e;
-  --teal:#2dd4bf; --teal-dim:#0d3d38;
-  --text:#e8eaf0; --text-muted:#7a84a0; --text-dim:#3d4560;
-  --radius:8px; --radius-lg:14px;
+  --bg:#0a0816;
+  --surface:rgba(26,22,48,.92); --surface2:rgba(255,255,255,.055); --border:rgba(196,186,255,.13);
+  --surface-solid:#1a1630;
+  --accent:#8ea8ff; --accent-dim:rgba(142,168,255,.16);
+  --gold:#ffc86b; --gold-dim:rgba(255,200,107,.14);
+  --green:#5ef2c2; --green-dim:rgba(94,242,194,.14);
+  --red:#ff7a90; --red-dim:rgba(255,122,144,.15);
+  --purple:#d98bff; --purple-dim:rgba(217,139,255,.16);
+  --teal:#6ee7f9; --teal-dim:rgba(110,231,249,.14);
+  --text:#efeafc; --text-muted:#a39cc2; --text-dim:#6f6892;
+  --on-bright:#130f24;
+  --foil:linear-gradient(115deg,#7cf7e4 0%,#8ea8ff 30%,#e38bff 58%,#ffc58a 82%,#7cf7e4 100%);
+  --foil-conic:conic-gradient(from var(--foil-angle,0deg),#7cf7e4,#8ea8ff,#e38bff,#ffc58a,#7cf7e4);
+  --glass-blur:blur(18px) saturate(140%);
+  --radius:12px; --radius-lg:20px; --radius-pill:999px;
   --mono:"JetBrains Mono","Fira Code",ui-monospace,monospace;
-  --sans:"Inter",system-ui,sans-serif;
+  --sans:"Manrope",system-ui,sans-serif;
+  --display:"Unbounded","Manrope",system-ui,sans-serif;
 }
+/* Lets the selected-photo foil border turn by animating one angle. */
+@property --foil-angle{syntax:"<angle>";inherits:false;initial-value:0deg}
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 /* A 2-row grid (auto 1fr) only works if body always has exactly two
    in-flow children. It doesn't: the pending-changes bar and the scan
@@ -29,14 +46,25 @@
    it, demoting .main to a squashed auto row. Flex sidesteps the whole
    problem — any number of auto-height bars can come and go, and .main
    (flex:1) always claims exactly what's left. */
-body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;
-     min-height:100vh;display:flex;flex-direction:column}
+body{color:var(--text);font-family:var(--sans);font-size:14px;
+     min-height:100vh;display:flex;flex-direction:column;
+     font-feature-settings:"tnum" 1;
+     /* The faint aurora the glass panels refract — fixed, so it doesn't
+        scroll with the grid. Kept dim: it's the light source, not decor. */
+     background:
+       radial-gradient(60vw 50vh at 8% -10%, rgba(124,247,228,.10), transparent 60%),
+       radial-gradient(50vw 60vh at 100% 0%, rgba(227,139,255,.11), transparent 60%),
+       radial-gradient(70vw 50vh at 60% 110%, rgba(142,168,255,.10), transparent 60%),
+       var(--bg);
+     background-attachment:fixed}
 
 /* Keyboard focus must stay visible against a dark UI — the browser default
    outline is easy to lose here, so every focusable control gets an explicit
    one instead of relying on it. */
 :focus{outline:none}
-:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:4px}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+::selection{background:rgba(227,139,255,.35)}
+*{scrollbar-width:thin;scrollbar-color:rgba(196,186,255,.22) transparent}
 
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation-duration:.001ms !important;animation-iteration-count:1 !important;
@@ -44,45 +72,51 @@ body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14
 }
 
 /* ── Header ── */
-header{background:var(--surface);border-bottom:1px solid var(--border);
-  padding:0 16px;display:flex;align-items:center;gap:10px;height:58px;
-  position:sticky;top:0;z-index:100;overflow-x:auto}
-.logo{font-size:15px;font-weight:700;color:var(--text);display:flex;align-items:center;gap:6px;white-space:nowrap;
-  letter-spacing:-.01em}
-.logo span{color:var(--accent)}
-.logo .version-badge{font-size:10px;font-weight:400;font-family:var(--mono);color:var(--text-dim);
-  background:var(--surface2);border:1px solid var(--border);border-radius:8px;padding:1px 6px;letter-spacing:0}
-.header-divider{width:1px;align-self:stretch;margin:12px 2px;background:var(--border);flex-shrink:0}
+header{background:rgba(14,11,30,.62);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border-bottom:1px solid var(--border);
+  padding:10px 20px;display:flex;flex-wrap:wrap;align-items:center;gap:10px 12px;min-height:64px;
+  position:sticky;top:0;z-index:100}
+.logo{font-family:var(--display);font-size:17px;font-weight:700;letter-spacing:-.02em;
+  display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+.logo .wordmark{background:var(--foil);background-size:200% 100%;
+  -webkit-background-clip:text;background-clip:text;color:transparent}
+.logo .version-badge{font-family:var(--mono);font-size:10px;font-weight:400;color:var(--text-dim);letter-spacing:0}
+.header-divider{width:1px;align-self:stretch;margin:16px 2px;background:var(--border);flex-shrink:0}
 .header-group{display:flex;align-items:center;gap:6px;flex-shrink:0}
-.scan-bar{display:flex;gap:6px;flex:1;max-width:560px;min-width:200px}
-.scan-bar input{flex:1;background:var(--surface2);border:1px solid var(--border);
-  border-radius:var(--radius);color:var(--text);padding:7px 10px;
-  font-family:var(--mono);font-size:12px;outline:none;transition:border-color .15s}
-.scan-bar input:focus{border-color:var(--accent)}
+.scan-bar{display:flex;gap:6px;flex:1 1 360px;max-width:620px;min-width:0;align-items:center;
+  background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:var(--radius-pill);padding:4px}
+.scan-bar:focus-within{border-color:rgba(142,168,255,.55);box-shadow:0 0 0 4px rgba(142,168,255,.10)}
+.scan-bar input{flex:1;min-width:0;background:transparent;border:none;color:var(--text);padding:6px 12px;
+  font-family:var(--mono);font-size:12px;outline:none}
 .scan-bar input::placeholder{color:var(--text-dim)}
-.btn{padding:7px 14px;border-radius:var(--radius);border:none;cursor:pointer;
-  font-family:var(--sans);font-size:13px;font-weight:600;transition:opacity .15s;white-space:nowrap}
+.btn{padding:8px 16px;border-radius:var(--radius-pill);border:1px solid transparent;cursor:pointer;
+  font-family:var(--sans);font-size:13px;font-weight:600;white-space:nowrap;
+  transition:background-color .15s,border-color .15s,color .15s,filter .15s}
 .btn:disabled{opacity:.4;cursor:not-allowed}
-.btn-primary{background:var(--accent);color:#fff}.btn-primary:hover:not(:disabled){background:#6ba0ff}
-.btn-ghost{background:transparent;color:var(--text-muted);border:1px solid var(--border)}
-.btn-ghost:hover:not(:disabled){color:var(--text);border-color:var(--text-muted)}
-.btn-gold{background:var(--gold);color:#000}.btn-green{background:var(--green);color:#000}
-.btn-red{background:var(--red);color:#000}
-.btn-sm{padding:4px 10px;font-size:12px}
+/* The foil, spent on the one primary action in view. */
+.btn-primary{background:var(--foil);background-size:160% 100%;background-position:0 0;color:var(--on-bright);
+  transition:background-position .5s ease,filter .15s}
+.btn-primary:hover:not(:disabled){background-position:100% 0}
+.btn-ghost{background:rgba(255,255,255,.035);color:var(--text-muted);border-color:var(--border)}
+.btn-ghost:hover:not(:disabled){color:var(--text);border-color:rgba(196,186,255,.32);background:rgba(255,255,255,.07)}
+.btn-gold{background:var(--gold);color:var(--on-bright)}.btn-green{background:var(--green);color:var(--on-bright)}
+.btn-red{background:var(--red);color:var(--on-bright)}
+.btn-gold:hover:not(:disabled),.btn-green:hover:not(:disabled),.btn-red:hover:not(:disabled){filter:brightness(1.08)}
+.btn-sm{padding:5px 12px;font-size:12px}
 .header-actions{display:flex;gap:6px;align-items:center;margin-left:auto;flex-shrink:0}
-.stats-pill{background:var(--surface2);border:1px solid var(--border);border-radius:20px;
-  padding:4px 10px;font-size:12px;color:var(--text-muted);display:flex;gap:12px;white-space:nowrap}
+.stats-pill{background:rgba(255,255,255,.04);border:1px solid var(--border);border-radius:var(--radius-pill);
+  padding:5px 12px;font-size:12px;color:var(--text-muted);display:flex;gap:12px;white-space:nowrap}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:4px}
 .dot-green{background:var(--green)}.dot-gold{background:var(--gold)}.dot-red{background:var(--red)}
 
 /* ── Dry run toggle ── */
-.dry-run-toggle{display:flex;align-items:center;gap:7px;cursor:pointer;user-select:none;
-  padding:5px 10px;border-radius:var(--radius);border:1px solid var(--border);
-  background:var(--surface2);transition:border-color .15s;white-space:nowrap}
+.dry-run-toggle{display:flex;align-items:center;gap:8px;cursor:pointer;user-select:none;font-size:13px;
+  padding:6px 12px;border-radius:var(--radius-pill);border:1px solid var(--border);
+  background:rgba(255,255,255,.04);color:var(--text-muted);transition:border-color .15s;white-space:nowrap}
 .dry-run-toggle:hover{border-color:var(--gold)}
 .dry-run-toggle.active{border-color:var(--gold);background:var(--gold-dim);color:var(--gold)}
 .dry-run-toggle input{display:none}
-.toggle-track{width:28px;height:16px;background:var(--border);border-radius:8px;
+.toggle-track{width:28px;height:16px;background:rgba(196,186,255,.22);border-radius:8px;
   position:relative;transition:background .15s;flex-shrink:0}
 .dry-run-toggle.active .toggle-track{background:var(--gold)}
 .toggle-thumb{position:absolute;top:2px;left:2px;width:12px;height:12px;
@@ -90,31 +124,38 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
 .dry-run-toggle.active .toggle-thumb{transform:translateX(12px)}
 
 /* ── Main layout ── */
-.main{display:grid;grid-template-columns:240px 1fr;flex:1;min-height:0}
-.sidebar{background:var(--surface);border-right:1px solid var(--border);
-  overflow-y:auto;padding:12px 0;display:flex;flex-direction:column;gap:0}
-.sidebar-section{padding:0 12px;margin-bottom:20px}
-.sidebar-label{font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;
-  color:var(--text-dim);margin-bottom:6px}
-.filter-btn{display:flex;align-items:center;gap:7px;width:100%;padding:6px 8px;
+.main{display:grid;grid-template-columns:256px 1fr;flex:1;min-height:0;gap:14px;padding:14px 14px 0 14px}
+.sidebar{background:rgba(22,18,42,.55);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border:1px solid var(--border);border-radius:var(--radius-lg);
+  overflow-y:auto;padding:16px 0 8px;display:flex;flex-direction:column;gap:0;
+  max-height:calc(100vh - 64px - 28px);position:sticky;top:78px;align-self:start}
+.sidebar-section{padding:0 12px;margin-bottom:22px}
+.sidebar-label{font-family:var(--display);font-size:11px;font-weight:500;letter-spacing:.02em;
+  color:var(--text-muted);margin:0 8px 8px}
+.filter-btn{display:flex;align-items:center;gap:8px;width:100%;padding:7px 10px;
   border-radius:var(--radius);border:none;background:transparent;color:var(--text-muted);
-  cursor:pointer;font-size:13px;text-align:left;transition:background .1s}
-.filter-btn:hover{background:var(--surface2);color:var(--text)}
-.filter-btn.active{background:var(--accent-dim);color:var(--accent);font-weight:600}
-.filter-btn .count{margin-left:auto;background:var(--surface2);border-radius:10px;
-  padding:1px 6px;font-size:11px;font-family:var(--mono)}
-.filter-btn.active .count{background:var(--accent-dim)}
+  cursor:pointer;font-family:var(--sans);font-size:13px;text-align:left;transition:background .1s}
+.filter-btn:hover{background:rgba(255,255,255,.05);color:var(--text)}
+.filter-btn.active{background:var(--accent-dim);color:var(--text);font-weight:600}
+.filter-btn .count{margin-left:auto;font-size:12px;color:var(--text-dim)}
+.filter-btn.active .count{color:var(--accent)}
+.library-actions{display:flex;flex-direction:column;gap:6px}
+.library-actions .btn{width:100%;text-align:left}
+.library-actions-pair{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.library-actions-pair .btn{text-align:center}
+/* Same numbers as the filter list's counts — shown once, there. */
+#statsPill{display:none !important}
 .folder-list{display:flex;flex-direction:column;gap:2px}
-.folder-item{display:flex;align-items:center;gap:7px;padding:5px 8px;border-radius:var(--radius);
+.folder-item{display:flex;align-items:center;gap:7px;padding:6px 10px;border-radius:var(--radius);
   border:none;background:transparent;color:var(--text-muted);cursor:pointer;
   font-size:11px;font-family:var(--mono);text-align:left;width:100%;overflow:hidden}
-.folder-item:hover{background:var(--surface2);color:var(--text)}
+.folder-item:hover{background:rgba(255,255,255,.05);color:var(--text)}
 .folder-item.active{background:var(--accent-dim);color:var(--accent)}
 .folder-item span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ── Session list ── */
-.session-item{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:var(--radius);
-  border:1px solid var(--border);background:var(--surface2);margin-bottom:4px;cursor:pointer}
+.session-item{display:flex;align-items:center;gap:6px;padding:7px 10px;border-radius:var(--radius);
+  border:1px solid var(--border);background:rgba(255,255,255,.03);margin-bottom:5px;cursor:pointer}
 .session-item:hover{border-color:var(--accent)}
 .session-item.active{border-color:var(--accent);background:var(--accent-dim)}
 .session-item[draggable="true"]{cursor:grab}
@@ -131,82 +172,105 @@ header{background:var(--surface);border-bottom:1px solid var(--border);
    the content instead of a side column, so both stay usable without a
    full nav rework (the header's existing overflow-x:auto still handles
    its own row of buttons at this width — scrollable, not wrapped). */
+@media (max-width: 1100px){
+  .sidebar{position:static;max-height:none}
+}
 @media (max-width: 720px){
-  .main{grid-template-columns:1fr;grid-template-rows:auto 1fr}
-  .sidebar{border-right:none;border-bottom:1px solid var(--border);max-height:180px}
+  header{padding:10px 12px;position:static}  /* three wrapped rows is too much to pin on a phone */
+  header > .header-divider{display:none}
+  /* Folder field gets its own full-width row under the wordmark/menus. */
+  .scan-bar{order:3;flex-basis:100%;max-width:none}
+  .header-actions{margin-left:auto}
+  .main{grid-template-columns:1fr;grid-template-rows:auto 1fr;padding:10px 10px 0;gap:10px}
+  .sidebar{max-height:200px}
   .photo-grid{grid-template-columns:repeat(auto-fill,minmax(140px,1fr))}
   .search-input{width:100%}
 }
 
 /* ── Content ── */
-.content{overflow-y:auto;padding:16px;position:relative}
-.empty-state{display:flex;flex-direction:column;align-items:center;justify-content:center;
-  min-height:60vh;gap:14px;color:var(--text-muted)}
-.empty-icon{font-size:48px;opacity:.3}
-.empty-state h2{font-size:17px;color:var(--text)}
-.empty-state p{max-width:340px;text-align:center;line-height:1.6;color:var(--text-muted)}
-.spinner{width:32px;height:32px;border:3px solid var(--border);border-top-color:var(--accent);
-  border-radius:50%;animation:spin .7s linear infinite}
+.content{overflow-y:auto;padding:4px 4px 24px;position:relative;min-width:0}
+.empty-state{display:flex;flex-direction:column;align-items:flex-start;justify-content:center;
+  min-height:62vh;gap:16px;color:var(--text-muted);max-width:620px;margin:0 auto;padding:0 8px}
+.empty-icon{font-size:40px;opacity:.5}
+.empty-state h2{font-family:var(--display);font-size:clamp(30px,4.2vw,52px);font-weight:700;line-height:1.02;
+  letter-spacing:-.035em;color:var(--text)}
+.empty-state p{max-width:46ch;line-height:1.65;color:var(--text-muted);font-size:15px}
+.spinner{width:34px;height:34px;border-radius:50%;
+  background:var(--foil-conic);animation:spin .9s linear infinite;
+  -webkit-mask:radial-gradient(farthest-side,transparent calc(100% - 4px),#000 calc(100% - 3px));
+          mask:radial-gradient(farthest-side,transparent calc(100% - 4px),#000 calc(100% - 3px))}
 @keyframes spin{to{transform:rotate(360deg)}}
-.progress-bar-wrap{background:var(--surface2);border-radius:4px;height:4px;overflow:hidden;margin-top:6px}
-.progress-bar-fill{height:100%;background:var(--accent);transition:width .3s;border-radius:4px}
+.progress-bar-wrap{background:rgba(255,255,255,.07);border-radius:4px;height:4px;overflow:hidden;margin-top:6px}
+.progress-bar-fill{height:100%;background:var(--foil);background-size:300px 100%;transition:width .3s;border-radius:4px}
 
 /* ── Grid toolbar ── */
-.grid-toolbar{display:flex;align-items:center;gap:8px;margin-bottom:14px;flex-wrap:wrap}
-.grid-toolbar h3{font-size:13px;color:var(--text-muted);font-weight:500}
+.grid-toolbar{display:flex;align-items:center;gap:8px;margin:6px 0 16px;flex-wrap:wrap}
+.grid-toolbar h3{font-family:var(--display);font-size:15px;color:var(--text-muted);font-weight:500;letter-spacing:-.01em}
 .grid-toolbar h3 strong{color:var(--text);font-weight:700}
 .toolbar-spacer{flex:1}
-.sort-select{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
-  border-radius:var(--radius);padding:5px 8px;font-size:12px;cursor:pointer;outline:none}
+.sort-select{background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text-muted);
+  border-radius:var(--radius-pill);padding:6px 12px;font-family:var(--sans);font-size:12px;cursor:pointer;outline:none}
+.sort-select option{background:var(--surface-solid);color:var(--text)}
 .density-group{display:flex;gap:2px}
 .density-btn.active-density{background:var(--accent-dim);color:var(--accent);border-color:var(--accent)}
 .dup-card-mark{display:flex;align-items:center;gap:4px;margin-top:4px;font-size:10px;color:var(--text-dim);cursor:pointer}
 .dup-card-mark input{margin:0;cursor:pointer}
 .exif-info{font-size:12px;color:var(--text-muted);line-height:1.6}
-.search-input{background:var(--surface2);border:1px solid var(--border);color:var(--text);
-  border-radius:var(--radius);padding:5px 10px;font-size:12px;outline:none;width:200px;
+.search-input{background:rgba(255,255,255,.04);border:1px solid var(--border);color:var(--text);
+  border-radius:var(--radius-pill);padding:6px 14px;font-family:var(--sans);font-size:12px;outline:none;width:220px;
   transition:border-color .15s}
 .search-input:focus{border-color:var(--accent)}
 .search-input::placeholder{color:var(--text-dim)}
 
 /* ── Photo grid ── */
-.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--card-min,190px),1fr));gap:10px}
-.photo-card{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
-  overflow:hidden;cursor:pointer;transition:transform .15s,border-color .15s,box-shadow .15s;position:relative}
-.photo-card:hover{transform:translateY(-2px);border-color:var(--accent);box-shadow:0 6px 20px rgba(0,0,0,.4)}
-.photo-card.selected{border-color:var(--accent);box-shadow:0 0 0 2px var(--accent)}
+.photo-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(var(--card-min,190px),1fr));gap:14px}
+.photo-card{background:rgba(255,255,255,.035);border:1px solid var(--border);border-radius:16px;
+  overflow:hidden;cursor:pointer;transition:border-color .15s,background-color .15s;position:relative;isolation:isolate}
+.photo-card:hover{border-color:rgba(196,186,255,.34);background:rgba(255,255,255,.06)}
+/* Selected = foil. A 2px turning holographic ring drawn by a masked
+   pseudo-element, so it sits outside the image without changing layout. */
+.photo-card.selected{border-color:transparent;box-shadow:0 10px 34px -12px rgba(227,139,255,.55)}
+.photo-card.selected::after{content:"";position:absolute;inset:0;border-radius:inherit;padding:2px;
+  background:var(--foil-conic);pointer-events:none;z-index:3;
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:foil-turn 6s linear infinite}
+@keyframes foil-turn{to{--foil-angle:360deg}}
 .photo-card.duplicate-flag{border-color:var(--purple)}
 body.marquee-dragging{user-select:none}
-body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
-.marquee-box{position:fixed;border:1px solid var(--accent);background:rgba(79,142,247,.15);
+.marquee-box{position:fixed;border:1px solid var(--accent);background:rgba(142,168,255,.14);border-radius:6px;
   pointer-events:none;z-index:500}
-.photo-thumb{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:var(--surface2);
+.photo-thumb{width:100%;aspect-ratio:4/3;object-fit:cover;display:block;background:rgba(255,255,255,.04);
   -webkit-user-drag:none;user-drag:none}
-.photo-thumb-placeholder{width:100%;aspect-ratio:4/3;background:var(--surface2);
+.photo-thumb-placeholder{width:100%;aspect-ratio:4/3;background:rgba(255,255,255,.04);
   display:flex;align-items:center;justify-content:center;color:var(--text-dim);font-size:24px}
-.photo-info{padding:8px 10px}
-.photo-filename{font-size:10px;font-family:var(--mono);color:var(--text-muted);
-  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:3px}
-.photo-date{font-size:10px;color:var(--text-dim);margin-bottom:5px}
-.photo-location{font-size:11px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.status-badge{position:absolute;top:7px;right:7px;border-radius:20px;padding:2px 7px;
-  font-size:10px;font-weight:700;letter-spacing:.3px;text-transform:uppercase}
-.badge-gps{background:var(--green-dim);color:var(--green)}
-.badge-inferred{background:var(--gold-dim);color:var(--gold)}
-.badge-named{background:var(--accent-dim);color:var(--accent)}
-.badge-unknown{background:var(--red-dim);color:var(--red)}
-.badge-dup{background:var(--purple-dim);color:var(--purple)}
-.badge-history{background:var(--teal-dim);color:var(--teal)}
+.photo-info{padding:10px 12px 12px}
+.photo-filename{font-size:10.5px;font-family:var(--mono);color:var(--text-dim);
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-bottom:4px}
+.photo-date{font-size:11px;color:var(--text-muted);margin-bottom:4px}
+.photo-location{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.status-badge{position:absolute;top:8px;right:8px;border-radius:var(--radius-pill);padding:3px 9px;
+  font-size:10.5px;font-weight:700;letter-spacing:.01em;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.08)}
+/* Tint over a dark base: these sit on top of arbitrary photos and must
+   stay readable over a white sky as well as a night shot. */
+.badge-gps{background:linear-gradient(var(--green-dim),var(--green-dim)),rgba(10,8,22,.72);color:var(--green)}
+.badge-inferred{background:linear-gradient(var(--gold-dim),var(--gold-dim)),rgba(10,8,22,.72);color:var(--gold)}
+.badge-named{background:linear-gradient(var(--accent-dim),var(--accent-dim)),rgba(10,8,22,.72);color:var(--accent)}
+.badge-unknown{background:linear-gradient(var(--red-dim),var(--red-dim)),rgba(10,8,22,.72);color:var(--red)}
+.badge-dup{background:linear-gradient(var(--purple-dim),var(--purple-dim)),rgba(10,8,22,.72);color:var(--purple)}
+.badge-history{background:linear-gradient(var(--teal-dim),var(--teal-dim)),rgba(10,8,22,.72);color:var(--teal)}
 /* The visible checkbox stays small and tidy, but its actual click target
    is a much bigger invisible corner (select-hit) — an 18px box was easy
    to miss, and missing it opened the photo instead of selecting it. */
 .select-hit{position:absolute;top:0;left:0;width:44px;height:44px;z-index:2;
   display:flex;align-items:flex-start;justify-content:flex-start;padding:7px;cursor:pointer}
-.select-checkbox{width:19px;height:19px;flex-shrink:0;
-  background:rgba(15,17,23,.7);border:2px solid var(--border);border-radius:4px;
-  display:flex;align-items:center;justify-content:center;font-size:11px;transition:.1s}
+.select-checkbox{width:20px;height:20px;flex-shrink:0;
+  background:rgba(10,8,22,.62);border:1.5px solid rgba(255,255,255,.45);border-radius:7px;
+  display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;color:var(--on-bright);
+  transition:border-color .1s,background-color .1s;backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
 .select-hit:hover .select-checkbox{border-color:var(--accent)}
-.photo-card.selected .select-checkbox{background:var(--accent);border-color:var(--accent)}
+.photo-card.selected .select-checkbox{background:var(--foil);border-color:transparent}
 
 /* ── Pending bar ── */
 .pending-bar{background:var(--gold-dim);border-bottom:1px solid var(--gold);padding:8px 16px;
@@ -230,10 +294,12 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .scan-status-fill{height:100%;background:currentColor;transition:width .3s;border-radius:4px}
 
 /* ── Detail overlay ── */
-.detail-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;
+.detail-overlay{position:fixed;inset:0;background:rgba(6,4,16,.72);z-index:200;
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   display:flex;align-items:center;justify-content:center;padding:16px}
 .detail-panel{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius-lg);width:100%;max-width:min(94vw,1400px);max-height:92vh;
+  border-radius:24px;width:100%;max-width:min(94vw,1400px);max-height:92vh;
+  box-shadow:0 40px 120px -30px rgba(0,0,0,.8);
   overflow:hidden;display:grid;grid-template-columns:1fr 360px}
 /* A fixed height, not just a min-height floor — this box used to size
    itself to whatever the current photo's rendered dimensions were (a
@@ -244,7 +310,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    Fixed height + object-fit:contain on the image means this box is the
    same size for every photo; the image letterboxes inside it instead of
    resizing it. */
-.detail-img-wrap{background:#000;display:flex;align-items:center;justify-content:center;
+.detail-img-wrap{background:#05040b;display:flex;align-items:center;justify-content:center;
   height:min(86vh,800px);position:relative;overflow:hidden}
 .detail-img-wrap img{max-width:100%;max-height:100%;object-fit:contain;display:block;transition:transform .2s}
 .detail-img-wrap.zoomed img{transition:none} /* dragging shouldn't lag behind the cursor */
@@ -265,19 +331,23 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   padding:6px 12px;border-radius:16px}
 .rotate-controls .btn:hover:not(:disabled){background:rgba(255,255,255,.15)}
 .rotate-controls .btn:disabled{opacity:.3}
-.detail-form{padding:20px;overflow-y:auto;border-left:1px solid var(--border);
-  display:flex;flex-direction:column;gap:14px}
+.detail-form{padding:22px;overflow-y:auto;border-left:1px solid var(--border);
+  display:flex;flex-direction:column;gap:16px}
 .detail-header{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
 .detail-filename{font-family:var(--mono);font-size:11px;color:var(--text-muted);word-break:break-all}
-.close-btn{background:var(--surface2);border:1px solid var(--border);color:var(--text-muted);
-  border-radius:var(--radius);width:26px;height:26px;cursor:pointer;display:flex;
+.close-btn{background:rgba(255,255,255,.05);border:1px solid var(--border);color:var(--text-muted);
+  border-radius:50%;width:30px;height:30px;cursor:pointer;display:flex;
   align-items:center;justify-content:center;flex-shrink:0;font-size:14px}
 .close-btn:hover{color:var(--text)}
 .field-group{display:flex;flex-direction:column;gap:5px}
-.field-label{font-size:10px;font-weight:700;letter-spacing:.6px;text-transform:uppercase;color:var(--text-dim)}
-.field-input{background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
-  color:var(--text);padding:7px 10px;font-size:13px;outline:none;transition:border-color .15s;width:100%}
-.field-input:focus{border-color:var(--accent)}
+.field-label{font-size:12px;font-weight:600;color:var(--text-muted)}
+.field-input{background:rgba(255,255,255,.045);border:1px solid var(--border);border-radius:var(--radius);
+  color:var(--text);padding:9px 12px;font-family:var(--sans);font-size:13px;outline:none;
+  transition:border-color .15s,box-shadow .15s;width:100%}
+.field-input:focus{border-color:rgba(142,168,255,.6);box-shadow:0 0 0 4px rgba(142,168,255,.10)}
+.field-input option{background:var(--surface-solid);color:var(--text)}
+/* Native date pickers default to a light icon/scheme on dark inputs. */
+input,select{color-scheme:dark}
 .gps-row{display:grid;grid-template-columns:1fr 1fr;gap:6px}
 .field-hint{font-size:11px;color:var(--text-dim);margin-top:1px}
 .infer-bar{background:var(--gold-dim);border:1px solid var(--gold);border-radius:var(--radius);
@@ -288,9 +358,11 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   padding-top:8px;border-top:1px solid var(--border)}
 
 /* ── Batch bar ── */
-.batch-bar{position:fixed;bottom:20px;left:50%;transform:translateX(-50%);
-  background:var(--surface);border:1px solid var(--accent);border-radius:var(--radius-lg);
-  padding:10px 18px;display:flex;align-items:center;gap:14px;box-shadow:0 6px 28px rgba(0,0,0,.5);
+.batch-bar{position:fixed;bottom:22px;left:50%;transform:translateX(-50%);
+  background:rgba(26,22,48,.78);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border:1px solid rgba(196,186,255,.28);border-radius:var(--radius-pill);
+  padding:8px 10px 8px 22px;display:flex;align-items:center;gap:10px;
+  box-shadow:0 18px 50px -12px rgba(0,0,0,.7),0 0 0 1px rgba(227,139,255,.08);
   z-index:150;white-space:nowrap}
 .batch-bar span{color:var(--text-muted);font-size:13px}
 .batch-bar strong{color:var(--text)}
@@ -306,21 +378,24 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
    results — is never silently rendered behind it. */
 .toast-stack{position:fixed;bottom:68px;right:20px;z-index:5000;
   display:flex;flex-direction:column;gap:8px;max-width:280px;pointer-events:none}
-.toast{background:var(--surface);border:1px solid var(--border);
-  border-radius:var(--radius);padding:9px 14px;font-size:13px;color:var(--text);
+.toast{background:rgba(26,22,48,.9);backdrop-filter:var(--glass-blur);-webkit-backdrop-filter:var(--glass-blur);
+  border:1px solid var(--border);box-shadow:0 12px 30px -10px rgba(0,0,0,.6);
+  border-radius:14px;padding:10px 14px;font-size:13px;line-height:1.45;color:var(--text);
   opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none}
 .toast.show{opacity:1;transform:translateY(0)}
 .toast.success{border-color:var(--green);color:var(--green)}
 .toast.error{border-color:var(--red);color:var(--red)}
 
 /* ── Map modal ── */
-.map-modal{position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:400;
+.map-modal{position:fixed;inset:0;background:rgba(6,4,16,.78);z-index:400;
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);
   display:flex;align-items:center;justify-content:center;padding:16px}
-.map-panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--radius-lg);
+.map-panel{background:var(--surface);border:1px solid var(--border);border-radius:24px;
+  box-shadow:0 40px 120px -30px rgba(0,0,0,.8);
   width:100%;max-width:780px;overflow:hidden;display:flex;flex-direction:column}
 .map-header{display:flex;align-items:center;justify-content:space-between;
-  padding:12px 16px;border-bottom:1px solid var(--border);gap:10px}
-.map-header h3{font-size:14px;font-weight:600}
+  padding:14px 18px;border-bottom:1px solid var(--border);gap:10px}
+.map-header h3{font-family:var(--display);font-size:15px;font-weight:500;letter-spacing:-.01em}
 .map-hint{font-size:12px;color:var(--text-muted);flex:1}
 #mapContainer{height:400px;width:100%}
 .map-footer{padding:10px 16px;border-top:1px solid var(--border);
@@ -337,7 +412,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
      was invisibly painted UNDER the map tiles every time, not merely
      positioned wrong. Comfortably above anything Leaflet uses. */
   z-index:2000;
-  background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  background:var(--surface-solid);border:1px solid var(--border);border-radius:var(--radius);
   max-height:220px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
 .map-search-result{padding:8px 10px;font-size:12px;cursor:pointer;border-bottom:1px solid var(--border)}
 .map-search-result:last-child{border-bottom:none}
@@ -345,10 +420,10 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 
 .saved-locations-wrap{position:relative}
 .saved-locations-dropdown{position:absolute;left:0;right:0;top:100%;margin-top:4px;z-index:20;
-  min-width:220px;background:var(--surface2);border:1px solid var(--border);border-radius:var(--radius);
+  min-width:220px;background:var(--surface-solid);border:1px solid var(--border);border-radius:var(--radius);
   max-height:260px;overflow-y:auto;box-shadow:0 8px 24px rgba(0,0,0,.4)}
-.saved-location-section{padding:6px 10px;font-size:10px;font-weight:700;letter-spacing:.4px;
-  text-transform:uppercase;color:var(--text-dim);background:var(--surface)}
+.saved-location-section{padding:7px 10px;font-size:11px;font-weight:600;color:var(--text-muted);
+  background:rgba(255,255,255,.03)}
 .saved-location-item{display:flex;align-items:center;gap:6px;padding:7px 10px;font-size:12px;
   cursor:pointer;border-bottom:1px solid var(--border)}
 .saved-location-item:last-child{border-bottom:none}
@@ -393,7 +468,13 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   background:var(--surface2);cursor:pointer;user-select:none;overflow:hidden;
   transition:border-color .15s,opacity .15s,transform .15s,box-shadow .15s}
 .seed-item:hover{border-color:var(--accent)}
-.seed-item.checked{border-color:var(--accent)}
+/* Checked here means the same as selected in the grid — same foil ring. */
+.seed-item.checked{border-color:transparent}
+.seed-item.checked::after{content:"";position:absolute;inset:0;border-radius:calc(var(--radius-lg) - 2px);padding:2px;
+  background:var(--foil-conic);pointer-events:none;z-index:2;
+  -webkit-mask:linear-gradient(#000 0 0) content-box,linear-gradient(#000 0 0);
+  -webkit-mask-composite:xor;mask-composite:exclude;
+  animation:foil-turn 6s linear infinite}
 /* Dim enough to read at a glance which are checked, but not so dim you
    can't actually see the photo well enough to tell if it's the right
    one — .4 made exactly the "is this really the boat deck or the sky"
@@ -437,7 +518,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .seed-checkbox{position:absolute;top:8px;left:8px;width:24px;height:24px;border-radius:6px;
   background:rgba(15,17,23,.75);border:2px solid rgba(255,255,255,.4);
   display:flex;align-items:center;justify-content:center;flex-shrink:0;font-size:14px;color:#fff;z-index:1}
-.seed-item.checked .seed-checkbox,.seed-checkbox.checked{background:var(--accent);border-color:var(--accent)}
+.seed-item.checked .seed-checkbox,.seed-checkbox.checked{background:var(--foil);border-color:transparent;color:var(--on-bright)}
 .seed-tabs{display:flex;gap:6px;padding:12px 16px 0;flex-wrap:wrap}
 .seed-tab{padding:5px 12px;border-radius:14px;border:1px solid var(--border);background:var(--surface2);
   color:var(--text-muted);font-size:12px;cursor:pointer;transition:border-color .1s,color .1s}
@@ -483,7 +564,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
   font-size:10px;font-weight:700;display:flex;align-items:center;justify-content:center}
 
 /* ── Logs view ──────────────────────────────────────────────── */
-.log-view{background:#0a0c12;border:1px solid var(--border);border-radius:var(--radius-lg);
+.log-view{background:rgba(6,4,16,.6);border:1px solid var(--border);border-radius:var(--radius-lg);
   padding:10px 12px;height:calc(100vh - 200px);min-height:300px;overflow-y:auto;
   font-family:var(--mono);font-size:11.5px;line-height:1.65;white-space:pre-wrap;word-break:break-all}
 .log-line{color:var(--text-muted);border-bottom:1px solid rgba(255,255,255,.02);padding:1px 0}
@@ -502,8 +583,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 .pending-folder{font-size:10px;color:var(--text-dim);font-family:var(--mono)}
 .pending-change{display:flex;align-items:center;gap:8px;font-size:11px;
   padding:3px 0;border-top:1px solid var(--border);margin-top:4px}
-.pending-field{color:var(--text-dim);font-weight:700;text-transform:uppercase;
-  font-size:10px;letter-spacing:.4px;width:76px;flex-shrink:0}
+.pending-field{color:var(--text-muted);font-weight:600;font-size:11px;width:84px;flex-shrink:0}
 .pending-old{color:var(--red);text-decoration:line-through;flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pending-arrow{color:var(--text-dim);flex-shrink:0}
 .pending-new{color:var(--green);flex:1;font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
@@ -520,7 +600,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 <body>
 
 <header>
-  <div class="logo">📷 <span>Photo</span>Tagger <span class="version-badge" title="Build/commit currently running — check this after a rebuild to confirm you're actually on new code">{{ version }}</span></div>
+  <div class="logo"><span class="wordmark">PhotoTagger</span><span class="version-badge" title="Build/commit currently running — check this after a rebuild to confirm you're actually on new code">{{ version }}</span></div>
   <div class="header-divider"></div>
   <div class="scan-bar">
     <input id="folderInput" type="text" placeholder="/photos"/>
@@ -539,14 +619,6 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <span><span class="dot dot-gold"></span><span id="statInf">0</span> Inf</span>
       <span><span class="dot" style="background:var(--teal)"></span><span id="statHist">0</span> Hist</span>
       <span><span class="dot dot-red"></span><span id="statUnk">0</span> Unk</span>
-    </div>
-    <div class="header-divider"></div>
-    <div class="header-group" id="libraryActions" style="display:none">
-      <button class="btn btn-ghost btn-sm" id="dupBtn" onclick="showDuplicates()">🔍 Duplicates</button>
-      <button class="btn btn-ghost btn-sm" id="inferNearbyBtn" onclick="inferNearby()"
-              title="For every untagged photo, copy in the location of the closest-in-time GPS-tagged photo (same folder tree, within 4 hours) — no rescan needed">📍 Infer Nearby</button>
-      <button class="btn btn-gold btn-sm" id="geoBtn" onclick="batchGeocode()">🌍 Geocode</button>
-      <button class="btn btn-green btn-sm" id="saveAllBtn" onclick="saveAll()">💾 Save All</button>
     </div>
     <div class="header-divider"></div>
     <div class="header-group">
@@ -574,6 +646,19 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 
 <div class="main">
 <aside class="sidebar">
+  <!-- Library-wide tools live here rather than in the header: they apply
+       to whatever's loaded, stay reachable from every view, and the header
+       keeps to folder + mode + app menus. -->
+  <div class="sidebar-section library-actions" id="libraryActions" style="display:none">
+    <div class="sidebar-label">Library</div>
+    <button class="btn btn-ghost btn-sm" id="dupBtn" onclick="showDuplicates()">🔍 Find duplicates</button>
+    <button class="btn btn-ghost btn-sm" id="inferNearbyBtn" onclick="inferNearby()"
+            title="For every untagged photo, copy in the location of the closest-in-time GPS-tagged photo (same folder tree, within 4 hours) — no rescan needed">📍 Infer nearby</button>
+    <div class="library-actions-pair">
+      <button class="btn btn-gold btn-sm" id="geoBtn" onclick="batchGeocode()">🌍 Geocode</button>
+      <button class="btn btn-green btn-sm" id="saveAllBtn" onclick="saveAll()">💾 Save all</button>
+    </div>
+  </div>
   <div class="sidebar-section">
     <div class="sidebar-label">Filter</div>
     <button class="filter-btn active" onclick="setFilter('all')" id="filter-all">📁 All <span class="count" id="cnt-all">0</span></button>
@@ -591,7 +676,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
     <div class="sidebar-label" style="display:flex;justify-content:space-between;align-items:center;gap:4px">
       Sessions
       <button class="btn btn-ghost btn-sm" onclick="newSession()"
-              style="font-size:10px;padding:2px 6px;text-transform:none;letter-spacing:0">+ New</button>
+              style="font-family:var(--sans);font-size:11px;padding:3px 10px;letter-spacing:0">+ New</button>
     </div>
     <select class="sort-select" id="sessionSortSelect" onchange="setSessionSort(this.value)"
             style="width:100%;font-size:10px;padding:3px 6px;margin-bottom:8px" title="Sort sessions">
@@ -608,9 +693,9 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
 
 <main class="content" id="content">
   <div class="empty-state" id="emptyState">
-    <div class="empty-icon">🗂️</div>
-    <h2>Point at your photo library</h2>
-    <p>Enter a folder path above, or click 📁 to browse. Hit Scan to start.</p>
+    <h2>Find out where every photo was taken.</h2>
+    <p>Type a folder path above or browse with 📁, then press Scan. PhotoTagger reads each photo's
+       GPS and date, fills the gaps, and writes nothing to your files until you review it.</p>
   </div>
   <div id="gridContainer" style="display:none">
     <div class="grid-toolbar">
@@ -693,7 +778,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
         <button class="btn btn-ghost btn-sm" onclick="aiInfer()" id="aiBtn">🤖 AI Suggest</button>
       </div>
       <div class="field-group">
-        <div class="field-label">Date Taken</div>
+        <div class="field-label">Date taken</div>
         <input class="field-input" id="detailDate" type="datetime-local" oninput="markDetailDirty();onDateChanged()"/>
         <div class="field-hint" id="detailDateHint"></div>
       </div>
@@ -702,7 +787,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
         <button class="btn btn-primary btn-sm" onclick="dateSeedFolder()">Choose photos…</button>
       </div>
       <div class="field-group">
-        <div class="field-label">GPS Coordinates</div>
+        <div class="field-label">GPS coordinates</div>
         <div class="gps-row">
           <input class="field-input" id="detailLat" type="number" step="0.000001" placeholder="Latitude" oninput="markDetailDirty();onCoordsChanged()"/>
           <input class="field-input" id="detailLon" type="number" step="0.000001" placeholder="Longitude" oninput="markDetailDirty();onCoordsChanged()"/>
@@ -751,7 +836,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
               width:100%;max-width:420px;padding:22px" onclick="event.stopPropagation()">
     <h3 style="margin-bottom:14px">Set location / date for selected</h3>
     <div class="field-group" style="margin-bottom:10px">
-      <div class="field-label">Location Name</div>
+      <div class="field-label">Location name</div>
       <input class="field-input" id="batchLocation" type="text" placeholder="e.g. Tokyo, Japan"/>
     </div>
     <div class="gps-row" style="margin-bottom:6px">
@@ -765,7 +850,7 @@ body.marquee-dragging .photo-card:hover{transform:none;box-shadow:none}
       <button class="btn btn-ghost btn-sm" onclick="openMapPicker('batch')">🗺️ Map</button>
     </div>
     <div class="field-group" style="margin-bottom:14px">
-      <div class="field-label">Date Taken</div>
+      <div class="field-label">Date taken</div>
       <input class="field-input" id="batchDate" type="datetime-local"/>
       <div class="field-hint">Sets the same date on every selected photo — leave blank to leave dates untouched.</div>
     </div>
@@ -1150,7 +1235,7 @@ function applyDryRunUi(announce) {
   const ex = document.getElementById('dryRunBanner');
   if (dryRun && !ex) {
     const b=document.createElement('div'); b.id='dryRunBanner';
-    b.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:500;background:var(--gold-dim);border-top:2px solid var(--gold);color:var(--gold);text-align:center;padding:7px;font-size:13px;font-weight:600';
+    b.style.cssText='position:fixed;bottom:0;left:0;right:0;z-index:500;background:linear-gradient(var(--gold-dim),var(--gold-dim)),rgba(10,8,22,.9);backdrop-filter:blur(12px);border-top:1px solid var(--gold);color:var(--gold);text-align:center;padding:7px;font-size:13px;font-weight:600';
     b.textContent='🧪 Dry run ON — saves preview only, nothing written to disk';
     document.body.appendChild(b);
   } else if (!dryRun && ex) ex.remove();
