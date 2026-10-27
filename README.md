@@ -2,6 +2,8 @@
 
 A self-hosted Docker web app to browse your photo library, read and write EXIF location/date metadata, detect duplicates, and intelligently infer locations for untagged photos. Built for Unraid, works anywhere Docker runs.
 
+> **Coded by AI.** Almost all of this project's code, tests and docs were written by an AI coding assistant (Anthropic's Claude), directed and reviewed by a human. Read it with that in mind before relying on it.
+
 ## Quick start (from GitHub)
 
 ```bash
