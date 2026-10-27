@@ -2064,7 +2064,7 @@ def _scan_read_one(p):
     except Exception as e:
         return p, None, None, None, None, str(e)
 
-def _list_photo_files(base):
+def _list_photo_files(base, errors=None):
     """
     Every supported photo under base, without following directory symlinks
     (a link to / would otherwise pull the whole container into the library)
@@ -2073,9 +2073,12 @@ def _list_photo_files(base):
     _move_to_duplicates_folder) — it lives inside the scan root for
     simplicity, so it must be excluded here or a rescan would just
     re-import everything just moved out of the library as "new" photos.
+    Directories os.walk couldn't read are appended to `errors` if given —
+    their photos are missing from the result without actually being gone.
     """
     found = []
-    for dirpath, dirnames, filenames in os.walk(str(base), followlinks=False):
+    onerror = errors.append if errors is not None else None
+    for dirpath, dirnames, filenames in os.walk(str(base), followlinks=False, onerror=onerror):
         # Also prune by resolved location: not every redirecting directory
         # is a symlink (Windows junctions, for one), and os.walk would
         # otherwise descend into it.
@@ -2091,6 +2094,43 @@ def _list_photo_files(base):
             found.append(Path(full))
     return sorted(found)
 
+def _forget_missing_photos(folder, base, listed, walk_errors):
+    """
+    Drop library rows for files under this scan root that no longer exist
+    on disk (a folder deleted or moved away since the last scan), along
+    with their unsaved pending edits — there's no file left to write them
+    to. Only database rows are removed; nothing on disk is touched.
+
+    Skipped entirely when the walk hit an unreadable directory or found no
+    photos at all: an unmounted share or a permissions hiccup looks exactly
+    like "everything was deleted", and forgetting the library (and its
+    pending edits) on that basis would be far worse than a stale entry.
+    Each row is also re-checked with lexists, so anything the listing
+    merely filtered out but is still there stays put.
+    """
+    if walk_errors:
+        _log(f"[scan] Not forgetting missing photos: couldn't read {len(walk_errors)} folder(s), "
+             f"e.g. {walk_errors[0]}")
+        return 0
+    if not listed:
+        _log("[scan] Not forgetting missing photos: no photos found (is the folder mounted?)")
+        return 0
+    listed_ids = {str(p.relative_to(base)) for p in listed}
+    conn = _connect_db()
+    try:
+        gone = [r["id"] for r in conn.execute(
+                    "SELECT id, path FROM photos WHERE scan_root=?", (folder,))
+                if r["id"] not in listed_ids and not os.path.lexists(r["path"] or "")]
+        for pid in gone:
+            conn.execute("DELETE FROM pending_changes WHERE photo_id=?", (pid,))
+            conn.execute("DELETE FROM photos WHERE id=?", (pid,))
+        conn.commit()
+    finally:
+        conn.close()
+    if gone:
+        _log(f"[scan] Forgot {len(gone)} photo(s) no longer on disk")
+    return len(gone)
+
 def _run_scan(folder, rescan=False):
     base = Path(folder)
     now_iso = datetime.now().isoformat()
@@ -2100,9 +2140,11 @@ def _run_scan(folder, rescan=False):
         with _scan_lock:
             _scan_state.update(phase="counting",message="Counting photo files…",
                                current=0,total=0,scan_root=folder)
-        all_paths = _list_photo_files(base)
+        walk_errors = []
+        all_paths = _list_photo_files(base, walk_errors)
         total = len(all_paths)
         _log(f"[scan] Found {total} photos in {folder}")
+        _forget_missing_photos(folder, base, all_paths, walk_errors)
 
         # ── Diff against DB (rescan) ───────────────────────────────
         if rescan:
